@@ -98,6 +98,12 @@ main() {
     wait_for_port "$BEYOND_PORT" beyond
     wait_for_port "$REDIS_PORT"  redis
 
+    # Forward run metadata so the bench can stamp it into saved JSON.
+    export BENCH_KERNEL="$(uname -srm)"
+    export BENCH_MEMORY_BYTES="$MEMORY_BYTES"
+    export BENCH_REDIS_VERSION="$(redis-server --version)"
+    # BENCH_GIT_SHA + BENCH_TIMESTAMP are passed in from run.sh on the host.
+
     kv-bench \
         --target "beyond=redis://127.0.0.1:$BEYOND_PORT" \
         --target "redis=redis://127.0.0.1:$REDIS_PORT" \

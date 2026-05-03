@@ -1,12 +1,13 @@
 //! `kv-bench` — honest, reproducible KV benchmarks.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use beyond_kv_bench::client::Target;
 use beyond_kv_bench::driver::{Driver, Mode, Plan};
 use beyond_kv_bench::keyspace::{KeyDist, Keyspace};
-use beyond_kv_bench::metrics::{KindReport, Report};
+use beyond_kv_bench::metrics::{BenchRun, KindReport, ModeSummary, PlanSummary, Report, RunMetadata};
 use beyond_kv_bench::targets::Resp;
 use beyond_kv_bench::workload::{OpMix, Workload};
 
@@ -35,6 +36,12 @@ struct Cli {
     /// Value size in bytes.
     #[arg(long, default_value_t = 256)]
     value_size: usize,
+
+    /// Batch size. `1` ⇒ single-key GET/SET; `>1` ⇒ MGET/MSET of N keys per
+    /// call. Throughput is reported in both calls/s and keys/s; latency is
+    /// per-call. Schedule rates are call rates, not key rates.
+    #[arg(long, default_value_t = 1)]
+    batch: usize,
 
     /// Number of concurrent connections / workers.
     #[arg(long, default_value_t = 64)]
@@ -71,6 +78,17 @@ struct Cli {
     /// Emit machine-readable JSON instead of a table.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Save the full run (metadata + plan + reports) as JSON to this path.
+    /// The table is still printed to stdout. Use this to archive baselines
+    /// for diffing across code changes (e.g. before/after a storage rewrite).
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+
+    /// Optional label stored in the run metadata. Useful as a free-text tag
+    /// (`rocksdb-baseline`, `lsm-rewrite-v1`, …) that survives in JSON greps.
+    #[arg(long)]
+    label: Option<String>,
 }
 
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
@@ -120,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let keyspace = Keyspace::new(cli.keys, cli.keydist)?;
-    let workload = Workload::new(keyspace, cli.workload, cli.value_size);
+    let workload = Workload::new(keyspace, cli.workload, cli.value_size, cli.batch);
     let driver = Driver::new(workload, plan);
 
     print_plan(&cli, &driver.plan);
@@ -151,7 +169,82 @@ async fn main() -> anyhow::Result<()> {
     } else {
         print_table(&reports);
     }
+
+    if let Some(ref path) = cli.out {
+        let run = BenchRun {
+            metadata: RunMetadata {
+                timestamp: env_or("BENCH_TIMESTAMP", current_timestamp()),
+                label: cli.label.clone(),
+                git_sha: std::env::var("BENCH_GIT_SHA").ok().filter(|s| !s.is_empty()),
+                kernel: std::env::var("BENCH_KERNEL").ok().filter(|s| !s.is_empty()),
+                cpu_count: num_cpus(),
+                memory_bytes: std::env::var("BENCH_MEMORY_BYTES").ok().and_then(|s| s.parse().ok()),
+                redis_version: std::env::var("BENCH_REDIS_VERSION").ok().filter(|s| !s.is_empty()),
+            },
+            plan: PlanSummary {
+                concurrency: driver.plan.concurrency,
+                duration_secs: driver.plan.duration.as_secs_f64(),
+                warmup_secs: driver.plan.warmup.as_secs_f64(),
+                populate: driver.plan.populate,
+                seed: driver.plan.seed,
+                batch: cli.batch,
+                workload: format!("{:?}", cli.workload),
+                keys: cli.keys,
+                value_size: cli.value_size,
+                keydist: format!("{:?}", cli.keydist),
+                modes: modes.iter().map(mode_summary).collect(),
+            },
+            reports,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&run)?)?;
+        eprintln!("saved: {}", path.display());
+    }
     Ok(())
+}
+
+fn env_or(key: &str, fallback: String) -> String {
+    std::env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or(fallback)
+}
+
+fn current_timestamp() -> String {
+    // RFC3339 UTC, second precision — minimal so we don't pull `chrono`.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Days-since-epoch + h/m/s decomposition (UTC, leap-seconds ignored — fine
+    // for a "when did this run happen" tag).
+    let (days, sec_of_day) = (secs / 86_400, secs % 86_400);
+    let (h, m, s) = (sec_of_day / 3600, (sec_of_day / 60) % 60, sec_of_day % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's days→{year,month,day} algorithm. Public domain.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y as i32, m as u32, d as u32)
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn mode_summary(m: &Mode) -> ModeSummary {
+    match *m {
+        Mode::Closed => ModeSummary::Closed,
+        Mode::Open { rate_per_sec } => ModeSummary::Open { rate_per_sec },
+    }
 }
 
 fn print_plan(cli: &Cli, plan: &Plan) {
@@ -177,11 +270,15 @@ fn print_plan(cli: &Cli, plan: &Plan) {
 #[derive(Tabled)]
 struct Row {
     target: String,
-    /// Requested rate in ops/s. `max` for closed-loop saturation runs.
+    /// Requested call rate. `max` for closed-loop saturation runs.
     rate: String,
     op: &'static str,
-    #[tabled(rename = "ops/s")]
-    throughput: String,
+    /// Calls per second (network round-trips).
+    #[tabled(rename = "calls/s")]
+    calls: String,
+    /// Logical keys per second (`calls × batch_size` for MGET/MSET).
+    #[tabled(rename = "keys/s")]
+    keys: String,
     #[tabled(rename = "svc p50 µs")]
     svc_p50: u64,
     #[tabled(rename = "svc p99 µs")]
@@ -204,7 +301,8 @@ impl Row {
             target: target.to_string(),
             rate: rate.to_string(),
             op: k.kind,
-            throughput: format!("{:.0}", k.throughput_ops_per_sec),
+            calls: format!("{:.0}", k.throughput_ops_per_sec),
+            keys: format!("{:.0}", k.throughput_keys_per_sec),
             svc_p50: k.service.p50_us,
             svc_p99: k.service.p99_us,
             rsp_p50: k.response.p50_us,

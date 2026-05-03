@@ -58,10 +58,22 @@ fi
 echo "==> Running bench"
 # --network none keeps the container off the host's network — only loopback,
 # which is all the bench and servers need. Removes one entire class of variance.
+#
+# Mount results/ so the bench can write archived JSON runs to a place that
+# survives container teardown. Also pass git SHA + timestamp so saved files are
+# attributable to a specific commit and a specific moment.
+RESULTS_DIR="$KV_ROOT/crates/bench/results"
+mkdir -p "$RESULTS_DIR"
+GIT_SHA="$(git -C "$KV_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 docker run \
     --rm \
     --name "$CONTAINER" \
     --network none \
     --init \
+    --volume "$RESULTS_DIR:/results" \
+    --env "BENCH_GIT_SHA=$GIT_SHA" \
+    --env "BENCH_TIMESTAMP=$TIMESTAMP" \
     "$IMAGE" \
     "${PASSTHROUGH[@]}"

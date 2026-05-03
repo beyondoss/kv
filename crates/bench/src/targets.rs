@@ -80,6 +80,22 @@ impl Client for RespClient {
             Op::Del { key } => {
                 let _: i64 = self.conn.del(key.as_ref()).await?;
             }
+            Op::MGet { keys } => {
+                // Hand-rolled command avoids the `ToRedisArgs` impl gymnastics
+                // for `&[&[u8]]`. The redis crate handles the wire encoding.
+                let mut cmd = redis::cmd("MGET");
+                for k in keys {
+                    cmd.arg(k.as_ref());
+                }
+                let _: Vec<Option<Vec<u8>>> = cmd.query_async(&mut self.conn).await?;
+            }
+            Op::MSet { pairs } => {
+                let mut cmd = redis::cmd("MSET");
+                for (k, v) in pairs {
+                    cmd.arg(k.as_ref()).arg(v.as_ref());
+                }
+                let _: () = cmd.query_async(&mut self.conn).await?;
+            }
         }
         Ok(())
     }

@@ -15,6 +15,22 @@ pub enum Op {
     Get { key: Bytes },
     Set { key: Bytes, value: Bytes },
     Del { key: Bytes },
+    /// Batched read. One round-trip, `keys.len()` logical operations.
+    MGet { keys: Vec<Bytes> },
+    /// Batched write. One round-trip, `pairs.len()` logical operations.
+    MSet { pairs: Vec<(Bytes, Bytes)> },
+}
+
+impl Op {
+    /// Logical operation count. For batched ops this is the batch size; for
+    /// single-key ops it is 1. Used to convert calls/sec → keys/sec.
+    pub fn keys(&self) -> u64 {
+        match self {
+            Op::Get { .. } | Op::Set { .. } | Op::Del { .. } => 1,
+            Op::MGet { keys } => keys.len() as u64,
+            Op::MSet { pairs } => pairs.len() as u64,
+        }
+    }
 }
 
 /// Compact, indexable op classification used by the metrics layer.
@@ -27,12 +43,22 @@ pub enum OpKind {
     Get = 0,
     Set = 1,
     Del = 2,
+    MGet = 3,
+    MSet = 4,
 }
 
 impl OpKind {
-    pub const ALL: [OpKind; 3] = [OpKind::Get, OpKind::Set, OpKind::Del];
+    pub const COUNT: usize = 5;
+    pub const ALL: [OpKind; Self::COUNT] =
+        [OpKind::Get, OpKind::Set, OpKind::Del, OpKind::MGet, OpKind::MSet];
     pub fn name(self) -> &'static str {
-        match self { OpKind::Get => "GET", OpKind::Set => "SET", OpKind::Del => "DEL" }
+        match self {
+            OpKind::Get => "GET",
+            OpKind::Set => "SET",
+            OpKind::Del => "DEL",
+            OpKind::MGet => "MGET",
+            OpKind::MSet => "MSET",
+        }
     }
 }
 
@@ -42,6 +68,8 @@ impl Op {
             Op::Get { .. } => OpKind::Get,
             Op::Set { .. } => OpKind::Set,
             Op::Del { .. } => OpKind::Del,
+            Op::MGet { .. } => OpKind::MGet,
+            Op::MSet { .. } => OpKind::MSet,
         }
     }
 }
@@ -80,33 +108,46 @@ pub struct Workload {
     /// Pre-built value buffer. Cloning a `Bytes` is a refcount bump, so all
     /// SETs share one backing allocation.
     value: Bytes,
+    /// Batch size. `1` ⇒ GET/SET; `>1` ⇒ MGET/MSET of this many keys.
+    batch: usize,
 }
 
 impl Workload {
-    pub fn new(keyspace: Keyspace, mix: OpMix, value_size: usize) -> Self {
+    pub fn new(keyspace: Keyspace, mix: OpMix, value_size: usize, batch: usize) -> Self {
         // Deterministic, non-zero filler so wire size matches the user's request.
         let mut buf = vec![0u8; value_size];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i as u8).wrapping_add(0x20);
         }
-        Self { keyspace, mix, value: Bytes::from(buf) }
+        Self { keyspace, mix, value: Bytes::from(buf), batch: batch.max(1) }
     }
 
     pub fn keyspace(&self) -> &Keyspace { &self.keyspace }
     pub fn value(&self) -> &Bytes { &self.value }
+    pub fn batch(&self) -> usize { self.batch }
 
     pub fn next<R: Rng>(&self, rng: &mut R) -> Op {
-        let key = self.keyspace.sample(rng);
-        match self.mix {
-            OpMix::GetOnly => Op::Get { key },
-            OpMix::SetOnly => Op::Set { key, value: self.value.clone() },
-            OpMix::Mixed { read_pct } => {
-                if rng.gen_range(0u8..100) < read_pct {
-                    Op::Get { key }
-                } else {
-                    Op::Set { key, value: self.value.clone() }
-                }
+        let pick_read = match self.mix {
+            OpMix::GetOnly => true,
+            OpMix::SetOnly => false,
+            OpMix::Mixed { read_pct } => rng.gen_range(0u8..100) < read_pct,
+        };
+        if self.batch == 1 {
+            let key = self.keyspace.sample(rng);
+            if pick_read {
+                Op::Get { key }
+            } else {
+                Op::Set { key, value: self.value.clone() }
             }
+        } else if pick_read {
+            let keys: Vec<Bytes> =
+                (0..self.batch).map(|_| self.keyspace.sample(rng)).collect();
+            Op::MGet { keys }
+        } else {
+            let pairs: Vec<(Bytes, Bytes)> = (0..self.batch)
+                .map(|_| (self.keyspace.sample(rng), self.value.clone()))
+                .collect();
+            Op::MSet { pairs }
         }
     }
 }

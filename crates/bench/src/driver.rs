@@ -193,7 +193,7 @@ async fn execute_one<R: Rng>(
             let service_us = us(completed - started);
             // In closed-loop mode, response == service: there is no schedule.
             let response_us = scheduled_at.map_or(service_us, |s| us(completed - s));
-            stats.record(op.kind(), service_us, response_us);
+            stats.record(op.kind(), service_us, response_us, op.keys());
         }
         Err(err) => {
             stats.errors += 1;
