@@ -1,0 +1,296 @@
+use std::rc::Rc;
+use std::time::Duration;
+
+use beyond_kv_engine::store::ShardStore;
+use beyond_kv_engine::types::SetOptions;
+use bytes::Bytes;
+use monoio::io::{sink::Sink, stream::Stream};
+use monoio::net::{TcpListener, TcpStream};
+use monoio_http::common::body::{Body, BodyExt, FixedBody, HttpBody};
+use monoio_http::h1::codec::{decoder::FillPayload, ServerCodec};
+use monoio_http::h1::payload::Payload;
+
+pub async fn serve(store: Rc<ShardStore>, port: u16) {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind HTTP {addr}: {e}");
+            return;
+        }
+    };
+    tracing::info!("HTTP listening on {addr}");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                tracing::debug!(%peer, "accepted HTTP connection");
+                let store = store.clone();
+                monoio::spawn(async move {
+                    handle_conn(stream, store).await;
+                });
+            }
+            Err(e) => tracing::error!("accept error: {e}"),
+        }
+    }
+}
+
+async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>) {
+    let mut codec: ServerCodec<TcpStream> = ServerCodec::new(stream);
+
+    loop {
+        let req = match Stream::next(&mut codec).await {
+            Some(Ok(r)) => r,
+            _ => break,
+        };
+
+        // Fill request body from IO into the payload channel before reading
+        if codec.fill_payload().await.is_err() {
+            break;
+        }
+
+        let (parts, body) = req.into_parts();
+        let body_bytes = read_body(body).await;
+
+        let response: http::Response<HttpBody> = route(&parts, body_bytes, &store).await;
+
+        if Sink::send(&mut codec, response).await.is_err() {
+            break;
+        }
+        if Sink::<http::Response<HttpBody>>::flush(&mut codec).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn read_body(body: Payload) -> Bytes {
+    match body.stream_hint() {
+        monoio_http::common::body::StreamHint::None => Bytes::new(),
+        _ => body.bytes().await.unwrap_or_default(),
+    }
+}
+
+async fn route(
+    parts: &http::request::Parts,
+    body: Bytes,
+    store: &ShardStore,
+) -> http::Response<HttpBody> {
+    let path = parts.uri.path();
+    let method = &parts.method;
+
+    // Route: /namespaces/{ns}/values/{key}
+    if let Some(rest) = path.strip_prefix("/namespaces/") {
+        if let Some((ns, rest)) = split_once(rest, '/') {
+            if let Some(key_encoded) = rest.strip_prefix("values/") {
+                let key = percent_decode(key_encoded);
+                return match *method {
+                    http::Method::GET => handle_get(ns, &key, store),
+                    http::Method::PUT => handle_put(ns, &key, body, parts, store),
+                    http::Method::DELETE => handle_delete(ns, &key, store),
+                    _ => method_not_allowed(),
+                };
+            }
+            if rest == "keys" || rest.starts_with("keys?") {
+                if *method == http::Method::GET {
+                    let query = parts.uri.query().unwrap_or("");
+                    return handle_list(ns, query, store);
+                }
+                return method_not_allowed();
+            }
+        }
+    }
+
+    if path == "/healthz" {
+        return ok_text("ok");
+    }
+
+    not_found_json("not_found", "endpoint not found")
+}
+
+fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+    match store.get(ns, key) {
+        Err(e) => internal_error(&e.to_string()),
+        Ok(None) => not_found_json("not_found", "key does not exist"),
+        Ok(Some(entry)) => {
+            let ttl_secs = entry.expires_at.map(|t| {
+                t.saturating_duration_since(std::time::Instant::now()).as_secs()
+            });
+            let mut builder = http::Response::builder().status(200);
+            if let Some(ttl) = ttl_secs {
+                builder = builder.header("X-KV-TTL", ttl.to_string());
+            }
+            if let Some(meta) = &entry.metadata {
+                if let Ok(json) = serde_json::to_string(meta) {
+                    builder = builder.header("X-KV-Metadata", json);
+                }
+            }
+            builder
+                .header("Content-Type", "application/octet-stream")
+                .body(HttpBody::fixed_body(Some(entry.value)))
+                .unwrap()
+        }
+    }
+}
+
+fn handle_put(
+    ns: &str,
+    key: &[u8],
+    body: Bytes,
+    parts: &http::request::Parts,
+    store: &ShardStore,
+) -> http::Response<HttpBody> {
+    let ttl = parse_ttl_from_request(parts);
+    let metadata = parts
+        .headers
+        .get("x-kv-metadata")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let nx = parts.uri.query().unwrap_or("").contains("nx=1");
+
+    let opts = SetOptions { ttl, metadata };
+
+    if nx {
+        match store.setnx(ns, key, body, opts) {
+            Ok(true) => http::Response::builder()
+                .status(204)
+                .body(HttpBody::fixed_body(None))
+                .unwrap(),
+            Ok(false) => json_response(
+                409,
+                &serde_json::json!({ "error": "conflict", "message": "key already exists" }),
+            ),
+            Err(e) => internal_error(&e.to_string()),
+        }
+    } else {
+        match store.set(ns, key, body, opts) {
+            Ok(()) => http::Response::builder()
+                .status(204)
+                .body(HttpBody::fixed_body(None))
+                .unwrap(),
+            Err(e) => internal_error(&e.to_string()),
+        }
+    }
+}
+
+fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+    match store.del(ns, &[key]) {
+        Ok(_) => http::Response::builder()
+            .status(204)
+            .body(HttpBody::fixed_body(None))
+            .unwrap(),
+        Err(e) => internal_error(&e.to_string()),
+    }
+}
+
+fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Response<HttpBody> {
+    let prefix = query_param(query, "prefix");
+    let cursor_str = query_param(query, "cursor").unwrap_or("0");
+    let limit: u64 = query_param(query, "limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+        .min(1000);
+
+    match store.scan(ns, cursor_str.as_bytes(), prefix.as_deref().map(str::as_bytes), limit) {
+        Err(e) => internal_error(&e.to_string()),
+        Ok(page) => {
+            let keys: Vec<serde_json::Value> = page
+                .keys
+                .iter()
+                .map(|k| serde_json::json!({ "name": String::from_utf8_lossy(k) }))
+                .collect();
+            let complete = page.next_cursor == b"0".as_ref();
+            let mut body = serde_json::json!({ "keys": keys, "complete": complete });
+            if !complete {
+                body["cursor"] = serde_json::Value::String(
+                    String::from_utf8_lossy(&page.next_cursor).into_owned()
+                );
+            }
+            json_response(200, &body)
+        }
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn parse_ttl_from_request(parts: &http::request::Parts) -> Option<Duration> {
+    let header_ttl = parts
+        .headers
+        .get("x-kv-ttl")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
+
+    header_ttl.or_else(|| {
+        query_param(parts.uri.query().unwrap_or(""), "ttl")
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+    })
+}
+
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k == name { Some(v) } else { None }
+    })
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn split_once(s: &str, delim: char) -> Option<(&str, &str)> {
+    let pos = s.find(delim)?;
+    Some((&s[..pos], &s[pos + 1..]))
+}
+
+fn json_response(status: u16, body: &serde_json::Value) -> http::Response<HttpBody> {
+    let json = serde_json::to_vec(body).unwrap_or_default();
+    http::Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(HttpBody::fixed_body(Some(Bytes::from(json))))
+        .unwrap()
+}
+
+fn ok_text(msg: &'static str) -> http::Response<HttpBody> {
+    http::Response::builder()
+        .status(200)
+        .body(HttpBody::fixed_body(Some(Bytes::from_static(msg.as_bytes()))))
+        .unwrap()
+}
+
+fn not_found_json(code: &str, msg: &str) -> http::Response<HttpBody> {
+    json_response(404, &serde_json::json!({ "error": code, "message": msg }))
+}
+
+fn internal_error(msg: &str) -> http::Response<HttpBody> {
+    json_response(500, &serde_json::json!({ "error": "internal_error", "message": msg }))
+}
+
+fn method_not_allowed() -> http::Response<HttpBody> {
+    json_response(405, &serde_json::json!({ "error": "method_not_allowed", "message": "method not allowed" }))
+}
