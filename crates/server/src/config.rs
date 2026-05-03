@@ -26,3 +26,60 @@ impl Config {
         <Self as Parser>::parse()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Config, clap::Error> {
+        Config::try_parse_from(["beyond-kv"].iter().chain(args).copied())
+    }
+
+    #[test]
+    fn defaults_are_sensible() {
+        let cfg = parse(&[]).unwrap();
+        assert_eq!(cfg.resp_port, 6379);
+        assert_eq!(cfg.http_port, 4869);
+        assert_eq!(cfg.memory_bytes, 256 * 1024 * 1024);
+        assert!(cfg.threads.is_none());
+    }
+
+    #[test]
+    fn explicit_flags_override_defaults() {
+        let cfg = parse(&[
+            "--resp-port", "7000",
+            "--http-port", "8000",
+            "--threads", "4",
+            "--memory-bytes", "134217728",
+            "--data-dir", "/tmp/kv-test",
+        ]).unwrap();
+        assert_eq!(cfg.resp_port, 7000);
+        assert_eq!(cfg.http_port, 8000);
+        assert_eq!(cfg.threads, Some(4));
+        assert_eq!(cfg.memory_bytes, 134217728);
+        assert_eq!(cfg.data_dir.to_str().unwrap(), "/tmp/kv-test");
+    }
+
+    #[test]
+    fn invalid_resp_port_is_rejected() {
+        assert!(parse(&["--resp-port", "not-a-port"]).is_err());
+    }
+
+    #[test]
+    fn invalid_threads_is_rejected() {
+        assert!(parse(&["--threads", "abc"]).is_err());
+    }
+
+    #[test]
+    fn invalid_memory_bytes_is_rejected() {
+        assert!(parse(&["--memory-bytes", "abc"]).is_err());
+    }
+
+    #[test]
+    fn threads_zero_is_accepted_by_parser() {
+        // The parser accepts 0; the runtime decides how to handle it.
+        let cfg = parse(&["--threads", "0"]).unwrap();
+        assert_eq!(cfg.threads, Some(0));
+    }
+}

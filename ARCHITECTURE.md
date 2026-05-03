@@ -1,138 +1,290 @@
-# beyond-kv Architecture
+# KV Architecture
 
-A high-performance KV store for the Beyond platform. Every VM gets a Redis-compatible KV service at `localhost:6379` — standard Redis clients work with zero config. An HTTP API mirrors the Cloudflare KV shape for edge functions and HTTP-native clients.
+A Redis-compatible key-value store that takes commands over RESP (TCP) or REST (HTTP), executes them against a two-level storage hierarchy (in-memory S3-FIFO cache + RocksDB), and returns results. Each OS thread runs a fully isolated shard — no cross-thread locking, no shared mutable state.
 
-Branching is free: GlideFS snapshots the block device at the storage layer. RocksDB's immutable SST files survive CoW forks cleanly; the WAL handles in-flight writes.
+## Data Flow
 
----
-
-## Workspace
+### RESP Write Path (SET)
 
 ```
-kv/
-├── crates/
-│   ├── engine/    # KV engine: tiered cache, TTL, namespaces, RocksDB
-│   ├── proto/     # RESP command parsing and response building
-│   └── server/    # Binary: monoio thread-per-core, RESP + HTTP listeners
-└── sdk/
-    └── ts/        # TypeScript SDK (@beyond.dev/kv)
+TCP Client
+  │
+  ▼
+RespCodec (beyond_resp)     ← RESP2/RESP3 framing
+  │ RESP Array → Bytes
+  ▼
+Command::parse()            ← command.rs  — stack-allocated parsing, arity check
+  │ Command::Set { key, value, args }
+  ▼
+dispatch()                  ← dispatch.rs — NX/XX condition, TTL conversion
+  │ SetOptions { ttl: Duration, metadata }
+  ▼
+ShardStore::set()           ← store.rs
+  ├─ postcard::encode(StoredValue { value, expires_at_ms, metadata })
+  ├─ RocksDB::put(cf, key, encoded)         ← L2 write
+  └─ MemCache::insert(key, value, ...)      ← L1 write
+  │
+  ▼
+r::ok()                     ← response.rs
+  │
+  ▼
+TCP Client
 ```
 
----
+### RESP Read Path (GET)
 
-## Thread-per-core Model
-
-The server spawns one worker thread per CPU core. Each worker:
-
-1. Opens its own RocksDB instance at `<data-dir>/shard-{i}/`
-2. Wraps it in `Rc<ShardStore>` (no `Arc`, no locks on the hot path)
-3. Runs a monoio (`FusionDriver`: io_uring on Linux, kqueue on macOS) event loop
-4. Binds both RESP (`:6379`) and HTTP (`:4869`) listeners with `SO_REUSEPORT` — the kernel distributes connections across threads with zero userspace coordination
-5. Spawns a background TTL sweeper task (30s interval)
-
-Because each thread owns its data independently, there is no cross-thread contention on reads or writes. The tradeoff: keys are not replicated across shards; a client hitting shard-0 and shard-1 sees different keyspaces. This is acceptable for the VM-local use case — each VM has a single KV service, not a distributed cluster.
-
----
-
-## Storage: L1 (MemCache) + L2 (RocksDB)
-
-### L1 — S3-FIFO In-memory Cache
-
-Hand-rolled S3-FIFO (~240 lines, `crates/engine/src/cache.rs`). All operations are O(1). Not `Send`/`Sync` — uses `Cell`/`RefCell` for interior mutability, no locking needed within a single worker thread.
-
-**Structure:**
-- **Small queue** (10% of capacity) — new entries enter here
-- **Main queue** (90% of capacity) — entries promoted from Small when `freq > 0`
-- **Ghost set** — hashed keys of recently evicted Small entries; re-insertion before displacement goes directly to Main
-
-**Eviction:** Walk Small front; `freq == 0` → evict and record in ghost; `freq > 0` → reset freq, promote to Main. If still over capacity, walk Main front; `freq > 0` → reset and requeue; `freq == 0` → evict. Main entries are never added to the ghost set.
-
-**Expiry:** Checked lazily on every `get`. Background sweeper calls `sweep_expired` every 30 seconds to batch-remove expired entries without blocking reads.
-
-### L2 — RocksDB
-
-One column family per namespace within a single DB instance per shard. Namespaces: `default` and `db1`–`db15` (matching Redis `SELECT 0`–`15`). Column families share the WAL and compaction infrastructure — one open DB, zero per-namespace file handle overhead.
-
-**Value encoding:** `StoredValue { value: &[u8], expires_at_ms: Option<u64>, metadata: Option<Vec<u8>> }` serialized with postcard. Compact binary format; `Option` is a single discriminant byte.
-
-**Read path:** L1 hit → return (bump freq). L1 miss → RocksDB point lookup → insert into L1 Small. Lazy expiry check on every read.
-
-**Write path:** Write to RocksDB first (durable), then update L1. `WriteBatch` used for multi-key operations (`MSET`, `DEL`).
-
-**TTL at the storage layer:** Expiry is stored as an absolute Unix millisecond timestamp. RocksDB does not natively expire keys; expiry is enforced lazily on read and by the background sweeper. A compaction filter could be added to clean up expired keys during compaction — not yet implemented.
-
----
-
-## RESP Server (port 6379)
-
-Uses `monoio-codec` `Framed<TcpStream, RespCodec>` from the `beyond-resp` crate. Supports pipelining naturally — each connection loops: decode a command, dispatch, send response, flush.
-
-`HELLO 3` switches the codec to RESP3 via `framed.codec_mut().set_version(Version::Resp3)`.  
-`SELECT {n}` updates per-connection namespace state without any store interaction.
-
-**Supported commands:** `GET`, `SET` (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `SCAN`, `MGET`, `MSET`, `GETSET`, `SETNX`, `GETDEL`, `GETEX`, `DBSIZE`, `FLUSHDB`, `PING`, `HELLO`, `SELECT`, `QUIT`, `RESET`.
-
----
-
-## HTTP Server (port 4869)
-
-Hand-rolled HTTP/1.1 on `monoio-http`. Uses `ServerCodec<TcpStream>` directly — no framework. Request body is filled from the IO source via `fill_payload()` before processing (required for correct HTTP/1.1 keep-alive pipelining).
-
-**Routes:**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/namespaces/{ns}/values/{key}` | Read value; `X-KV-TTL` and `X-KV-Metadata` response headers |
-| `PUT` | `/namespaces/{ns}/values/{key}` | Write value; TTL from `X-KV-TTL` header or `?ttl=` query; `?nx=1` for set-if-not-exists |
-| `DELETE` | `/namespaces/{ns}/values/{key}` | Delete (idempotent) |
-| `GET` | `/namespaces/{ns}/keys` | Cursor-paginated key list; `?prefix=`, `?cursor=`, `?limit=` |
-| `GET` | `/healthz` | Health check |
-
-**Error shape:** `{ "error": "<code>", "message": "..." }` — codes: `not_found`, `conflict`, `method_not_allowed`, `internal_error`.
-
-**List response** (Cloudflare KV-compatible):
-```json
-{ "keys": [{ "name": "..." }], "cursor": "42", "complete": false }
 ```
-When `complete: true`, `cursor` is omitted.
-
----
-
-## TypeScript SDK (`sdk/ts/`, `@beyond.dev/kv`)
-
-Thin fetch wrapper — no generated client, no runtime dependencies.
-
-```ts
-import { createKvClient } from "@beyond.dev/kv"
-
-const kv = createKvClient({ baseUrl: "http://localhost:4869", namespace: "default" })
-
-await kv.set("hello", "world", { ttl: 60 })
-const entry = await kv.get("hello")     // { value: Uint8Array, ttl: 59 }
-await kv.delete("hello")
-const page = await kv.list({ prefix: "user:" })
+TCP Client
+  │
+  ▼
+Command::Get { key }
+  │
+  ▼
+ShardStore::get()
+  ├─ MemCache::get(key, now_ms)  ── hit? ──► check expiry ──► return Entry  (L1 fast path)
+  │                                                │ expired
+  │                                                ▼
+  │                               remove from L1 + RocksDB, return None
+  │
+  └─ miss? ──► RocksDB::get(cf, key)
+                 ├─ None ──────────────────────────────────────────► return None
+                 └─ Some(bytes) ──► postcard::decode(StoredValue)
+                                      ├─ expired? ──► delete RocksDB + skip L1 ──► None
+                                      └─ live? ──► MemCache::insert ──► return Entry
+  │
+  ▼
+r::bulk(entry.value) or r::nil()
+  │
+  ▼
+TCP Client
 ```
 
-**Next.js helper:**
-```ts
-import { createServerKvClient } from "@beyond.dev/kv/next"
+### HTTP Path
 
-// Reads KV_URL and KV_NAMESPACE from env
-const kv = createServerKvClient()
+```
+HTTP Client
+  │
+  ▼
+http.rs router
+  ├─ GET    /namespaces/{ns}/values/{key}     → ShardStore::get()
+  ├─ PUT    /namespaces/{ns}/values/{key}     → ShardStore::set() / setnx()
+  ├─ DELETE /namespaces/{ns}/values/{key}     → ShardStore::del()
+  ├─ GET    /namespaces/{ns}/keys             → ShardStore::scan() (paginated)
+  └─ GET    /healthz                          → 200 OK
+  │
+  ▼
+HTTP Client
 ```
 
-**Error types:** `KvError` (non-2xx responses) and `KvNotFoundError extends KvError` (thrown by `getOrThrow`).
+### TTL Expiry
 
----
+```
+Lazy (on access):
+  ShardStore::get/ttl/del
+    └─ expires_at_ms ≤ now_ms? ──► delete RocksDB + evict L1 ──► None
 
-## Key Design Decisions
+Background (every 30s per thread):
+  ShardStore::sweep_cache()
+    └─ MemCache::sweep_expired(now_ms)  ← removes L1 entries only, not RocksDB
+```
 
-**`Rc` not `Arc`:** All per-thread state uses `Rc`. Since monoio is single-threaded per worker, there are zero atomic operations on the hot path.
+### SCAN Pagination
 
-**`SO_REUSEPORT` over a shared accept loop:** The kernel load-balances connections across threads. No userspace queue, no mutex, no thundering herd.
+```
+SCAN 0 MATCH user:* COUNT 100
+  │
+  ▼
+ShardStore::scan(cursor="0", pattern, count=100)
+  ├─ "0" → RocksDB iterator from column family start
+  ├─ iterate: skip expired, glob-match against pattern
+  ├─ collect up to count matching keys
+  └─ hit count? → next_cursor = b"\x01" + last_key
+     exhausted? → next_cursor = "0"  (signals completion)
+  │
+  ▼
+[cursor_bytes, [key1, key2, ...]]
+  │
+  ▼
+SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
+```
 
-**S3-FIFO over LRU:** Better hit rate on skewed/Zipf workloads (which real KV traffic resembles) with the same O(1) complexity. The ghost set prevents churn on recently-evicted hot keys.
+## Concepts & Terminology
 
-**Postcard over JSON/protobuf:** Binary, zero-copy-friendly, no schema registration. Smaller wire format than JSON for numeric fields.
+| Term | What It Controls | NOT |
+|------|-----------------|-----|
+| Namespace (`ns`) | Which RocksDB column family receives reads/writes; set by `SELECT 0–15` (RESP) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary |
+| Shard / ShardStore | One independent storage unit per OS thread — its own RocksDB instance + L1 cache | Not a partition of data; all shards hold the full key space |
+| L1 / MemCache | In-process S3-FIFO cache that short-circuits RocksDB reads | Not write-through durable storage |
+| L2 / RocksDB | Persistent on-disk store; authoritative source of truth | Not the hot path for reads after first access |
+| Column Family | One per database (0–15); `"default"` for db 0, `"db1"`…`"db15"` for the rest | Not a Redis slot or hash slot |
+| Ghost Set | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue | Not a tombstone or deletion marker |
+| Cursor `"0"` | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states | Not a literal zero integer |
+| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page | Not a user-visible value; internal to scan |
 
-**One RocksDB per shard (not one per namespace):** Column families share the block cache, WAL, and compaction threads. Adding a namespace is one `create_cf` call, not a new file descriptor set.
+## Core Mechanism
+
+### Threading Model
+
+`main.rs` spawns one OS thread per CPU. Each thread:
+1. Opens its own `ShardStore` (separate RocksDB path + 256 MB L1 cache by default)
+2. Starts a Monoio async runtime (io-uring on Linux)
+3. Spawns three tasks: RESP listener, HTTP listener, cache sweeper
+
+```
+[OS Thread 0]  Monoio runtime  ┬─ RESP listener :6379
+               ShardStore 0    ├─ HTTP listener :4869
+                               └─ cache sweeper (30s)
+
+[OS Thread 1]  Monoio runtime  ┬─ RESP listener :6379
+               ShardStore 1    ├─ HTTP listener :4869
+                               └─ cache sweeper (30s)
+... (N threads)
+```
+
+`ShardStore` is `!Sync` (via `Rc<>` wrapping). There is no shared mutable state between threads — each is fully autonomous. A routing layer (not in this codebase) is expected to hash client connections to a specific thread so that a given key always lands on the same shard.
+
+### Two-Level Storage
+
+Every read checks L1 first. L1 hits avoid all RocksDB I/O, deserialization, and system call overhead. On L1 miss the engine reads from RocksDB, decodes the `StoredValue`, populates L1, and returns the entry.
+
+Writes go to both levels synchronously: RocksDB first (durable), then L1 (hot set).
+
+### S3-FIFO Cache (`cache.rs`)
+
+S3-FIFO partitions capacity into a Small queue (10%) and a Main queue (90%):
+
+- **Insert:** New keys enter Small. If the key was recently evicted (ghost hit), it goes directly to Main.
+- **Eviction:** Small is evicted FIFO. If the entry's `freq == 1` (accessed at least once since insertion), it's promoted to Main instead of discarded. Main is evicted FIFO, but entries with `freq == 1` get one reprieve (freq reset to 0, placed back in Main).
+- **Ghost Set:** A bounded `HashSet` (≈10% of capacity) of recently evicted keys. Prevents one-hit wonders from polluting Main; ensures keys with real reuse skip the Small queue on re-insertion.
+
+Memory accounting tracks `key.len() + value.len() + metadata.len()` per entry. Eviction runs until `current_bytes ≤ max_bytes`.
+
+### RocksDB Storage Format
+
+Values are serialized with `postcard` (compact binary, no schema) into:
+
+```rust
+struct StoredValue<'a> {
+    value:          &'a [u8],
+    expires_at_ms:  Option<u64>,   // Unix timestamp in milliseconds
+    metadata:       Option<&'a [u8]>,
+}
+```
+
+LZ4 block compression is enabled. One column family per database (16 total). Shards are separate RocksDB instances with paths like `{data_dir}/shard-{n}`.
+
+### Command Parsing (`command.rs`)
+
+RESP arrays are parsed into a `Command` enum with zero heap allocation for command name matching: command names are compared against 16-byte stack buffers. SET option tokens use 7-byte stack buffers. Arity is checked before any further parsing.
+
+### Expiry
+
+Expiry is stored as an absolute Unix timestamp in milliseconds. On every read, the current time is compared against `expires_at_ms`. If expired:
+- The key is deleted from RocksDB and evicted from L1.
+- The caller receives `None`.
+
+RocksDB itself has no TTL mechanism in use here; expiry is entirely application-managed. This means expired keys that are never accessed remain on disk until RocksDB compaction or a future read deletes them.
+
+### SCAN Glob Matching
+
+Pattern matching uses a stack-based backtracking algorithm that handles `*` (any sequence) and `?` (single character). No heap allocation; runs inline during RocksDB iteration. See `store.rs:glob_match()`.
+
+## State Machines
+
+### Connection Lifecycle (RESP)
+
+```
+         accept()
+            │
+            ▼
+        ┌───────┐
+        │ OPEN  │ ◄─── default RESP2, ns="default"
+        └───┬───┘
+            │ HELLO n  ──────────► switch codec (RESP2 ↔ RESP3)
+            │ SELECT n ──────────► switch ns ("default" | "db1"…"db15")
+            │ QUIT     ──────────┐
+            │ EOF/error ─────────┤
+            ▼                    │
+        ┌────────┐               │
+        │ CLOSED │ ◄─────────────┘
+        └────────┘
+```
+
+`ConnState` (`dispatch.rs`) holds `ns`, `resp_version`, and `quit`. The HELLO command is handled before the codec switches so the response uses the old version.
+
+### Key Lifecycle
+
+```
+absent ──SET──► live
+  live ──GET──► live  (freq bumped in L1)
+  live ──DEL──► absent
+  live ──expired────► absent  (lazy, on next access or L1 sweep)
+  live ──PERSIST──► live (TTL cleared)
+  live ──EXPIRE──► live (TTL replaced)
+```
+
+## Why It Behaves This Way
+
+### Why each thread has its own RocksDB instance
+
+Sharing one RocksDB across threads requires locking at the compaction and write-batch level even with `MultiThreaded` mode. Per-thread instances eliminate that coordination entirely and keep the hot path lock-free. The tradeoff is that a routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
+
+### Why expiry is lazy rather than proactive
+
+Proactive expiry requires a background scan of all RocksDB keys, which competes with normal I/O and is expensive at scale. Lazy expiry costs nothing at write time and reclaims memory immediately on access. The background L1 sweep (every 30s) prevents L1 from filling with dead entries, but RocksDB may hold expired keys until they're accessed or until RocksDB's own compaction runs. Disk usage will be overstated for workloads with many short-lived keys that are never re-read.
+
+### Why S3-FIFO instead of LRU
+
+LRU requires updating a linked list on every cache hit (O(1) but with high cache-line contention). S3-FIFO uses FIFO queues (append/pop, no random access) and a single `freq` bit per entry. It performs comparably to LRU on typical access distributions while being significantly cheaper to update under high hit rates.
+
+### Why postcard over JSON or bincode
+
+postcard produces the most compact binary output of the common Rust serialization crates and is deterministic (no padding, no alignment). It decodes via borrowed slices — the `value` and `metadata` fields in `StoredValue` point directly into the RocksDB buffer without copying. JSON would double or triple storage size and require allocation.
+
+### Why RESP cursor "0" means both start and done
+
+Redis protocol defines SCAN to return "0" when iteration is complete. Reusing "0" as the start sentinel matches the Redis API contract exactly — clients loop `while cursor != "0"` after the first call, which naturally handles both starting and stopping. Internal continuation cursors are prefixed with `\x01` to ensure they can never collide with the literal "0" string.
+
+### Why MSET is atomic
+
+Redis MSET is documented as atomic. This implementation uses a single RocksDB `WriteBatch` — all key/value pairs are written in one `db.write(batch)` call. Either all keys land or none do. The L1 cache is populated after the batch write; in the narrow window between the two a cache miss will correctly fall back to RocksDB and see all keys.
+
+## Configuration
+
+| CLI Flag / Env Var | Default | What It Controls at Runtime |
+|--------------------|---------|------------------------------|
+| `--data-dir` / `KV_DATA_DIR` | `/var/lib/beyond-kv` | Root path for all RocksDB shard directories (`{data_dir}/shard-{n}`) |
+| `--resp-port` / `KV_RESP_PORT` | `6379` | TCP port each thread's RESP listener binds to |
+| `--http-port` / `KV_HTTP_PORT` | `4869` | TCP port each thread's HTTP listener binds to |
+| `--threads` / `KV_THREADS` | `num_cpus::get()` | Number of OS threads (= number of shards) |
+| `--memory-bytes` / `KV_MEMORY_BYTES` | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads |
+
+## Failure Modes
+
+| Failure | What Actually Happens | Recovery |
+|---------|----------------------|----------|
+| Thread panic | `panic = "abort"` — process terminates immediately; no unwinding | External process supervisor restarts the process |
+| RocksDB write error | `EngineError::RocksDb` propagated; RESP client receives `ERR` response; connection stays open | Client retries; underlying disk issue must be resolved externally |
+| Postcard decode error | `EngineError::Encode`; treated as a missing key in callers that swallow the error — a corrupted value becomes invisible | Affected key must be deleted and rewritten |
+| RESP parse error | Connection closed; no response sent | Client reconnects |
+| HTTP malformed request | JSON error body `{"error": "...", "message": "..."}` with 4xx status | Client fixes request |
+| Expired key read | Deleted from RocksDB + L1; `None` returned to caller | Transparent; client sees cache miss |
+| Crash during MSET | RocksDB WriteBatch is atomic — either all keys are written or none are | No partial state; client can safely retry |
+| L1 cache over capacity | Eviction runs inline during insert; oldest Small-queue entries dropped first | Automatic; no data loss (L2 is authoritative) |
+
+## File Map
+
+| File | What It Does |
+|------|-------------|
+| `crates/proto/src/command.rs` | Parses RESP arrays into `Command` enum; validates arity and option syntax |
+| `crates/proto/src/response.rs` | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply) |
+| `crates/proto/src/error.rs` | Protocol-level error variants returned to clients |
+| `crates/engine/src/store.rs` | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN |
+| `crates/engine/src/cache.rs` | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting |
+| `crates/engine/src/types.rs` | `Entry`, `SetOptions`, `TtlResult`, `ScanPage` |
+| `crates/engine/src/error.rs` | Storage-level errors (RocksDB, encode, I/O, invalid namespace) |
+| `crates/server/src/main.rs` | Thread spawning; per-thread Monoio runtime + ShardStore initialization |
+| `crates/server/src/config.rs` | CLI arg + env var parsing into `Config` |
+| `crates/server/src/dispatch.rs` | Maps `Command` → `ShardStore` calls → RESP response; `ConnState` |
+| `crates/server/src/resp.rs` | TCP accept loop; RESP framing; connection state machine |
+| `crates/server/src/http.rs` | HTTP route handlers; header/query param extraction; JSON error responses |

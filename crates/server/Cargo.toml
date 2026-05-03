@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "beyond_kv"
+path = "src/lib.rs"
+
 [[bin]]
 name = "beyond-kv"
 path = "src/main.rs"
@@ -28,3 +32,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 num_cpus = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+redis = { version = "0.27", features = ["tcp_nodelay"] }
+tempfile = "3"
+ureq = "2"
+urlencoding = "2"

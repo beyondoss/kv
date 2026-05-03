@@ -1,36 +1,59 @@
+use std::net::SocketAddr;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::SetOptions;
 use bytes::Bytes;
+use monoio::io::AsyncReadRent;
 use monoio::io::{sink::Sink, stream::Stream};
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::{TcpStream, UnixStream};
 use monoio_http::common::body::{Body, BodyExt, FixedBody, HttpBody};
 use monoio_http::h1::codec::{decoder::FillPayload, ServerCodec};
 use monoio_http::h1::payload::Payload;
 
-pub async fn serve(store: Rc<ShardStore>, port: u16) {
-    let addr = format!("0.0.0.0:{port}");
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
+pub async fn serve_routed(
+    store: Rc<ShardStore>,
+    rx: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
+    wakeup_read: StdUnixStream,
+) {
+    wakeup_read.set_nonblocking(true).expect("wakeup set_nonblocking");
+    let mut wakeup = match UnixStream::from_std(wakeup_read) {
+        Ok(s) => s,
         Err(e) => {
-            tracing::error!("failed to bind HTTP {addr}: {e}");
+            tracing::error!("failed to create HTTP wakeup stream: {e}");
             return;
         }
     };
-    tracing::info!("HTTP listening on {addr}");
 
+    let mut buf = vec![0u8; 64];
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                tracing::debug!(%peer, "accepted HTTP connection");
-                let store = store.clone();
-                monoio::spawn(async move {
-                    handle_conn(stream, store).await;
-                });
+        let res;
+        (res, buf) = wakeup.read(buf).await;
+        match res {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        loop {
+            match rx.try_recv() {
+                Ok((stream, peer)) => {
+                    if stream.set_nonblocking(true).is_err() {
+                        tracing::error!(%peer, "HTTP set_nonblocking failed");
+                        continue;
+                    }
+                    match TcpStream::from_std(stream) {
+                        Ok(s) => {
+                            tracing::debug!(%peer, "accepted HTTP connection");
+                            let store = store.clone();
+                            monoio::spawn(async move { handle_conn(s, store).await });
+                        }
+                        Err(e) => tracing::error!(%peer, "HTTP TcpStream::from_std: {e}"),
+                    }
+                }
+                Err(_) => break,
             }
-            Err(e) => tracing::error!("accept error: {e}"),
         }
     }
 }
@@ -184,14 +207,18 @@ fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<Htt
 }
 
 fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Response<HttpBody> {
-    let prefix = query_param(query, "prefix");
-    let cursor_str = query_param(query, "cursor").unwrap_or("0");
+    let prefix_pattern = query_param(query, "prefix").map(|raw| {
+        let mut p = percent_decode(raw);
+        p.push(b'*');
+        p
+    });
+    let cursor_bytes = percent_decode(query_param(query, "cursor").unwrap_or("0"));
     let limit: u64 = query_param(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100)
         .min(1000);
 
-    match store.scan(ns, cursor_str.as_bytes(), prefix.as_deref().map(str::as_bytes), limit) {
+    match store.scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit) {
         Err(e) => internal_error(&e.to_string()),
         Ok(page) => {
             let keys: Vec<serde_json::Value> = page
