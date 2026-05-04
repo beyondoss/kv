@@ -363,7 +363,7 @@ Proactive expiry requires a background scan of all keys, which competes with nor
 
 ### Why log-structured (and not RocksDB / LMDB / redb)
 
-The platform runs each instance on a CoW filesystem (GlideFS) where O(1) fork is the load-bearing capability. RocksDB's LSM compaction rewrites SST files in the background regardless of write load — an idle fork diverges from its parent within minutes. mmap-based stores (LMDB, redb) page-fault synchronously on cold reads, stalling the monoio reactor across other tenants on the same core. A custom append-only log + in-RAM index satisfies all nine required properties (idle stability, bounded fork-local growth, async-friendly reads, crash atomicity via per-record CRC, native TTL via the sidecar, single-I/O point lookup, scan without ordering, operator-controlled reclaim, single-writer-per-shard) without those failure modes.
+The platform runs each instance on a CoW filesystem (GlideFS) where O(1) fork is the load-bearing capability. RocksDB's LSM compaction rewrites SST files in the background regardless of write load — an idle fork diverges from its parent within minutes. mmap-based stores (LMDB, redb) page-fault synchronously on cold reads, stalling the monoio reactor across other tenants on the same core. A custom append-only log + in-RAM index satisfies all nine required properties (idle stability, bounded fork-local growth, async-friendly reads, crash atomicity via per-record CRC, native TTL via the sidecar, single-I/O point lookup, scan without ordering, threshold-triggered reclaim, single-writer-per-shard) without those failure modes.
 
 ### Why S3-FIFO instead of LRU
 
@@ -427,7 +427,7 @@ Across shards (when MSET keys span shard boundaries), atomicity is **not** prese
 | `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                                    |
 | `crates/engine/src/log/index.rs`   | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN                                                                              |
 | `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers; clean-shutdown active file has a footer (fast path), crash falls back to CRC-truncating replay |
-| `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file                                                                    |
+| `crates/engine/src/log/reclaim.rs` | Threshold-triggered merge of sealed files into a new sealed file; also exposed as `BGREWRITEAOF`                                   |
 | `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                             |
 | `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                            |
 | `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS                     |

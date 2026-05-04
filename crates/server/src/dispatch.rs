@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
 use beyond_kv_engine::types::{Entry, SetOptions};
-use beyond_kv_proto::command::{Command, GetExTtl, SetCondition, SetTtl};
+use beyond_kv_proto::command::{Command, GetExTtl, SetArgs, SetCondition, SetTtl};
 use beyond_kv_proto::response::{self as r};
 use beyond_resp::Value;
 use bytes::Bytes;
@@ -65,7 +65,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         },
 
         Command::Set { key, value, args } => {
-            let opts = set_opts_from_args(&args.ttl);
+            let opts = set_opts_from_args(&args);
 
             // Handle NX / XX / REV conditions
             match args.condition {
@@ -311,7 +311,11 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             revision,
             ttl,
         } => {
-            let opts = set_opts_from_args(&ttl);
+            let opts = SetOptions {
+                ttl: ttl.as_ref().map(ttl_duration_from_spec),
+                metadata: None,
+                keep_ttl: false,
+            };
             match store.setrev(&state.ns, &key, value, opts, revision).await {
                 Ok(Some(new_rev)) => r::integer(new_rev as i64),
                 Ok(None) => r::error("CONFLICT", "revision mismatch"),
@@ -676,10 +680,11 @@ fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
     }
 }
 
-fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
+fn set_opts_from_args(args: &SetArgs) -> SetOptions {
     SetOptions {
-        ttl: ttl.as_ref().map(ttl_duration_from_spec),
+        ttl: args.ttl.as_ref().map(ttl_duration_from_spec),
         metadata: None,
+        keep_ttl: args.keep_ttl,
     }
 }
 
@@ -793,6 +798,7 @@ mod tests {
             EngineSetOptions {
                 ttl: Some(ttl),
                 metadata: None,
+                keep_ttl: false,
             },
         ))
         .unwrap();
@@ -882,6 +888,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Always,
                     get: false,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -908,6 +915,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Nx,
                     get: false,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -929,6 +937,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Nx,
                     get: false,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -956,6 +965,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Xx,
                     get: false,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -977,6 +987,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Xx,
                     get: false,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -1006,6 +1017,7 @@ mod tests {
                     ttl: None,
                     condition: SetCondition::Always,
                     get: true,
+                    keep_ttl: false,
                 },
             },
             &s,
@@ -1325,6 +1337,124 @@ mod tests {
         run(Command::FlushDb, &s, &mut st);
         let size = run(Command::DbSize, &s, &mut st);
         assert!(matches!(size, Value::Integer(0)));
+    }
+
+    // ── INCR / INCRBY / DECR / DECRBY ────────────────────────────────────────
+
+    #[test]
+    fn incr_missing_key_starts_at_one() {
+        let (s, _t) = store();
+        let res = run(
+            Command::Incr {
+                key: Bytes::from_static(b"ctr"),
+            },
+            &s,
+            &mut state(),
+        );
+        assert!(matches!(res, Value::Integer(1)));
+    }
+
+    #[test]
+    fn incr_increments_existing_value() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"ctr2", b"10");
+        let res = run(
+            Command::Incr {
+                key: Bytes::from_static(b"ctr2"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::Integer(11)));
+    }
+
+    #[test]
+    fn incrby_adds_delta() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"ctr3", b"5");
+        let res = run(
+            Command::IncrBy {
+                key: Bytes::from_static(b"ctr3"),
+                delta: 3,
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::Integer(8)));
+    }
+
+    #[test]
+    fn decr_missing_key_starts_at_minus_one() {
+        let (s, _t) = store();
+        let res = run(
+            Command::Decr {
+                key: Bytes::from_static(b"dtr"),
+            },
+            &s,
+            &mut state(),
+        );
+        assert!(matches!(res, Value::Integer(-1)));
+    }
+
+    #[test]
+    fn decrby_subtracts_delta() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"dtr2", b"10");
+        let res = run(
+            Command::DecrBy {
+                key: Bytes::from_static(b"dtr2"),
+                delta: 4,
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::Integer(6)));
+    }
+
+    #[test]
+    fn incr_non_integer_returns_error() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"badtype", b"notanumber");
+        let res = run(
+            Command::Incr {
+                key: Bytes::from_static(b"badtype"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(
+            matches!(res, Value::SimpleError(..) | Value::BulkError(..)),
+            "expected error for non-integer value, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn incr_preserves_ttl() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_with_ttl(&s, b"ctr-ttl", b"1", Duration::from_secs(60));
+        run(
+            Command::Incr {
+                key: Bytes::from_static(b"ctr-ttl"),
+            },
+            &s,
+            &mut st,
+        );
+        let ttl = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"ctr-ttl"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(
+            matches!(ttl, Value::Integer(n) if n > 0),
+            "INCR must preserve TTL"
+        );
     }
 
     #[test]

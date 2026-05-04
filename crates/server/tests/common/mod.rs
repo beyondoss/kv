@@ -339,6 +339,83 @@ pub fn raw_call_url(req: ureq::Request) -> KvResponse {
     raw_call(req)
 }
 
+// ── SSE watch helpers ─────────────────────────────────────────────────────────
+
+/// A handle to a background thread reading SSE events from the server.
+///
+/// `recv_event` blocks until an event arrives or the 5-second idle timeout
+/// fires (the background reader uses `timeout_read`). Drop this handle when
+/// done; the background thread exits on the next failed send.
+pub struct SseReceiver(std::sync::mpsc::Receiver<serde_json::Value>);
+
+impl SseReceiver {
+    pub fn recv_event(&self) -> Option<serde_json::Value> {
+        self.0.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+}
+
+/// Open an SSE stream on `/namespaces/{ns}/watch/{key}`.
+///
+/// Pass `since` to replay missed events (architecture: `tstamp_ms > since`).
+pub fn watch_key_sse(port: u16, ns: &str, key: &str, since: Option<u64>) -> SseReceiver {
+    let mut url = format!(
+        "http://127.0.0.1:{port}/namespaces/{}/watch/{}",
+        urlencoding::encode(ns),
+        urlencoding::encode(key),
+    );
+    if let Some(s) = since {
+        url.push_str(&format!("?since={s}"));
+    }
+    sse_stream(url)
+}
+
+/// Open an SSE stream on `/namespaces/{ns}/watch?prefix={prefix}`.
+pub fn watch_prefix_sse(port: u16, ns: &str, prefix: &str, since: Option<u64>) -> SseReceiver {
+    let mut url = format!(
+        "http://127.0.0.1:{port}/namespaces/{}/watch?prefix={}",
+        urlencoding::encode(ns),
+        urlencoding::encode(prefix),
+    );
+    if let Some(s) = since {
+        url.push_str(&format!("&since={s}"));
+    }
+    sse_stream(url)
+}
+
+fn sse_stream(url: String) -> SseReceiver {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<serde_json::Value>(64);
+    std::thread::spawn(move || {
+        // 5-second read timeout so the thread exits cleanly when no more
+        // events arrive (e.g. after the test finishes).
+        let agent = ureq::AgentBuilder::new()
+            .timeout_read(std::time::Duration::from_secs(5))
+            .build();
+        let response = match agent.get(&url).call() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut reader = std::io::BufReader::new(response.into_reader());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if let Some(data) = trimmed.strip_prefix("data: ") {
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    SseReceiver(rx)
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn raw_call(req: ureq::Request) -> KvResponse {

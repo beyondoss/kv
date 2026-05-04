@@ -5,6 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use base64::Engine as _;
+use beyond_kv_engine::error::EngineError;
 use beyond_kv_engine::log::now_ms;
 use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::SetOptions;
@@ -175,7 +176,7 @@ async fn route(
 
 async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
     match store.get(ns, key).await {
-        Err(e) => internal_error(&e.to_string()),
+        Err(e) => engine_error_response(e),
         Ok(None) => not_found_json("not_found", "key does not exist"),
         Ok(Some(entry)) => {
             let ttl_secs = entry.expires_at.map(|t| {
@@ -229,7 +230,11 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
-    let opts = SetOptions { ttl, metadata };
+    let opts = SetOptions {
+        ttl,
+        metadata,
+        keep_ttl: false,
+    };
 
     if let Some(expected_rev) = if_match {
         match store.setrev(ns, key, body, opts, expected_rev).await {
@@ -242,7 +247,7 @@ async fn handle_put(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
             ),
-            Err(e) => internal_error(&e.to_string()),
+            Err(e) => engine_error_response(e),
         }
     } else if nx {
         match store.setnx(ns, key, body, opts).await {
@@ -251,7 +256,7 @@ async fn handle_put(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "key already exists" }),
             ),
-            Err(e) => internal_error(&e.to_string()),
+            Err(e) => engine_error_response(e),
         }
     } else if xx {
         match store.setxx(ns, key, body, opts).await {
@@ -260,12 +265,12 @@ async fn handle_put(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "key does not exist" }),
             ),
-            Err(e) => internal_error(&e.to_string()),
+            Err(e) => engine_error_response(e),
         }
     } else {
         match store.set(ns, key, body, opts).await {
             Ok(()) => no_content(),
-            Err(e) => internal_error(&e.to_string()),
+            Err(e) => engine_error_response(e),
         }
     }
 }
@@ -289,13 +294,13 @@ async fn handle_delete(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
             ),
-            Err(e) => internal_error(&e.to_string()),
+            Err(e) => engine_error_response(e),
         };
     }
 
     match store.del(ns, &[key]).await {
         Ok(_) => no_content(),
-        Err(e) => internal_error(&e.to_string()),
+        Err(e) => engine_error_response(e),
     }
 }
 
@@ -307,17 +312,7 @@ async fn handle_incr(
 ) -> http::Response<HttpBody> {
     match store.incr(ns, key, delta).await {
         Ok(n) => json_response(200, &serde_json::json!({ "value": n })),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not an integer") || msg.contains("overflow") {
-                json_response(
-                    400,
-                    &serde_json::json!({ "error": "invalid_value", "message": msg }),
-                )
-            } else {
-                internal_error(&msg)
-            }
-        }
+        Err(e) => engine_error_response(e),
     }
 }
 
@@ -327,12 +322,17 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
         p.push(b'*');
         p
     });
-    // Cursor is a decimal u64 string (URL-safe). "0" or absent = start of scan.
+    // Cursor is a base64-encoded key or "0" for start. Wrap in the \x01 prefix
+    // that store::scan uses to distinguish continuation cursors from the sentinel.
     let cursor_bytes: Vec<u8> = match query_param(query, "cursor") {
         None | Some("0") => b"0".to_vec(),
-        Some(s) => match s.parse::<u64>() {
-            Ok(0) => b"0".to_vec(),
-            Ok(pos) => pos.to_le_bytes().to_vec(),
+        Some(s) => match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
+            Ok(key) => {
+                let mut v = Vec::with_capacity(1 + key.len());
+                v.push(0x01u8);
+                v.extend_from_slice(&key);
+                v
+            }
             Err(_) => b"0".to_vec(), // invalid cursor: restart
         },
     };
@@ -345,7 +345,7 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
         .scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit)
         .await
     {
-        Err(e) => internal_error(&e.to_string()),
+        Err(e) => engine_error_response(e),
         Ok(page) => {
             let keys: Vec<serde_json::Value> = page
                 .keys
@@ -359,17 +359,14 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
             let complete = page.next_cursor == b"0".as_ref();
             let mut body = serde_json::json!({ "keys": keys, "complete": complete });
             if !complete {
-                // Emit cursor as decimal u64 — URL-safe, no re-encoding needed by clients.
-                let pos = if page.next_cursor.len() == 8 {
-                    page.next_cursor
-                        .as_ref()
-                        .try_into()
-                        .map(u64::from_le_bytes)
-                        .unwrap_or(0)
-                } else {
-                    0u64
-                };
-                body["cursor"] = serde_json::Value::String(pos.to_string());
+                // Cursor is b"\x01" + last_key — strip prefix, base64-encode the key.
+                let key = page
+                    .next_cursor
+                    .strip_prefix(b"\x01")
+                    .unwrap_or(&page.next_cursor);
+                body["cursor"] = serde_json::Value::String(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+                );
             }
             json_response(200, &body)
         }
@@ -500,7 +497,7 @@ fn sse_event_json(event: &WatchEvent) -> String {
             revision,
         } => {
             let key_str = String::from_utf8_lossy(key);
-            let value_b64 = base64::engine::general_purpose::STANDARD.encode(value);
+            let value_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
             let mut obj = serde_json::json!({
                 "type": "set",
                 "key": key_str,
@@ -644,6 +641,28 @@ fn payload_too_large() -> http::Response<HttpBody> {
 
 fn not_found_json(code: &str, msg: &str) -> http::Response<HttpBody> {
     json_response(404, &serde_json::json!({ "error": code, "message": msg }))
+}
+
+fn engine_error_response(e: EngineError) -> http::Response<HttpBody> {
+    match e {
+        EngineError::InvalidNamespace { .. } => json_response(
+            400,
+            &serde_json::json!({ "error": "invalid_namespace", "message": e.to_string() }),
+        ),
+        EngineError::CapacityExceeded { .. } => json_response(
+            400,
+            &serde_json::json!({ "error": "capacity_exceeded", "message": e.to_string() }),
+        ),
+        EngineError::InvalidInput { .. } => json_response(
+            400,
+            &serde_json::json!({ "error": "invalid_value", "message": e.to_string() }),
+        ),
+        EngineError::Conflict { .. } => json_response(
+            409,
+            &serde_json::json!({ "error": "conflict", "message": e.to_string() }),
+        ),
+        _ => internal_error(&e.to_string()),
+    }
 }
 
 fn internal_error(msg: &str) -> http::Response<HttpBody> {

@@ -240,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_excludes_keys_absent_from_live_set() {
+        // The caller (NamespaceLog::reclaim) filters expired keys before building
+        // the live set. This test documents that interface contract: keys not in
+        // `live` are absent from the compacted output.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run(async move {
+            let path0 = dir.join(data_filename(0));
+            let file0 = Rc::new(LogFile::open_rw(path0, 0).await.unwrap());
+
+            write_record(&file0, b"expired", b"old", 1, Some(1)).await;
+            let live_entry = write_record(&file0, b"live", b"keep", 2, None).await;
+
+            let live = vec![(Bytes::from("live"), live_entry, None)];
+            let (report, new_entries) = reclaim_namespace(dir, &[file0], 1, &live).await.unwrap();
+
+            assert_eq!(report.live_keys, 1, "only the live key must survive");
+            assert_eq!(new_entries.len(), 1);
+            assert_eq!(new_entries[0].0, Bytes::from("live"));
+        });
+    }
+
+    #[test]
     fn stale_tmp_is_cleared_before_reclaim() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();

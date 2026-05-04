@@ -492,7 +492,11 @@ impl ShardStore {
     pub async fn set(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
-        let expires_at_ms = opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?;
+        let expires_at_ms = if opts.keep_ttl {
+            nslog.index.borrow().ttl(key)
+        } else {
+            opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?
+        };
         let meta_bytes: Vec<u8> = opts
             .metadata
             .as_ref()
@@ -1084,12 +1088,14 @@ impl ShardStore {
         Ok(())
     }
 
-    /// SCAN with bucket-cursor semantics:
-    ///   cursor `b"0"` = start (and the same byte string signals scan complete).
-    ///   continuation cursor = 8 LE bytes of the iteration position.
-    /// Spec-compliant with Redis SCAN: may skip yielded-then-deleted keys, may
-    /// see newly-inserted keys inconsistently. Yield-once is preserved within a
-    /// single page; cross-page guarantees match Redis's documented contract.
+    /// SCAN with key-cursor semantics:
+    ///   cursor `b"0"` = start from the beginning of the keyspace.
+    ///   continuation cursor = `b"\x01"` + last yielded key bytes (exclusive lower bound).
+    ///   `ScanPage::next_cursor == b"0"` signals scan complete.
+    ///
+    /// Keys present for the full duration of a scan appear exactly once.
+    /// Keys inserted or deleted between pages are handled gracefully: a key-based
+    /// cursor is stable regardless of concurrent map mutations.
     pub async fn scan(
         &self,
         ns: &str,
@@ -1100,32 +1106,30 @@ impl ShardStore {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
 
-        let cursor_pos: u64 = if cursor == b"0" {
-            0
-        } else if cursor.len() == 8 {
-            cursor
-                .try_into()
-                .map(u64::from_le_bytes)
-                .expect("cursor is 8 bytes; checked above")
+        let resume_after: Option<&[u8]> = if cursor == b"0" {
+            None
+        } else if let Some(key) = cursor.strip_prefix(b"\x01") {
+            Some(key)
         } else {
-            return Err(EngineError::InvalidInput {
-                reason: "invalid scan cursor",
-            });
+            None // invalid cursor: restart
         };
 
         let pat = pattern;
-        let (keys, next_cursor_pos) =
-            nslog
-                .index
-                .borrow()
-                .scan(cursor_pos, count as usize, now, |k| {
-                    pat.map_or(true, |p| glob_match(p, k))
-                });
+        let (keys, last_key) = nslog
+            .index
+            .borrow()
+            .scan(resume_after, count as usize, now, |k| {
+                pat.map_or(true, |p| glob_match(p, k))
+            });
 
-        let next_cursor = if next_cursor_pos == 0 {
-            Bytes::from_static(b"0")
-        } else {
-            Bytes::copy_from_slice(&next_cursor_pos.to_le_bytes())
+        let next_cursor = match last_key {
+            None => Bytes::from_static(b"0"),
+            Some(k) => {
+                let mut v = Vec::with_capacity(1 + k.len());
+                v.push(0x01u8);
+                v.extend_from_slice(&k);
+                Bytes::from(v)
+            }
         };
         Ok(ScanPage { next_cursor, keys })
     }
@@ -1305,6 +1309,7 @@ mod tests {
             SetOptions {
                 ttl: Some(ttl),
                 metadata: None,
+                keep_ttl: false,
             },
         )
         .await
@@ -1687,6 +1692,7 @@ mod tests {
                 SetOptions {
                     ttl: Some(Duration::from_secs(3600)),
                     metadata: None,
+                    keep_ttl: false,
                 },
             )
             .await

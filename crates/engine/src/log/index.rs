@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -36,8 +38,8 @@ impl IndexEntry {
 
 /// Per-namespace in-memory index.
 pub struct NsIndex {
-    map: FxHashMap<Bytes, IndexEntry>,
-    /// TTL sidecar — only TTL'd keys pay extra memory.
+    map: BTreeMap<Bytes, IndexEntry>,
+    /// TTL sidecar — only TTL'd keys pay extra memory. FxHashMap for O(1) point lookups.
     ttl: FxHashMap<Bytes, u64>,
     /// Best-effort live key count: incremented on insert, decremented on remove.
     /// Lazy-expired keys are included until tombstoned, matching Redis DBSIZE semantics.
@@ -53,7 +55,7 @@ impl Default for NsIndex {
 impl NsIndex {
     pub fn new() -> Self {
         Self {
-            map: FxHashMap::default(),
+            map: BTreeMap::new(),
             ttl: FxHashMap::default(),
             live_count: 0,
         }
@@ -128,51 +130,57 @@ impl NsIndex {
         self.map.iter()
     }
 
-    /// Walk hash buckets starting at `cursor`, yielding up to `count` keys that
-    /// pass `filter` and aren't expired at `now_ms`. Returns `(yielded, next_cursor)`.
-    /// `next_cursor == 0` signals scan complete.
+    /// Walk keys starting after `cursor` (exclusive lower bound), yielding up to
+    /// `count` live keys that pass `filter`. Returns `(yielded, next_cursor)`.
     ///
-    /// Cursor is a position index into `FxHashMap::iter()`. The iteration order
-    /// is NOT stable across any mutation (insert or delete can shift bucket
-    /// positions regardless of rehash). Multi-batch scans are best-effort: keys
-    /// written or deleted between batches may be skipped or returned twice.
-    /// This matches Redis SCAN semantics: callers must tolerate duplicates and
-    /// gaps when the keyspace mutates during iteration.
+    /// `cursor = None` starts from the beginning of the keyspace.
+    /// `cursor = Some(key)` resumes strictly after `key`.
+    /// `next_cursor = None` signals scan complete; `Some(key)` is the exclusive
+    /// lower bound for the next page call.
+    ///
+    /// Because the cursor is a key rather than a position index, it is stable
+    /// across concurrent inserts and deletes: keys present for the full duration
+    /// of a scan appear exactly once. Keys inserted after the cursor position may
+    /// appear; keys deleted before their position is reached will not.
     pub fn scan<F>(
         &self,
-        cursor: u64,
+        cursor: Option<&[u8]>,
         count: usize,
         now_ms: u64,
         mut filter: F,
-    ) -> (Vec<Bytes>, u64)
+    ) -> (Vec<Bytes>, Option<Bytes>)
     where
         F: FnMut(&[u8]) -> bool,
     {
+        use std::collections::Bound;
         let count = count.max(1);
         let mut yielded: Vec<Bytes> = Vec::with_capacity(count.min(4096));
-        let mut next_cursor: u64 = 0;
-        let mut last_idx: u64 = 0;
-        for (i, (k, _v)) in self.map.iter().enumerate() {
-            let i = i as u64;
-            last_idx = i + 1;
-            if i < cursor {
-                continue;
-            }
+
+        let start = match cursor {
+            None => Bound::Unbounded,
+            Some(key) => Bound::Excluded(key),
+        };
+
+        for (k, _v) in self.map.range::<[u8], _>((start, Bound::Unbounded)) {
             if self.ttl.get(k).copied().map_or(false, |ms| ms <= now_ms) {
                 continue;
             }
-            if filter(k) {
-                yielded.push(k.clone());
-                if yielded.len() >= count {
-                    next_cursor = last_idx;
-                    break;
-                }
+            if !filter(k) {
+                continue;
+            }
+            yielded.push(k.clone());
+            if yielded.len() >= count {
+                break;
             }
         }
-        if (last_idx as usize) >= self.map.len() {
-            next_cursor = 0;
-        }
-        (yielded, next_cursor)
+
+        let next = if yielded.len() >= count {
+            yielded.last().cloned()
+        } else {
+            None
+        };
+
+        (yielded, next)
     }
 }
 
@@ -238,16 +246,43 @@ mod tests {
             );
         }
         let mut seen: Vec<Bytes> = Vec::new();
-        let mut cursor = 0u64;
+        let mut cursor: Option<Bytes> = None;
         loop {
-            let (keys, next) = idx.scan(cursor, 7, 0, |_| true);
+            let (keys, next) = idx.scan(cursor.as_deref(), 7, 0, |_| true);
             seen.extend(keys);
             cursor = next;
-            if cursor == 0 {
+            if cursor.is_none() {
                 break;
             }
         }
         assert_eq!(seen.len(), 50);
+    }
+
+    #[test]
+    fn scan_no_duplicates_or_gaps_in_static_map() {
+        // Key-based cursor must yield each key exactly once when the map is stable.
+        let mut idx = NsIndex::new();
+        for i in 0..100u8 {
+            idx.insert(
+                Bytes::copy_from_slice(format!("key-{i:03}").as_bytes()),
+                IndexEntry::new(0, 0, 1, 0),
+                None,
+            );
+        }
+        let mut seen: Vec<Bytes> = Vec::new();
+        let mut cursor: Option<Bytes> = None;
+        loop {
+            let (keys, next) = idx.scan(cursor.as_deref(), 11, 0, |_| true);
+            seen.extend(keys);
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 100, "no gaps");
+        let mut deduped = seen.clone();
+        deduped.dedup();
+        assert_eq!(deduped.len(), seen.len(), "no duplicates");
     }
 
     #[test]
@@ -261,12 +296,12 @@ mod tests {
             );
         }
         let mut seen: Vec<Bytes> = Vec::new();
-        let mut cursor = 0u64;
+        let mut cursor: Option<Bytes> = None;
         loop {
-            let (keys, next) = idx.scan(cursor, 100, 0, |k| k[0] >= b'e');
+            let (keys, next) = idx.scan(cursor.as_deref(), 100, 0, |k| k[0] >= b'e');
             seen.extend(keys);
             cursor = next;
-            if cursor == 0 {
+            if cursor.is_none() {
                 break;
             }
         }
@@ -278,7 +313,7 @@ mod tests {
         let mut idx = NsIndex::new();
         idx.insert(b("live"), IndexEntry::new(0, 0, 1, 0), None);
         idx.insert(b("dead"), IndexEntry::new(0, 0, 1, 0), Some(50));
-        let (keys, _next) = idx.scan(0, 100, 100, |_| true);
+        let (keys, _next) = idx.scan(None, 100, 100, |_| true);
         let strs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
         assert!(strs.contains(&b"live".as_ref()));
         assert!(!strs.contains(&b"dead".as_ref()));
@@ -310,7 +345,7 @@ mod tests {
         idx.insert(b("keep"), IndexEntry::new(0, 0, 1, 1), None);
         idx.insert(b("gone"), IndexEntry::new(0, 1, 1, 2), None);
         idx.remove(b"gone");
-        let (keys, _) = idx.scan(0, 100, 0, |_| true);
+        let (keys, _) = idx.scan(None, 100, 0, |_| true);
         assert!(keys.contains(&b("keep")));
         assert!(!keys.contains(&b("gone")));
     }
@@ -320,7 +355,7 @@ mod tests {
         let mut idx = NsIndex::new();
         idx.insert(b("k"), IndexEntry::new(0, 0, 1, 1), None);
         // count=0 must be clamped to 1 so scan always makes progress.
-        let (keys, _) = idx.scan(0, 0, 0, |_| true);
+        let (keys, _) = idx.scan(None, 0, 0, |_| true);
         assert_eq!(keys.len(), 1);
     }
 }

@@ -127,4 +127,33 @@ mod tests {
         let cfg = parse(&["--threads", "0"]).unwrap();
         assert_eq!(cfg.threads, Some(0));
     }
+
+    // ── Config::validate() ────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_defaults() {
+        let cfg = parse(&[]).unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_memory_bytes() {
+        let mut cfg = parse(&[]).unwrap();
+        cfg.memory_bytes = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_memory_below_thread_count() {
+        let mut cfg = parse(&["--threads", "8"]).unwrap();
+        cfg.memory_bytes = 4;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_memory_equal_to_thread_count() {
+        let mut cfg = parse(&["--threads", "4"]).unwrap();
+        cfg.memory_bytes = 4;
+        assert!(cfg.validate().is_ok());
+    }
 }

@@ -99,19 +99,19 @@ open_namespace(dir, config)
 
 ## Concepts & Terminology
 
-| Term           | What It Controls                                                            | NOT                                                                              |
-| -------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set             | Not a shard — multiple namespaces can live in one shard                          |
-| `LogFile`      | One `data-{id}.log` file; tracks write offset, exposes positioned I/O       | Not a WAL segment; the log IS the store                                          |
-| `active` file  | The only writable file at any time; receives all new appends                | Not memory-mapped; accessed via io_uring                                         |
-| `sealed` files | Immutable; readable only; eligible for reclaim                              | Not deleted until reclaim completes the rename                                   |
-| Footer         | Per-key metadata block at the end of a file; enables fast recovery          | Written to the active file on clean shutdown; absence means crash or in-progress |
-| Tombstone      | A record with the `TOMBSTONE` flag; marks a key as deleted in the log       | Not a physical delete — the old record remains until reclaim                     |
-| TTL-update     | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy | Not authoritative until replayed against the index                               |
-| `NsIndex`      | In-memory `FxHashMap` from key → `IndexEntry`; the read path                | Not persisted — rebuilt from log on every open                                   |
-| `IndexEntry`   | 16-byte struct: file_id + record_offset + record_size + flags               | Does not hold the value or the key                                               |
-| Reclaim        | Operator-triggered GC: rewrites live keys into one new file                 | Never automatic; caller must serialize with writes                               |
-| `flush()`      | Unlinks and recreates all files (CoW snapshot invalidation)                 | Not fsync — this destroys all data in the namespace                              |
+| Term           | What It Controls                                                                                          | NOT                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set                                           | Not a shard — multiple namespaces can live in one shard                          |
+| `LogFile`      | One `data-{id}.log` file; tracks write offset, exposes positioned I/O                                     | Not a WAL segment; the log IS the store                                          |
+| `active` file  | The only writable file at any time; receives all new appends                                              | Not memory-mapped; accessed via io_uring                                         |
+| `sealed` files | Immutable; readable only; eligible for reclaim                                                            | Not deleted until reclaim completes the rename                                   |
+| Footer         | Per-key metadata block at the end of a file; enables fast recovery                                        | Written to the active file on clean shutdown; absence means crash or in-progress |
+| Tombstone      | A record with the `TOMBSTONE` flag; marks a key as deleted in the log                                     | Not a physical delete — the old record remains until reclaim                     |
+| TTL-update     | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy                               | Not authoritative until replayed against the index                               |
+| `NsIndex`      | In-memory `FxHashMap` from key → `IndexEntry`; the read path                                              | Not persisted — rebuilt from log on every open                                   |
+| `IndexEntry`   | 16-byte struct: file_id + record_offset + record_size + flags                                             | Does not hold the value or the key                                               |
+| Reclaim        | GC: rewrites live keys into one new file; auto-triggered by sealed-file count threshold or `BGREWRITEAOF` | Caller must serialize with writes; cannot run concurrently with appends          |
+| `flush()`      | Unlinks and recreates all files (CoW snapshot invalidation)                                               | Not fsync — this destroys all data in the namespace                              |
 
 ## Core Mechanisms
 
@@ -183,9 +183,9 @@ APPENDED       SEALING ──► COMPACTING ────┘
 
 ## Why It Behaves This Way
 
-### Why reclaim is never automatic
+### Why reclaim is not continuous
 
-Reclaim cannot run concurrently with writes — it seals the active file, which would race with in-flight appends. Making it automatic would require either a write lock (adding latency) or a more complex copy-on-write scheme. The current design delegates scheduling to the operator (or a higher-level controller), keeping the engine simple and the hot path uncontested.
+Reclaim cannot run concurrently with writes — it seals the active file, which would race with in-flight appends. Instead, the server schedules it between async tasks: when the sealed-file count exceeds `--reclaim-sealed-threshold` (default: 4), a reclaim runs on the next `--reclaim-interval-secs` tick (default: 300s). `BGREWRITEAOF` triggers the same path immediately. The hot path stays uncontested; reclaim is a periodic stop-the-append, not a background thread.
 
 ### Why TTL-update is a separate record type
 

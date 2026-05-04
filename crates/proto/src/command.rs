@@ -24,6 +24,7 @@ pub struct SetArgs {
     pub ttl: Option<SetTtl>,
     pub condition: SetCondition,
     pub get: bool,
+    pub keep_ttl: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +541,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
     let mut ttl = None;
     let mut condition = SetCondition::Always;
     let mut get = false;
+    let mut keep_ttl = false;
     let mut i = 3;
     while i < args.len() {
         let opt = bulk(&args[i])?;
@@ -601,7 +603,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             b"NX" => condition = SetCondition::Nx,
             b"XX" => condition = SetCondition::Xx,
             b"GET" => get = true,
-            b"KEEPTTL" => {} // preserve existing TTL — engine is responsible for the semantics
+            b"KEEPTTL" => keep_ttl = true,
             b"REV" => {
                 i += 1;
                 if i >= args.len() {
@@ -620,6 +622,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             ttl,
             condition,
             get,
+            keep_ttl,
         },
     })
 }

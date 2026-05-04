@@ -252,6 +252,53 @@ fn pttl_on_key_with_expiry_returns_millis() {
     );
 }
 
+#[test]
+fn set_keepttl_preserves_existing_ttl() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = redis::cmd("SET")
+        .arg("kt")
+        .arg("v1")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
+    let ttl_before: i64 = con.ttl("kt").unwrap();
+    assert!(ttl_before > 0, "expected TTL set, got {ttl_before}");
+
+    let _: () = redis::cmd("SET")
+        .arg("kt")
+        .arg("v2")
+        .arg("KEEPTTL")
+        .query(&mut con)
+        .unwrap();
+
+    let got: Vec<u8> = con.get("kt").unwrap();
+    assert_eq!(got, b"v2");
+    let ttl_after: i64 = con.ttl("kt").unwrap();
+    assert!(
+        ttl_after > 0,
+        "KEEPTTL should preserve TTL, got {ttl_after}"
+    );
+}
+
+#[test]
+fn set_keepttl_on_key_without_ttl_stays_persistent() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("kt2", "v1").unwrap();
+    assert_eq!(con.ttl::<_, i64>("kt2").unwrap(), -1);
+
+    let _: () = redis::cmd("SET")
+        .arg("kt2")
+        .arg("v2")
+        .arg("KEEPTTL")
+        .query(&mut con)
+        .unwrap();
+
+    assert_eq!(con.ttl::<_, i64>("kt2").unwrap(), -1);
+}
+
 // ── EXPIRE / PEXPIRE ──────────────────────────────────────────────────────────
 
 #[test]
@@ -515,6 +562,33 @@ fn mset_writes_all_keys_atomically_via_write_batch() {
     assert_eq!(c, "3");
 }
 
+#[test]
+fn mset_clears_ttl_on_overwrite() {
+    // MSET does not accept per-key TTL options, so overwriting a key with an
+    // active TTL should clear the TTL (Redis-compatible behaviour).
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = redis::cmd("SET")
+        .arg("mset-ttl-k")
+        .arg("v1")
+        .arg("EX")
+        .arg(60u64)
+        .query(&mut con)
+        .unwrap();
+    assert!(
+        con.ttl::<_, i64>("mset-ttl-k").unwrap() > 0,
+        "key must have TTL before MSET overwrite"
+    );
+
+    let _: () = con.mset(&[("mset-ttl-k", "v2")]).unwrap();
+    assert_eq!(
+        con.ttl::<_, i64>("mset-ttl-k").unwrap(),
+        -1,
+        "MSET overwrite must clear TTL"
+    );
+    assert_eq!(con.get::<_, String>("mset-ttl-k").unwrap(), "v2");
+}
+
 // ── GETSET / SETNX / GETDEL ──────────────────────────────────────────────────
 
 #[test]
@@ -646,6 +720,59 @@ fn getex_on_missing_key_returns_nil() {
         .query(&mut con)
         .unwrap();
     assert!(matches!(res, redis::Value::Nil));
+}
+
+// ── GETEX with EXAT / PXAT ────────────────────────────────────────────────────
+
+#[test]
+fn getex_with_exat_sets_ttl_as_unix_secs() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("gex-exat", "v").unwrap();
+
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+
+    let val: Vec<u8> = redis::cmd("GETEX")
+        .arg("gex-exat")
+        .arg("EXAT")
+        .arg(future_ts)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(val, b"v");
+
+    let ttl: i64 = con.ttl("gex-exat").unwrap();
+    assert!(ttl > 0 && ttl <= 60, "GETEX EXAT should set TTL, got {ttl}");
+}
+
+#[test]
+fn getex_with_pxat_sets_ttl_as_unix_millis() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("gex-pxat", "v").unwrap();
+
+    let future_ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 30_000;
+
+    let val: Vec<u8> = redis::cmd("GETEX")
+        .arg("gex-pxat")
+        .arg("PXAT")
+        .arg(future_ts_ms)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(val, b"v");
+
+    let pttl: i64 = con.pttl("gex-pxat").unwrap();
+    assert!(
+        pttl > 0 && pttl <= 30_000,
+        "GETEX PXAT should set TTL in ms, got {pttl}"
+    );
 }
 
 // ── KEYS / SCAN ───────────────────────────────────────────────────────────────
@@ -1081,6 +1208,59 @@ fn setrev_conflict_on_missing_key() {
     assert!(msg.contains("conflict") || msg.contains("err"), "{msg}");
 }
 
+// ── SETREV with TTL options ────────────────────────────────────────────────────
+
+#[test]
+fn setrev_with_ex_sets_ttl() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("sr-ttl", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("sr-ttl")
+        .query(&mut con)
+        .unwrap();
+    assert!(rev > 0);
+
+    let new_rev: i64 = redis::cmd("SETREV")
+        .arg("sr-ttl")
+        .arg("v2")
+        .arg(rev)
+        .arg("EX")
+        .arg(60u64)
+        .query(&mut con)
+        .unwrap();
+    assert!(new_rev > rev, "SETREV should return new revision");
+
+    let ttl: i64 = con.ttl("sr-ttl").unwrap();
+    assert!(ttl > 0 && ttl <= 60, "SETREV EX should set TTL, got {ttl}");
+}
+
+#[test]
+fn setrev_with_px_sets_ttl_in_millis() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("sr-pttl", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("sr-pttl")
+        .query(&mut con)
+        .unwrap();
+
+    let _: i64 = redis::cmd("SETREV")
+        .arg("sr-pttl")
+        .arg("v2")
+        .arg(rev)
+        .arg("PX")
+        .arg(30_000u64)
+        .query(&mut con)
+        .unwrap();
+
+    let pttl: i64 = con.pttl("sr-pttl").unwrap();
+    assert!(
+        pttl > 0 && pttl <= 30_000,
+        "SETREV PX should set TTL in ms, got {pttl}"
+    );
+}
+
 // ── SET with REV condition ─────────────────────────────────────────────────────
 
 #[test]
@@ -1352,4 +1532,236 @@ fn pwatch_streams_prefix_events() {
     let (pt2, ps2) = raw.read_push();
     assert_eq!(pt2, "watch");
     assert_eq!(ps2, "set");
+}
+
+// ── BGREWRITEAOF (reclaim) ────────────────────────────────────────────────────
+
+#[test]
+fn reclaim_preserves_all_keys() {
+    // Two BGREWRITEAOF calls are required to trigger actual compaction:
+    // the first seals the active file (→ 1 sealed file, no compaction yet);
+    // the second seals the new active (→ 2 sealed files, compaction runs).
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+
+    let n = 100usize;
+    for i in 0..n {
+        let _: () = con.set(format!("rcl-{i:03}"), format!("val-{i}")).unwrap();
+    }
+
+    // First BGREWRITEAOF: seals the active file, opens a fresh one.
+    let msg: String = redis::cmd("BGREWRITEAOF").query(&mut con).unwrap();
+    assert!(
+        msg.to_lowercase().contains("started") || msg.to_lowercase().contains("ok"),
+        "unexpected BGREWRITEAOF reply: {msg}"
+    );
+
+    // Write more keys into the newly opened active file.
+    for i in n..n + 50 {
+        let _: () = con.set(format!("rcl-{i:03}"), format!("val-{i}")).unwrap();
+    }
+
+    // Second BGREWRITEAOF: seals the second file → 2 sealed files → compaction.
+    let _: redis::Value = redis::cmd("BGREWRITEAOF").query(&mut con).unwrap();
+
+    // Every key written before or between the two reclaims must survive.
+    for i in 0..n + 50 {
+        let val: Option<String> = con.get(format!("rcl-{i:03}")).unwrap();
+        assert_eq!(
+            val.as_deref(),
+            Some(format!("val-{i}").as_str()),
+            "key rcl-{i:03} lost after reclaim"
+        );
+    }
+}
+
+// ── FLUSHDB notifies watchers ─────────────────────────────────────────────────
+
+#[test]
+fn watch_receives_del_event_after_flushdb() {
+    // store::flush_db() snapshots live keys and notifies watchers with Del
+    // events. A WATCH subscriber must receive a del push for each key that
+    // existed at flush time.
+    let srv = TestServer::start();
+
+    // Write a key and get a watcher on it before the flush.
+    let mut con = srv.resp();
+    let _: () = con.set("flush-watch-k", "v").unwrap();
+
+    let mut raw = MinResp3::connect(srv.resp_port);
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+    raw.send(&[b"WATCH", b"flush-watch-k"]);
+
+    // Consume the initial "ready" push (and optional initial "set" push).
+    loop {
+        let (pt, ps) = raw.read_push();
+        assert_eq!(pt, "watch");
+        if ps == "ready" {
+            break;
+        }
+    }
+
+    // Flush the database — watcher should receive a del event.
+    let _: () = redis::cmd("FLUSHDB").query(&mut con).unwrap();
+
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(ps, "del", "FLUSHDB must deliver del push to watchers");
+}
+
+// ── WATCH SINCE (catch-up replay) ─────────────────────────────────────────────
+
+#[test]
+fn watch_since_replays_missed_write() {
+    // Architecture guarantee: WATCH key SINCE <rev> replays all mutations
+    // with tstamp_ms > rev before sending "ready". This is the reconnection
+    // contract — clients provide their last-seen revision to get any events
+    // they missed while disconnected.
+    let srv = TestServer::start();
+
+    let mut con = srv.resp();
+    let _: () = con.set("ws-since", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("ws-since")
+        .query(&mut con)
+        .unwrap();
+    assert!(rev > 0);
+
+    // Write v2 while not watching — this is the "missed" event.
+    let _: () = con.set("ws-since", "v2").unwrap();
+
+    // Subscribe with SINCE=rev(v1). Should receive the v2 catch-up, then ready.
+    let mut raw = MinResp3::connect(srv.resp_port);
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+
+    let rev_str = rev.to_string();
+    raw.send(&[b"WATCH", b"ws-since", b"SINCE", rev_str.as_bytes()]);
+
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(ps, "set", "expected catch-up set event for v2 write");
+
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(ps, "ready");
+}
+
+#[test]
+fn watch_since_current_rev_emits_only_ready() {
+    // SINCE=current_revision: no mutations after that point → only "ready",
+    // no catch-up events.
+    let srv = TestServer::start();
+
+    let mut con = srv.resp();
+    let _: () = con.set("ws-curr", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("ws-curr")
+        .query(&mut con)
+        .unwrap();
+
+    let mut raw = MinResp3::connect(srv.resp_port);
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+
+    let rev_str = rev.to_string();
+    raw.send(&[b"WATCH", b"ws-curr", b"SINCE", rev_str.as_bytes()]);
+
+    // First (and only) push should be "ready" — no mutations since rev.
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(
+        ps, "ready",
+        "no catch-up expected when SINCE equals current revision"
+    );
+}
+
+// ── Concurrent INCR ───────────────────────────────────────────────────────────
+
+#[test]
+fn concurrent_incr_produces_correct_sum() {
+    // Each connection exercises the CAS retry loop inside store::incr():
+    // when two coroutines overlap at the disk-write await point, one CAS
+    // loses and re-reads before retrying. The final count must equal
+    // THREADS × PER_THREAD regardless of interleaving order.
+    let srv = TestServer::start();
+    let port = srv.resp_port;
+
+    const THREADS: usize = 4;
+    const PER_THREAD: i64 = 25;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut con = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+                    .unwrap()
+                    .get_connection()
+                    .unwrap();
+                for _ in 0..PER_THREAD {
+                    let _: i64 = redis::cmd("INCR")
+                        .arg("concurrent-ctr")
+                        .query(&mut con)
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let mut con = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let final_val: i64 = con.get("concurrent-ctr").unwrap();
+    assert_eq!(
+        final_val,
+        THREADS as i64 * PER_THREAD,
+        "concurrent INCR total mismatch: expected {}, got {final_val}",
+        THREADS as i64 * PER_THREAD
+    );
+}
+
+// ── SCAN under concurrent writes ──────────────────────────────────────────────
+
+#[test]
+fn scan_completes_under_concurrent_writes() {
+    // Key-based cursor: keys that existed before the scan started and are not
+    // deleted during the scan must all appear exactly once. Newly-inserted keys
+    // may or may not appear depending on whether they fall after the cursor.
+    let srv = TestServer::start();
+    let port = srv.resp_port;
+
+    let mut scanner = srv.resp();
+    for i in 0..50i32 {
+        let _: () = scanner.set(format!("sc-base-{i:02}"), "v").unwrap();
+    }
+
+    // Writer thread: insert new keys concurrently with the SCAN below.
+    let handle = std::thread::spawn(move || {
+        let mut w = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        for i in 0..50i32 {
+            let _: () = w.set(format!("sc-new-{i:02}"), "v").unwrap_or(());
+        }
+    });
+
+    let found = scan_all(&mut scanner, None);
+    handle.join().unwrap();
+
+    // All 50 pre-existing keys must appear exactly once — no gaps, no duplicates.
+    let mut base_found: Vec<_> = found.iter().filter(|k| k.starts_with("sc-base-")).collect();
+    base_found.sort();
+    base_found.dedup();
+    assert_eq!(
+        base_found.len(),
+        50,
+        "all pre-existing keys must appear in SCAN: got {}/50",
+        base_found.len()
+    );
 }

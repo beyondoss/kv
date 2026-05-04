@@ -582,3 +582,129 @@ fn incr_patch_returns_405() {
     let res = common::raw_call_url(ureq::patch(&url));
     assert_eq!(res.status, 405);
 }
+
+// ── HTTP Watch (SSE) ──────────────────────────────────────────────────────────
+
+#[test]
+fn watch_key_receives_set_event() {
+    let srv = TestServer::start();
+    let sse = common::watch_key_sse(srv.http_port, "default", "sse-set-k", None);
+
+    // No existing key → first event is "ready".
+    let ready = sse.recv_event().expect("expected ready event");
+    assert_eq!(ready["type"], "ready", "first event must be ready: {ready}");
+
+    // Write the key — must produce a "set" watch event.
+    srv.put("sse-set-k", b"hello-sse");
+
+    let event = sse.recv_event().expect("expected set event after PUT");
+    assert_eq!(event["type"], "set", "expected set event: {event}");
+    assert_eq!(event["key"], "sse-set-k");
+    assert!(
+        event["revision"].as_u64().unwrap_or(0) > 0,
+        "revision must be positive"
+    );
+}
+
+#[test]
+fn watch_key_receives_del_event() {
+    let srv = TestServer::start();
+    srv.put("sse-del-k", b"to-delete");
+
+    let sse = common::watch_key_sse(srv.http_port, "default", "sse-del-k", None);
+
+    // Key exists — initial state push (set), then ready.
+    let init = sse.recv_event().expect("expected initial set event");
+    assert_eq!(init["type"], "set", "expected initial state set: {init}");
+    let ready = sse.recv_event().expect("expected ready event");
+    assert_eq!(ready["type"], "ready", "expected ready: {ready}");
+
+    // Delete the key.
+    srv.delete("sse-del-k");
+
+    let event = sse.recv_event().expect("expected del event after DELETE");
+    assert_eq!(event["type"], "del", "expected del event: {event}");
+    assert_eq!(event["key"], "sse-del-k");
+}
+
+#[test]
+fn watch_since_replays_missed_event() {
+    // Architecture guarantee: ?since=<rev> replays mutations with tstamp_ms > rev.
+    // This models a client reconnecting after a disconnect.
+    let srv = TestServer::start();
+
+    srv.put("sse-since-k", b"v1");
+
+    // Capture revision of v1 via RESP REVISION command.
+    let rev: u64 = {
+        let mut con = srv.resp();
+        redis::cmd("REVISION")
+            .arg("sse-since-k")
+            .query::<i64>(&mut con)
+            .unwrap() as u64
+    };
+    assert!(rev > 0);
+
+    // Write v2 without watching — this is the event we want to replay.
+    srv.put("sse-since-k", b"v2");
+
+    // Watch with since=rev(v1): should get the v2 catch-up event, then ready.
+    let sse = common::watch_key_sse(srv.http_port, "default", "sse-since-k", Some(rev));
+
+    let catchup = sse.recv_event().expect("expected catch-up set event");
+    assert_eq!(catchup["type"], "set", "expected set catch-up: {catchup}");
+    assert_eq!(catchup["key"], "sse-since-k");
+
+    let ready = sse.recv_event().expect("expected ready after catch-up");
+    assert_eq!(ready["type"], "ready", "expected ready: {ready}");
+}
+
+#[test]
+fn watch_prefix_receives_matching_events_only() {
+    let srv = TestServer::start();
+    let sse = common::watch_prefix_sse(srv.http_port, "default", "pfx:", None);
+
+    // No existing keys with prefix → ready arrives immediately.
+    let ready = sse.recv_event().expect("expected ready event");
+    assert_eq!(ready["type"], "ready", "expected ready: {ready}");
+
+    // Write a matching key.
+    srv.put("pfx:alpha", b"a");
+    let ev1 = sse.recv_event().expect("expected set event for pfx:alpha");
+    assert_eq!(ev1["type"], "set", "expected set: {ev1}");
+    assert_eq!(ev1["key"], "pfx:alpha");
+
+    // Write a non-matching key — should produce no event.
+    srv.put("other:beta", b"b");
+
+    // Write another matching key — this event must arrive (not the other:beta one).
+    srv.put("pfx:gamma", b"g");
+    let ev2 = sse.recv_event().expect("expected set event for pfx:gamma");
+    assert_eq!(ev2["type"], "set", "expected set: {ev2}");
+    assert_eq!(ev2["key"], "pfx:gamma");
+}
+
+// ── Namespace validation ──────────────────────────────────────────────────────
+
+#[test]
+fn namespace_with_invalid_chars_returns_error() {
+    // Namespace names allow only ASCII alphanumeric, '_', and '-'.
+    // A period is not allowed; the store returns InvalidNamespace — the server
+    // must not respond with 2xx or panic.
+    let srv = TestServer::start();
+    let res = srv.get_ns("invalid.ns", "k");
+    assert_eq!(res.status, 400, "invalid namespace chars must return 400");
+    let body = res.json();
+    assert_eq!(body["error"], "invalid_namespace");
+}
+
+#[test]
+fn namespace_too_long_returns_error() {
+    // is_valid_ns_name rejects names longer than 64 bytes.
+    let srv = TestServer::start();
+    let long_ns: String = "a".repeat(65);
+    let res = srv.get_ns(&long_ns, "k");
+    assert_eq!(res.status, 400, "namespace name >64 chars must return 400");
+    let body = res.json();
+    assert_eq!(body["error"], "invalid_namespace");
+}

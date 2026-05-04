@@ -13,6 +13,10 @@ When spawning Task subagents to read files (e.g., for parallel codebase explorat
 
 You are auditing the testing posture of a codebase area. Your job is to find the tests that are MISSING — the ones that would have caught the bug that ships at 2am on a Friday. Prioritize ruthlessly.
 
+## Mandate
+
+**YOUR JOB** should you find a bug, is to **fix** the bug. Not work around it by changing the test. If you are caught working around it, you will be **FIRED**.
+
 ## Step 1: Detect Persona
 
 Use the same persona auto-detection as the `audit` skill based on target directory language. A rustacean evaluates `#[cfg(test)]` modules and integration tests differently than a gopher evaluates `_test.go` files.
