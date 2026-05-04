@@ -40,37 +40,38 @@ await kv.close();
 
 ## Operations
 
-| Operation     | RESP command                                                                               | HTTP                                                                                   |
-| ------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| Get           | `GET key`                                                                                  | `GET /namespaces/{ns}/values/{key}`                                                    |
-| Set           | `SET key value [EX n] [NX\|XX]`                                                            | `PUT /namespaces/{ns}/values/{key}`                                                    |
-| Set if absent | `SETNX key value`                                                                          | `PUT /namespaces/{ns}/values/{key}?nx=1`                                               |
-| Compare+set   | _(none — use `SET XX` after `GET`)_                                                        | `PUT /namespaces/{ns}/values/{key}` + `if-match: <revision>`                           |
-| Delete        | `DEL key`                                                                                  | `DELETE /namespaces/{ns}/values/{key}`                                                 |
-| Exists        | `EXISTS key`                                                                               | —                                                                                      |
-| Get+set       | `GETSET key value`                                                                         | —                                                                                      |
-| Get+delete    | `GETDEL key`                                                                               | —                                                                                      |
-| Get+expire    | `GETEX key [EX n \| PERSIST]`                                                              | —                                                                                      |
-| Increment     | `INCR key` / `INCRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=n`                                      |
-| Decrement     | `DECR key` / `DECRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=-n`                                     |
-| Bulk get      | `MGET k1 k2 ...`                                                                           | parallel requests                                                                      |
-| Bulk set      | `MSET k1 v1 k2 v2 ...`                                                                     | parallel requests                                                                      |
-| Scan          | `SCAN cursor [MATCH pat] [COUNT n]`                                                        | `GET /namespaces/{ns}/keys?cursor=0&prefix=p`                                          |
-| Keys          | `KEYS pattern`                                                                             | —                                                                                      |
-| TTL (get)     | `TTL key` / `PTTL key`                                                                     | `X-KV-TTL` response header                                                             |
-| TTL (set)     | `EXPIRE key n` / `PEXPIRE key ms` / `EXPIREAT key ts` / `PEXPIREAT key ts` / `PERSIST key` | `X-KV-TTL` request header                                                              |
-| Watch         | `WATCH key ...` / `PWATCH prefix ...` / `UNWATCH`                                          | `GET /namespaces/{ns}/watch/{key}` (SSE) / `GET /namespaces/{ns}/watch?prefix=p` (SSE) |
-| Namespace     | `SELECT 0–15`                                                                              | path: `/namespaces/{name}/...`                                                         |
-| Count         | `DBSIZE`                                                                                   | —                                                                                      |
-| Flush         | `FLUSHDB`                                                                                  | —                                                                                      |
+| Operation      | RESP command                                                                               | HTTP                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Get            | `GET key`                                                                                  | `GET /namespaces/{ns}/values/{key}`                                                    |
+| Set            | `SET key value [EX n] [NX\|XX]`                                                            | `PUT /namespaces/{ns}/values/{key}`                                                    |
+| Set if absent  | `SETNX key value`                                                                          | `PUT /namespaces/{ns}/values/{key}?nx=1`                                               |
+| Revision (get) | `REVISION key`                                                                             | `X-KV-Revision` response header on GET                                                 |
+| Compare+set    | `SETREV key value revision [EX n]`                                                         | `PUT /namespaces/{ns}/values/{key}` + `if-match: <revision>`                           |
+| Delete         | `DEL key`                                                                                  | `DELETE /namespaces/{ns}/values/{key}`                                                 |
+| Exists         | `EXISTS key`                                                                               | —                                                                                      |
+| Get+set        | `GETSET key value`                                                                         | —                                                                                      |
+| Get+delete     | `GETDEL key`                                                                               | —                                                                                      |
+| Get+expire     | `GETEX key [EX n \| PERSIST]`                                                              | —                                                                                      |
+| Increment      | `INCR key` / `INCRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=n`                                      |
+| Decrement      | `DECR key` / `DECRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=-n`                                     |
+| Bulk get       | `MGET k1 k2 ...`                                                                           | parallel requests                                                                      |
+| Bulk set       | `MSET k1 v1 k2 v2 ...`                                                                     | parallel requests                                                                      |
+| Scan           | `SCAN cursor [MATCH pat] [COUNT n]`                                                        | `GET /namespaces/{ns}/keys?cursor=0&prefix=p`                                          |
+| Keys           | `KEYS pattern`                                                                             | —                                                                                      |
+| TTL (get)      | `TTL key` / `PTTL key`                                                                     | `X-KV-TTL` response header                                                             |
+| TTL (set)      | `EXPIRE key n` / `PEXPIRE key ms` / `EXPIREAT key ts` / `PEXPIREAT key ts` / `PERSIST key` | `X-KV-TTL` request header                                                              |
+| Watch          | `WATCH key ...` / `PWATCH prefix ...` / `UNWATCH`                                          | `GET /namespaces/{ns}/watch/{key}` (SSE) / `GET /namespaces/{ns}/watch?prefix=p` (SSE) |
+| Namespace      | `SELECT 0–15`                                                                              | path: `/namespaces/{name}/...`                                                         |
+| Count          | `DBSIZE`                                                                                   | —                                                                                      |
+| Flush          | `FLUSHDB`                                                                                  | —                                                                                      |
 
 TTL is stored as an absolute millisecond timestamp. `EXPIRE`/`PERSIST` update a sidecar map without rewriting the value. Expiry is lazy on access; a background sweep handles L1 eviction.
 
 `INCR`/`INCRBY`/`DECR`/`DECRBY` interpret the stored value as a UTF-8 decimal integer and return the new value as an integer reply. The operation is atomic per shard. Over HTTP, pass a negative `delta` to decrement.
 
-Compare-and-swap over HTTP: `GET` a key to read its `X-KV-Revision` header, then `PUT` with `if-match: <revision>`. The server atomically rejects the write if the revision has changed.
+Compare-and-swap: read the current revision with `REVISION key` (RESP) or from the `X-KV-Revision` response header (HTTP), then write conditionally with `SETREV key value revision [EX n]` (RESP) or `PUT` + `if-match: <revision>` (HTTP). The write is atomic — nil on mismatch, the new revision integer on success. The TypeScript SDK exposes this as `kv.set(key, value, { ifMatch: entry.revision })` on both backends.
 
-`WATCH` / `PWATCH` over RESP3 deliver push messages on key writes — send `HELLO 3` first; `UNWATCH` cancels all subscriptions. Over HTTP, the SSE endpoints stream the same events; closing the connection is equivalent to `UNWATCH`.
+`WATCH key [SINCE revision]` / `PWATCH prefix [SINCE revision]` deliver RESP3 push messages on key writes — send `HELLO 3` first; `UNWATCH` cancels all subscriptions. `SINCE` replays all mutations recorded after that revision from the append-only log, so reconnecting clients never miss events. Over HTTP, the SSE endpoints do the same via `?since=revision`; closing the connection is equivalent to `UNWATCH`. The TypeScript SDK's `kv.watch(key)` / `kv.watch(prefix, { prefix: true })` works on both backends with automatic reconnect and `since` tracking built in.
 
 ## TypeScript SDK
 

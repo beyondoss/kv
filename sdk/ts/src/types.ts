@@ -10,7 +10,6 @@ export interface KvEntry {
   /**
    * Monotonically-increasing revision (server write timestamp in ms).
    * Use with `ifMatch` in `KvSetOptions` for compare-and-swap.
-   * HTTP backend only; `0` when using the RESP backend (use RESP `GET` + `SET … REV` directly).
    */
   revision: number;
 }
@@ -29,7 +28,7 @@ export interface KvSetOptions {
   xx?: boolean;
   /**
    * Compare-and-swap: only set if the current revision matches this value.
-   * Throws `KvError` (409) on mismatch. HTTP backend only.
+   * Throws `KvError` (409) on mismatch.
    * Obtain the current revision from `kv.get()`.
    */
   ifMatch?: number;

@@ -299,6 +299,26 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             Err(e) => r::error("ERR", &e.to_string()),
         },
 
+        Command::Revision { key } => match store.get(&state.ns, &key).await {
+            Ok(Some(entry)) => r::integer(entry.revision as i64),
+            Ok(None) => r::integer(-2),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
+
+        Command::SetRev {
+            key,
+            value,
+            revision,
+            ttl,
+        } => {
+            let opts = set_opts_from_args(&ttl);
+            match store.setrev(&state.ns, &key, value, opts, revision).await {
+                Ok(Some(new_rev)) => r::integer(new_rev as i64),
+                Ok(None) => r::nil(),
+                Err(e) => r::error("ERR", &e.to_string()),
+            }
+        }
+
         // Watch commands are intercepted in handle_conn before dispatch reaches here.
         Command::Watch { .. } | Command::PWatch { .. } | Command::Unwatch => r::error(
             "ERR",
@@ -719,6 +739,8 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Watch { .. } => "WATCH",
         Command::PWatch { .. } => "PWATCH",
         Command::Unwatch => "UNWATCH",
+        Command::Revision { .. } => "REVISION",
+        Command::SetRev { .. } => "SETREV",
     }
 }
 

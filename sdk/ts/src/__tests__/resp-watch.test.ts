@@ -10,6 +10,7 @@
 import * as net from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createKvClient, type KvClient } from "../client.js";
+import type { KvWatchEvent } from "../types.js";
 import { getRespUrl, uniqueKey } from "./harness.js";
 
 // ── minimal RESP3 codec ───────────────────────────────────────────────────────
@@ -394,5 +395,181 @@ describe("RESP3 PWATCH — prefix", () => {
     expect(respStr(push.push[2]!)).toBe(match);
 
     conn.close();
+  });
+});
+
+// ── SDK-level watch() tests ──────────────────────────────────────────────────
+
+async function take(
+  gen: AsyncGenerator<KvWatchEvent>,
+  n: number,
+): Promise<KvWatchEvent[]> {
+  const out: KvWatchEvent[] = [];
+  for await (const v of gen) {
+    out.push(v);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+function decUtf8(b?: Uint8Array): string {
+  return b ? new TextDecoder().decode(b) : "";
+}
+
+describe("RESP backend — kv.watch() SDK", () => {
+  it("yields a ready event on a non-existent key", async () => {
+    const key = uniqueKey("sdk-watch");
+    const ctrl = new AbortController();
+    const gen = kv.watch(key, { signal: ctrl.signal });
+    const events = await take(gen, 1);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("ready");
+    expect(events[0]!.revision).toBe(0);
+    ctrl.abort();
+    await gen.return(undefined);
+  });
+
+  it("yields ready preceded by initial set when key already exists", async () => {
+    const key = uniqueKey("sdk-watch");
+    await kv.set(key, "hello");
+
+    const ctrl = new AbortController();
+    const gen = kv.watch(key, { signal: ctrl.signal });
+    const events = await take(gen, 2);
+    expect(events).toHaveLength(2);
+    expect(events[0]!.type).toBe("set");
+    expect(events[0]!.key).toBe(key);
+    expect(decUtf8(events[0]!.value)).toBe("hello");
+    expect(events[0]!.revision).toBeGreaterThan(0);
+    expect(events[1]!.type).toBe("ready");
+
+    ctrl.abort();
+    await gen.return(undefined);
+  });
+
+  it("yields a set event when the key is written after subscribing", async () => {
+    const key = uniqueKey("sdk-watch");
+    const ctrl = new AbortController();
+    const gen = kv.watch(key, { signal: ctrl.signal });
+
+    // Wait for ready
+    const ready = await take(gen, 1);
+    expect(ready[0]!.type).toBe("ready");
+
+    // Write in background, then collect next event
+    const collect = take(gen, 1);
+    await kv.set(key, "world");
+    const events = await collect;
+    expect(events[0]!.type).toBe("set");
+    expect(events[0]!.key).toBe(key);
+    expect(decUtf8(events[0]!.value)).toBe("world");
+    expect(events[0]!.revision).toBeGreaterThan(0);
+
+    ctrl.abort();
+    await gen.return(undefined);
+  });
+
+  it("yields a del event when the key is deleted", async () => {
+    const key = uniqueKey("sdk-watch");
+    await kv.set(key, "v");
+
+    const ctrl = new AbortController();
+    const gen = kv.watch(key, { signal: ctrl.signal });
+
+    // Skip initial set + ready
+    await take(gen, 2);
+
+    const collect = take(gen, 1);
+    await kv.delete(key);
+    const events = await collect;
+    expect(events[0]!.type).toBe("del");
+    expect(events[0]!.key).toBe(key);
+    expect(events[0]!.revision).toBeGreaterThan(0);
+
+    ctrl.abort();
+    await gen.return(undefined);
+  });
+
+  it("with prefix:true receives events for matching keys only", async () => {
+    const prefix = `sdk-pfx:${crypto.randomUUID()}:`;
+    const match = `${prefix}a`;
+    const noMatch = uniqueKey("other");
+
+    const ctrl = new AbortController();
+    const gen = kv.watch(prefix, { prefix: true, signal: ctrl.signal });
+    const ready = await take(gen, 1);
+    expect(ready[0]!.type).toBe("ready");
+
+    const collect = take(gen, 1);
+    await kv.set(noMatch, "x"); // should be filtered server-side
+    await kv.set(match, "y"); // should arrive
+    const events = await collect;
+    expect(events[0]!.type).toBe("set");
+    expect(events[0]!.key).toBe(match);
+    expect(decUtf8(events[0]!.value)).toBe("y");
+
+    ctrl.abort();
+    await gen.return(undefined);
+  });
+
+  it("stops when the AbortSignal is aborted (generator returns)", async () => {
+    const key = uniqueKey("sdk-watch");
+    const ctrl = new AbortController();
+    const gen = kv.watch(key, { signal: ctrl.signal });
+
+    // Receive the ready frame.
+    await take(gen, 1);
+
+    // Abort, then the generator should complete.
+    ctrl.abort();
+
+    // Drain remaining events; the loop must exit.
+    const remaining: KvWatchEvent[] = [];
+    for await (const e of gen) {
+      remaining.push(e);
+      if (remaining.length > 5) break; // safety
+    }
+    // We don't care what's in `remaining`; we just need the loop to terminate.
+    expect(true).toBe(true);
+  });
+
+  it("with since replays missed events on reconnect", async () => {
+    const key = uniqueKey("sdk-watch");
+
+    // First watch: capture revision after first write.
+    const ctrl1 = new AbortController();
+    const gen1 = kv.watch(key, { signal: ctrl1.signal });
+    const ready1 = await take(gen1, 1);
+    expect(ready1[0]!.type).toBe("ready");
+
+    const collectV1 = take(gen1, 1);
+    await kv.set(key, "v1");
+    const v1Events = await collectV1;
+    expect(v1Events[0]!.type).toBe("set");
+    const revAfterV1 = v1Events[0]!.revision;
+    expect(revAfterV1).toBeGreaterThan(0);
+
+    ctrl1.abort();
+    await gen1.return(undefined);
+
+    // While "disconnected", mutate.
+    await kv.set(key, "v2");
+    await kv.delete(key);
+
+    // Reconnect from since=revAfterV1, should replay v2 + del then ready.
+    const ctrl2 = new AbortController();
+    const gen2 = kv.watch(key, {
+      since: revAfterV1,
+      signal: ctrl2.signal,
+    });
+
+    const events = await take(gen2, 3);
+    expect(events[0]!.type).toBe("set");
+    expect(decUtf8(events[0]!.value)).toBe("v2");
+    expect(events[1]!.type).toBe("del");
+    expect(events[2]!.type).toBe("ready");
+
+    ctrl2.abort();
+    await gen2.return(undefined);
   });
 });

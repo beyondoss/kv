@@ -148,6 +148,21 @@ pub enum Command {
         since: Option<u64>,
     },
     Unwatch,
+    /// REVISION key → current revision (ms since epoch) or -2 if the key is missing.
+    Revision {
+        key: Bytes,
+    },
+    /// SETREV key value revision [EX n | PX n | EXAT n | PXAT n]
+    ///
+    /// Compare-and-swap write: atomically sets `key` to `value` only when the
+    /// current revision equals `revision`. Returns the new revision on success,
+    /// nil on mismatch or missing key.
+    SetRev {
+        key: Bytes,
+        value: Bytes,
+        revision: u64,
+        ttl: Option<SetTtl>,
+    },
 }
 
 fn bulk(v: &beyond_resp::Value) -> Result<Bytes, ProtoError> {
@@ -500,6 +515,15 @@ impl Command {
                 Ok(Command::PWatch { prefix, since })
             }
             b"UNWATCH" => Ok(Command::Unwatch),
+            b"REVISION" => {
+                if args.len() != 2 {
+                    return Err(ProtoError::WrongArity { cmd: "REVISION" });
+                }
+                Ok(Command::Revision {
+                    key: bulk(&args[1])?,
+                })
+            }
+            b"SETREV" => parse_setrev(&args),
             // Satisfy clients that probe server capabilities
             b"COMMAND" => Ok(Command::Ping { message: None }),
             _ => Err(ProtoError::UnknownCommand { cmd: name_bytes }),
@@ -597,6 +621,84 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             condition,
             get,
         },
+    })
+}
+
+fn parse_setrev(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
+    if args.len() < 4 {
+        return Err(ProtoError::WrongArity { cmd: "SETREV" });
+    }
+    let key = bulk(&args[1])?;
+    let value = bulk(&args[2])?;
+    let revision = parse_u64(&args[3])?;
+    let mut ttl = None;
+    let mut i = 4;
+    while i < args.len() {
+        let opt = bulk(&args[i])?;
+        // Buffer sized for the longest option: EXAT/PXAT (4 bytes)
+        let mut buf = [0u8; 4];
+        let opt_up: &[u8] = if opt.len() <= 4 {
+            for (j, b) in opt.iter().enumerate() {
+                buf[j] = b.to_ascii_uppercase();
+            }
+            &buf[..opt.len()]
+        } else {
+            return Err(ProtoError::Syntax { token: opt });
+        };
+        match opt_up {
+            b"EX" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SETREV" });
+                }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
+                ttl = Some(SetTtl::Seconds(v));
+            }
+            b"PX" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SETREV" });
+                }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
+                ttl = Some(SetTtl::Millis(v));
+            }
+            b"EXAT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SETREV" });
+                }
+                ttl = Some(SetTtl::UnixSecs(parse_u64(&args[i])?));
+            }
+            b"PXAT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SETREV" });
+                }
+                ttl = Some(SetTtl::UnixMillis(parse_u64(&args[i])?));
+            }
+            _ => return Err(ProtoError::Syntax { token: opt }),
+        }
+        i += 1;
+    }
+    Ok(Command::SetRev {
+        key,
+        value,
+        revision,
+        ttl,
     })
 }
 
