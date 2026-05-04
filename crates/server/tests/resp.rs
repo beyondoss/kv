@@ -870,3 +870,124 @@ fn wrong_arity_returns_error() {
         "{msg}"
     );
 }
+
+// ── INCR / INCRBY / DECR / DECRBY ────────────────────────────────────────────
+
+#[test]
+fn incr_missing_key_starts_at_one() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let n: i64 = redis::cmd("INCR").arg("ctr").query(&mut con).unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn incr_increments_existing_value() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("ctr", "5").unwrap();
+    let n: i64 = redis::cmd("INCR").arg("ctr").query(&mut con).unwrap();
+    assert_eq!(n, 6);
+}
+
+#[test]
+fn incrby_adds_delta() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("ctr", "10").unwrap();
+    let n: i64 = redis::cmd("INCRBY")
+        .arg("ctr")
+        .arg(5)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(n, 15);
+}
+
+#[test]
+fn incrby_negative_decrements() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("ctr", "10").unwrap();
+    let n: i64 = redis::cmd("INCRBY")
+        .arg("ctr")
+        .arg(-3)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(n, 7);
+}
+
+#[test]
+fn decr_decrements() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("ctr", "5").unwrap();
+    let n: i64 = redis::cmd("DECR").arg("ctr").query(&mut con).unwrap();
+    assert_eq!(n, 4);
+}
+
+#[test]
+fn decr_missing_key_starts_at_minus_one() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let n: i64 = redis::cmd("DECR").arg("ctr").query(&mut con).unwrap();
+    assert_eq!(n, -1);
+}
+
+#[test]
+fn decrby_subtracts_delta() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("ctr", "20").unwrap();
+    let n: i64 = redis::cmd("DECRBY")
+        .arg("ctr")
+        .arg(7)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(n, 13);
+}
+
+#[test]
+fn incr_non_integer_value_returns_error() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("bad", "hello").unwrap();
+    let err = redis::cmd("INCR")
+        .arg("bad")
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("not an integer") || msg.contains("err"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn incr_preserves_ttl() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    // Set a key with a TTL, then INCR it — TTL should survive.
+    let _: () = redis::cmd("SET")
+        .arg("ctr")
+        .arg("5")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
+    let _: i64 = redis::cmd("INCR").arg("ctr").query(&mut con).unwrap();
+    let ttl: i64 = redis::cmd("TTL").arg("ctr").query(&mut con).unwrap();
+    assert!(ttl > 0, "TTL should be preserved after INCR, got {ttl}");
+}
+
+#[test]
+fn incr_overflow_returns_error() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("big", i64::MAX.to_string()).unwrap();
+    let err = redis::cmd("INCR")
+        .arg("big")
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("overflow") || msg.contains("err"), "{msg}");
+}

@@ -322,3 +322,34 @@ describe("RESP backend — observability hooks", () => {
     expect(mgetCounts[0]).toBe(3);
   });
 });
+
+describe("RESP backend — incr", () => {
+  it("incr on missing key starts at 1", async () => {
+    const key = uniqueKey();
+    expect(await kv.incr(key)).toBe(1);
+  });
+
+  it("incr increments an existing value", async () => {
+    const key = uniqueKey();
+    await kv.set(key, "5");
+    expect(await kv.incr(key)).toBe(6);
+  });
+
+  it("incr with positive delta adds delta", async () => {
+    const key = uniqueKey();
+    await kv.set(key, "10");
+    expect(await kv.incr(key, 5)).toBe(15);
+  });
+
+  it("incr with negative delta decrements", async () => {
+    const key = uniqueKey();
+    await kv.set(key, "10");
+    expect(await kv.incr(key, -3)).toBe(7);
+  });
+
+  it("incr on a non-integer value throws", async () => {
+    const key = uniqueKey();
+    await kv.set(key, "hello");
+    await expect(kv.incr(key)).rejects.toThrow();
+  });
+});

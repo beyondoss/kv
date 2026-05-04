@@ -132,10 +132,22 @@ async fn route(
     let path = parts.uri.path();
     let method = &parts.method;
 
-    // Route: /namespaces/{ns}/values/{key}
+    // Route: /namespaces/{ns}/values/{key}[/incr]
     if let Some(rest) = path.strip_prefix("/namespaces/") {
         if let Some((ns, rest)) = split_once(rest, '/') {
             if let Some(key_encoded) = rest.strip_prefix("values/") {
+                // POST .../values/{key}/incr — atomic increment/decrement
+                if *method == http::Method::POST {
+                    if let Some(key_encoded) = key_encoded.strip_suffix("/incr") {
+                        let key = percent_decode(key_encoded);
+                        let query = parts.uri.query().unwrap_or("");
+                        let delta = query_param(query, "delta")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(1);
+                        return handle_incr(ns, &key, delta, store).await;
+                    }
+                    return method_not_allowed();
+                }
                 let key = percent_decode(key_encoded);
                 return match *method {
                     http::Method::GET => handle_get(ns, &key, store).await,
@@ -262,6 +274,28 @@ async fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Respon
     match store.del(ns, &[key]).await {
         Ok(_) => no_content(),
         Err(e) => internal_error(&e.to_string()),
+    }
+}
+
+async fn handle_incr(
+    ns: &str,
+    key: &[u8],
+    delta: i64,
+    store: &ShardStore,
+) -> http::Response<HttpBody> {
+    match store.incr(ns, key, delta).await {
+        Ok(n) => json_response(200, &serde_json::json!({ "value": n })),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not an integer") || msg.contains("overflow") {
+                json_response(
+                    400,
+                    &serde_json::json!({ "error": "invalid_value", "message": msg }),
+                )
+            } else {
+                internal_error(&msg)
+            }
+        }
     }
 }
 

@@ -103,6 +103,10 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
 
     set,
 
+    async incr(key: string, delta: number = 1): Promise<number> {
+      return track("INCR", 1, () => redis.incrby(key, delta));
+    },
+
     async delete(key: string): Promise<void> {
       return track("DEL", 1, () => redis.del(key).then(() => undefined));
     },

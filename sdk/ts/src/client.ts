@@ -38,6 +38,12 @@ export interface KvClient {
   /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: parallel requests. */
   mset(entries: KvMSetEntry[]): Promise<void>;
   /**
+   * Atomically increment the integer stored at `key` by `delta` (default 1).
+   * Missing keys are treated as 0. Returns the new value.
+   * Throws if the stored value is not a valid integer or if the result would overflow.
+   */
+  incr(key: string, delta?: number): Promise<number>;
+  /**
    * Subscribe to changes on a key or prefix.
    *
    * Yields `"ready"` once the initial state has been delivered, then streams

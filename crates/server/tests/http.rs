@@ -494,3 +494,91 @@ fn zero_ttl_header_results_in_no_ttl() {
         "zero TTL must not cause 5xx"
     );
 }
+
+// ── INCR ──────────────────────────────────────────────────────────────────────
+
+fn incr_url(srv: &TestServer, key: &str) -> String {
+    format!("{}/incr", srv.value_url("default", key))
+}
+
+fn incr_url_delta(srv: &TestServer, key: &str, delta: i64) -> String {
+    format!("{}/incr?delta={delta}", srv.value_url("default", key))
+}
+
+#[test]
+fn incr_missing_key_starts_at_one() {
+    let srv = TestServer::start();
+    let res = common::raw_call_url(ureq::post(&incr_url(&srv, "ctr")));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["value"], 1);
+}
+
+#[test]
+fn incr_increments_existing_value() {
+    let srv = TestServer::start();
+    srv.put("ctr", b"5");
+    let res = common::raw_call_url(ureq::post(&incr_url(&srv, "ctr")));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["value"], 6);
+}
+
+#[test]
+fn incr_with_delta() {
+    let srv = TestServer::start();
+    srv.put("ctr", b"10");
+    let res = common::raw_call_url(ureq::post(&incr_url_delta(&srv, "ctr", 5)));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["value"], 15);
+}
+
+#[test]
+fn incr_with_negative_delta_decrements() {
+    let srv = TestServer::start();
+    srv.put("ctr", b"10");
+    let res = common::raw_call_url(ureq::post(&incr_url_delta(&srv, "ctr", -3)));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["value"], 7);
+}
+
+#[test]
+fn incr_non_integer_value_returns_400() {
+    let srv = TestServer::start();
+    srv.put("bad", b"hello");
+    let res = common::raw_call_url(ureq::post(&incr_url(&srv, "bad")));
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "invalid_value");
+}
+
+#[test]
+fn incr_preserves_ttl() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        "default",
+        "ctr",
+        b"5",
+        common::PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    common::raw_call_url(ureq::post(&incr_url(&srv, "ctr")));
+    let res = srv.get("ctr");
+    assert!(res.ttl.is_some(), "TTL should be preserved after INCR");
+    assert!(res.ttl.unwrap() > 0);
+}
+
+#[test]
+fn incr_overflow_returns_400() {
+    let srv = TestServer::start();
+    srv.put("big", i64::MAX.to_string().as_bytes());
+    let res = common::raw_call_url(ureq::post(&incr_url(&srv, "big")));
+    assert_eq!(res.status, 400);
+}
+
+#[test]
+fn incr_patch_returns_405() {
+    let srv = TestServer::start();
+    let url = incr_url(&srv, "ctr");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 405);
+}

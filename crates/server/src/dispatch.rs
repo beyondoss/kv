@@ -231,6 +231,11 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             Err(e) => r::error("ERR", &e.to_string()),
         },
 
+        Command::Incr { key } => do_incr(store, &state.ns, &key, 1).await,
+        Command::IncrBy { key, delta } => do_incr(store, &state.ns, &key, delta).await,
+        Command::Decr { key } => do_incr(store, &state.ns, &key, -1).await,
+        Command::DecrBy { key, delta } => do_incr(store, &state.ns, &key, -delta).await,
+
         Command::GetEx { key, ttl } => {
             use beyond_kv_engine::types::GetExOp;
             let op = ttl.map(|t| match t {
@@ -672,6 +677,13 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+async fn do_incr(store: &ShardStore, ns: &str, key: &[u8], delta: i64) -> Value {
+    match store.incr(ns, key, delta).await {
+        Ok(n) => r::integer(n),
+        Err(e) => r::error("ERR", &e.to_string()),
+    }
+}
+
 fn cmd_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::Ping { .. } => "PING",
@@ -696,6 +708,10 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::SetNx { .. } => "SETNX",
         Command::GetDel { .. } => "GETDEL",
         Command::GetEx { .. } => "GETEX",
+        Command::Incr { .. } => "INCR",
+        Command::IncrBy { .. } => "INCRBY",
+        Command::Decr { .. } => "DECR",
+        Command::DecrBy { .. } => "DECRBY",
         Command::Keys { .. } => "KEYS",
         Command::Scan { .. } => "SCAN",
         Command::DbSize => "DBSIZE",

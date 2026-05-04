@@ -655,3 +655,39 @@ describe("HTTP backend — watch (prefix)", () => {
     expect(keys).toContain(inside);
   });
 });
+
+describe("HTTP backend — incr", () => {
+  it("incr on missing key starts at 1", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    expect(await kv.incr(key)).toBe(1);
+  });
+
+  it("incr increments an existing value", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, "5");
+    expect(await kv.incr(key)).toBe(6);
+  });
+
+  it("incr with positive delta adds delta", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, "10");
+    expect(await kv.incr(key, 5)).toBe(15);
+  });
+
+  it("incr with negative delta decrements", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, "10");
+    expect(await kv.incr(key, -3)).toBe(7);
+  });
+
+  it("incr on a non-integer value throws KvError", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, enc("hello"));
+    await expect(kv.incr(key)).rejects.toBeInstanceOf(KvError);
+  });
+});

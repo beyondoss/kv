@@ -852,6 +852,97 @@ impl ShardStore {
         Ok(Some(revision))
     }
 
+    /// Atomically increment or decrement an integer counter stored at `key` by `delta`.
+    ///
+    /// Missing keys are treated as 0. Returns the new value.
+    /// Returns `EngineError::InvalidInput` if the stored value is not a valid i64 decimal
+    /// string, or if the operation would overflow.
+    /// The key's existing TTL is preserved.
+    pub async fn incr(&self, ns: &str, key: &[u8], delta: i64) -> Result<i64> {
+        let nslog = self.ensure_ns(ns).await?;
+        let now = now_ms();
+
+        // Read current value + TTL. Cache returns expires_at_ms directly; index does too.
+        let (current, expires_at_ms) = if let Some((value, ttl_ms, _meta, _rev)) =
+            Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
+        {
+            (Some(value), ttl_ms)
+        } else {
+            let (idx_entry, ttl_ms) = {
+                let idx = nslog.index.borrow();
+                match idx.get(key) {
+                    None => (None, None),
+                    Some(e) => (Some(*e), idx.ttl(key)),
+                }
+            };
+            match idx_entry {
+                None => (None, None),
+                Some(e) => {
+                    if ttl_ms.map_or(false, |ms| ms <= now) {
+                        nslog.tombstone(key).await?;
+                        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+                        (None, None)
+                    } else {
+                        let (value, _meta_bytes) = nslog.read_value(e).await?;
+                        (Some(value), ttl_ms)
+                    }
+                }
+            }
+        };
+
+        let current_int = match current {
+            None => 0i64,
+            Some(v) => std::str::from_utf8(&v)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or(EngineError::InvalidInput {
+                    reason: "value is not an integer or out of range",
+                })?,
+        };
+
+        let new_val = current_int
+            .checked_add(delta)
+            .ok_or(EngineError::InvalidInput {
+                reason: "increment or decrement would overflow",
+            })?;
+
+        let new_bytes = Bytes::from(new_val.to_string());
+        let key_bytes = Bytes::copy_from_slice(key);
+        nslog
+            .put_full(key_bytes.clone(), &new_bytes, &[], expires_at_ms)
+            .await?;
+        let revision = nslog.last_revision();
+
+        let cache_updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache
+                .try_update(ck, new_bytes.clone(), expires_at_ms, None, 0, revision)
+        });
+        if !cache_updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                new_bytes.clone(),
+                expires_at_ms,
+                None,
+                0,
+                revision,
+            );
+        }
+
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Set {
+                key: key_bytes,
+                value: new_bytes,
+                metadata: None,
+                expires_at_ms,
+                revision,
+            },
+        );
+
+        Ok(new_val)
+    }
+
     /// Subscribe to key or prefix mutations. Returns initial events (current state for
     /// since=0, catch-up log scan for since>0) plus a live receiver. Subscribe BEFORE
     /// scanning to avoid missing live events produced between scan and subscribe.

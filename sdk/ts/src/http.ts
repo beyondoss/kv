@@ -143,6 +143,16 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
 
     set,
 
+    async incr(key: string, delta: number = 1): Promise<number> {
+      const url = delta === 1
+        ? `${valueUrl(key)}/incr`
+        : `${valueUrl(key)}/incr?delta=${delta}`;
+      const res = await request("INCR", 1, url, { method: "POST" });
+      if (!res.ok) throw await parseError(res);
+      const body = (await res.json()) as { value: number };
+      return body.value;
+    },
+
     async delete(key: string): Promise<void> {
       const res = await request("DEL", 1, valueUrl(key), { method: "DELETE" });
       if (!res.ok) throw await parseError(res);

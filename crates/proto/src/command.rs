@@ -109,6 +109,20 @@ pub enum Command {
         key: Bytes,
         ttl: Option<GetExTtl>,
     },
+    Incr {
+        key: Bytes,
+    },
+    IncrBy {
+        key: Bytes,
+        delta: i64,
+    },
+    Decr {
+        key: Bytes,
+    },
+    DecrBy {
+        key: Bytes,
+        delta: i64,
+    },
     Hello {
         version: Option<u8>,
     },
@@ -147,6 +161,14 @@ fn bulk(v: &beyond_resp::Value) -> Result<Bytes, ProtoError> {
 }
 
 fn parse_u64(v: &beyond_resp::Value) -> Result<u64, ProtoError> {
+    let b = bulk(v)?;
+    std::str::from_utf8(&b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ProtoError::InvalidInteger { raw: b })
+}
+
+fn parse_i64(v: &beyond_resp::Value) -> Result<i64, ProtoError> {
     let b = bulk(v)?;
     std::str::from_utf8(&b)
         .ok()
@@ -357,6 +379,40 @@ impl Command {
                 })
             }
             b"GETEX" => parse_getex(&args),
+            b"INCR" => {
+                if args.len() != 2 {
+                    return Err(ProtoError::WrongArity { cmd: "INCR" });
+                }
+                Ok(Command::Incr {
+                    key: bulk(&args[1])?,
+                })
+            }
+            b"INCRBY" => {
+                if args.len() != 3 {
+                    return Err(ProtoError::WrongArity { cmd: "INCRBY" });
+                }
+                Ok(Command::IncrBy {
+                    key: bulk(&args[1])?,
+                    delta: parse_i64(&args[2])?,
+                })
+            }
+            b"DECR" => {
+                if args.len() != 2 {
+                    return Err(ProtoError::WrongArity { cmd: "DECR" });
+                }
+                Ok(Command::Decr {
+                    key: bulk(&args[1])?,
+                })
+            }
+            b"DECRBY" => {
+                if args.len() != 3 {
+                    return Err(ProtoError::WrongArity { cmd: "DECRBY" });
+                }
+                Ok(Command::DecrBy {
+                    key: bulk(&args[1])?,
+                    delta: parse_i64(&args[2])?,
+                })
+            }
             b"HELLO" => {
                 let version = if args.len() >= 2 {
                     let raw = bulk(&args[1])?;
