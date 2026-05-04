@@ -67,13 +67,14 @@ HTTP Client
   │
   ▼
 http.rs router
-  ├─ GET    /namespaces/{ns}/values/{key}     → ShardStore::get()
-  ├─ PUT    /namespaces/{ns}/values/{key}     → ShardStore::set() / setnx()
-  ├─ DELETE /namespaces/{ns}/values/{key}     → ShardStore::del()
-  ├─ GET    /namespaces/{ns}/keys             → ShardStore::scan() (paginated)
-  ├─ GET    /namespaces/{ns}/watch/{key}      → SSE stream (exact key)
-  ├─ GET    /namespaces/{ns}/watch?prefix=…   → SSE stream (prefix)
-  └─ GET    /healthz                          → 200 OK
+  ├─ GET    /namespaces/{ns}/values/{key}               → ShardStore::get()         → X-KV-Revision: <n>
+  ├─ PUT    /namespaces/{ns}/values/{key}               → ShardStore::set() / setnx()
+  ├─ PUT    /namespaces/{ns}/values/{key} + If-Match    → ShardStore::setrev()      → 204 + X-KV-Revision / 409 conflict
+  ├─ DELETE /namespaces/{ns}/values/{key}               → ShardStore::del()
+  ├─ GET    /namespaces/{ns}/keys                       → ShardStore::scan() (paginated)
+  ├─ GET    /namespaces/{ns}/watch/{key}                → SSE stream (exact key)
+  ├─ GET    /namespaces/{ns}/watch?prefix=…             → SSE stream (prefix)
+  └─ GET    /healthz                                    → 200 OK
   │
   ▼
 HTTP Client
@@ -182,20 +183,20 @@ Each namespace gets its own directory `{data_dir}/shard-{n}/{ns}/`. Files in tha
 
 CRC-64/NVME via `crc-fast` covers everything after the CRC field. `flags` carries `TOMBSTONE` (0x01), `NO_EXPIRY` (0x02), `TTL_UPDATE` (0x04). Tombstone and TTL-update records have `val_size = meta_size = 0`.
 
-**In-RAM index** (per namespace): `FxHashMap<Bytes, IndexEntry>`. `IndexEntry` is 16 bytes (with natural padding):
+**In-RAM index** (per namespace): `FxHashMap<Bytes, IndexEntry>`. `IndexEntry` is 24 bytes:
 
 ```rust
 struct IndexEntry {
     record_offset: u64,
     record_size: u32,
     file_id: u16,
-    flags: u8,
+    tstamp_ms: u64, // revision — enables O(1) CAS checks without a disk read
 }
 ```
 
 Plus a TTL sidecar `FxHashMap<Bytes, u64>` so only TTL'd keys pay the extra 16-byte slot.
 
-**Sealed-file footer** (written when the active file is rotated by reclaim): array of `(key, record_offset, record_size, expires_at_ms)` entries followed by a 24-byte trailer (body length + CRC + magic). On startup, recovery reads the footer of each sealed file in O(1) and rebuilds the index without scanning the file body. The active file's tail (between its last hint checkpoint and EOF) is replayed record-by-record; first bad CRC truncates the active file at the last good boundary.
+**Sealed-file footer** (written when the active file is rotated by reclaim): array of `(key, record_offset, record_size, expires_at_ms, tstamp_ms)` entries followed by a 24-byte trailer (body length + CRC + magic `0x4259_4F4E_445F_4B57`). On startup, recovery reads the footer of each sealed file in O(1) and rebuilds the index without scanning the file body. Sealed files with the older magic (`0x4259_4F4E_445F_4B56`, written before the `tstamp_ms` footer field was added) fall back to a full sequential scan of the file body, reading `tstamp_ms` from each record header — no explicit migration needed. The active file's tail (between its last hint checkpoint and EOF) is replayed record-by-record; first bad CRC truncates the active file at the last good boundary.
 
 **Reclaim**: seal the current active file, walk live index entries, copy live records to a new sealed file, write its footer + fsync, atomic-rename, unlink old sealed files. A fresh active file is opened. Triggered two ways: `BGREWRITEAOF` (current namespace, synchronous from the client's perspective) or the auto-reclaim background task (every `KV_RECLAIM_INTERVAL_SECS`, default 300s) which reclaims any namespace whose sealed file count exceeds `KV_RECLAIM_SEALED_THRESHOLD` (default 4, 0 = disabled).
 
@@ -272,6 +273,31 @@ GET /namespaces/{ns}/watch?prefix=<p>           → prefix SSE stream
 GET /namespaces/{ns}/watch?prefix=<p>&since=<r> → resumable prefix stream
 ```
 
+### Compare-And-Swap (CAS)
+
+CAS enables optimistic concurrency control: a write succeeds only if the current revision of the key matches the caller's expected value. Because each shard is single-threaded, the check-then-write is atomic with no race window.
+
+**RESP** — `SET key value REV <n>`:
+
+- If the key exists and its `IndexEntry.tstamp_ms == n` → write proceeds, new revision returned as a RESP integer.
+- Otherwise (missing key, expired, or stale revision) → `nil` returned; key unchanged.
+
+**HTTP** — `PUT /namespaces/{ns}/values/{key}` with `If-Match: <n>` request header:
+
+- Match → `204 No Content` + `X-KV-Revision: <new_rev>` response header.
+- Mismatch → `409 Conflict` + `{"error":"conflict","message":"revision mismatch"}`.
+- `GET` always returns `X-KV-Revision: <n>` so the caller can capture the revision before a CAS write.
+
+**Implementation** — `ShardStore::setrev()`:
+
+1. `ensure_ns()` borrows the in-memory index.
+2. Reads `IndexEntry.tstamp_ms` for the key (O(1), no disk read).
+3. Expired keys are treated as absent (revision mismatch).
+4. On match: write via `put_full()`, notify watchers, return `Ok(Some(new_rev))`.
+5. On mismatch: return `Ok(None)` — no write, no disk I/O.
+
+`REV` is mutually exclusive with `NX`/`XX` at the protocol layer.
+
 ## State Machines
 
 ### Connection Lifecycle (RESP)
@@ -299,11 +325,14 @@ GET /namespaces/{ns}/watch?prefix=<p>&since=<r> → resumable prefix stream
 
 ```
 absent ──SET──► live
-  live ──GET──► live  (freq bumped in L1)
+  live ──GET──► live  (freq bumped in L1; revision returned in X-KV-Revision / Entry.revision)
   live ──DEL──► absent
   live ──expired────► absent  (lazy, on next access or L1 sweep)
   live ──PERSIST──► live (TTL cleared)
   live ──EXPIRE──► live (TTL replaced)
+  live ──CAS (rev matches)────► live (new value; revision advances)
+  live ──CAS (rev mismatch)───► live (unchanged; 409 / nil returned)
+absent ──CAS──────────────────► absent (mismatch; 409 / nil returned)
 ```
 
 ## Why It Behaves This Way

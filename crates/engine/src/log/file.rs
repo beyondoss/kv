@@ -11,7 +11,8 @@ use crate::log::index::IndexEntry;
 
 /// Magic at the very end of every sealed file. Lets recovery distinguish
 /// "sealed cleanly" from "active or crashed mid-seal" without scanning.
-pub const FOOTER_MAGIC: u64 = 0x4259_4F4E_445F_4B56; // "BYOND_KV"
+/// v2: includes tstamp_ms per entry for O(1) CAS revision checks.
+pub const FOOTER_MAGIC: u64 = 0x4259_4F4E_445F_4B57; // "BYOND_KW" (v2)
 /// Footer trailer size: footer_body_len (8) + footer_crc (8) + magic (8).
 pub const FOOTER_TRAILER_LEN: u64 = 24;
 
@@ -19,7 +20,7 @@ pub const FOOTER_TRAILER_LEN: u64 = 24;
 ///
 /// Wire layout (little-endian):
 ///   [key_size: u32][record_offset: u64][record_size: u32]
-///   [expires_at_ms: u64 (0 if absent)][has_expiry: u8]
+///   [expires_at_ms: u64 (0 if absent)][has_expiry: u8][tstamp_ms: u64]
 ///   [key bytes]
 #[derive(Debug, Clone)]
 pub struct FooterEntry {
@@ -27,11 +28,12 @@ pub struct FooterEntry {
     pub record_offset: u64,
     pub record_size: u32,
     pub expires_at_ms: Option<u64>,
+    pub tstamp_ms: u64,
 }
 
 impl FooterEntry {
     fn encoded_size(&self) -> usize {
-        4 + 8 + 4 + 8 + 1 + self.key.len()
+        4 + 8 + 4 + 8 + 1 + 8 + self.key.len()
     }
 
     fn encode_into(&self, buf: &mut Vec<u8>) {
@@ -44,11 +46,12 @@ impl FooterEntry {
         };
         buf.extend_from_slice(&ms.to_le_bytes());
         buf.push(has_expiry);
+        buf.extend_from_slice(&self.tstamp_ms.to_le_bytes());
         buf.extend_from_slice(&self.key);
     }
 
     fn parse(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 25 {
+        if buf.len() < 33 {
             return None;
         }
         let key_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -60,11 +63,14 @@ impl FooterEntry {
             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
         ]);
         let has_expiry = buf[24];
-        let total = 25 + key_size;
+        let tstamp_ms = u64::from_le_bytes([
+            buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32],
+        ]);
+        let total = 33 + key_size;
         if buf.len() < total {
             return None;
         }
-        let key = bytes::Bytes::copy_from_slice(&buf[25..total]);
+        let key = bytes::Bytes::copy_from_slice(&buf[33..total]);
         Some((
             Self {
                 key,
@@ -75,6 +81,7 @@ impl FooterEntry {
                 } else {
                     None
                 },
+                tstamp_ms,
             },
             total,
         ))
@@ -320,6 +327,7 @@ pub(crate) fn footer_entry_from_index(
         record_offset: entry.record_offset,
         record_size: entry.record_size,
         expires_at_ms,
+        tstamp_ms: entry.tstamp_ms,
     }
 }
 

@@ -174,6 +174,9 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
             if let Some(ttl) = ttl_secs {
                 builder = builder.header("X-KV-TTL", ttl.to_string());
             }
+            if entry.revision > 0 {
+                builder = builder.header("X-KV-Revision", entry.revision.to_string());
+            }
             if let Some(meta) = &entry.metadata {
                 if let Ok(json) = serde_json::to_string(meta) {
                     if let Ok(hv) = http::HeaderValue::from_str(&json) {
@@ -207,10 +210,28 @@ async fn handle_put(
     let query = parts.uri.query().unwrap_or("");
     let nx = query.contains("nx=1");
     let xx = query.contains("xx=1");
+    let if_match: Option<u64> = parts
+        .headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
 
     let opts = SetOptions { ttl, metadata };
 
-    if nx {
+    if let Some(expected_rev) = if_match {
+        match store.setrev(ns, key, body, opts, expected_rev).await {
+            Ok(Some(new_rev)) => http::Response::builder()
+                .status(204)
+                .header("X-KV-Revision", new_rev.to_string())
+                .body(HttpBody::fixed_body(None))
+                .unwrap_or_else(|_| internal_error("response build failed")),
+            Ok(None) => json_response(
+                409,
+                &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
+            ),
+            Err(e) => internal_error(&e.to_string()),
+        }
+    } else if nx {
         match store.setnx(ns, key, body, opts).await {
             Ok(true) => no_content(),
             Ok(false) => json_response(

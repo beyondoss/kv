@@ -143,7 +143,7 @@ impl NamespaceLog {
         let offset = active.append(buf).await?;
         self.unsynced_bytes
             .set(self.unsynced_bytes.get() + record_size as u64);
-        let entry = IndexEntry::new(active.file_id, offset, record_size);
+        let entry = IndexEntry::new(active.file_id, offset, record_size, tstamp);
         self.index.borrow_mut().insert(key, entry, expires_at_ms);
         if active.write_offset() >= self.config.rotate_threshold {
             self.rotate_active().await?;
@@ -160,13 +160,13 @@ impl NamespaceLog {
             return Ok(());
         }
         let mut buf: Vec<u8> = Vec::new();
-        let mut layout: Vec<(usize, u32)> = Vec::with_capacity(pairs.len());
+        let mut layout: Vec<(usize, u32, u64)> = Vec::with_capacity(pairs.len());
         for (k, v) in pairs {
             let tstamp = self.next_tstamp();
             let start = buf.len();
             record::encode_into(&mut buf, tstamp, rflags::NO_EXPIRY, 0, k, v, &[])?;
             let record_size = (buf.len() - start) as u32;
-            layout.push((start, record_size));
+            layout.push((start, record_size, tstamp));
         }
         let active = self.active();
         let buf_len = buf.len() as u64;
@@ -174,8 +174,13 @@ impl NamespaceLog {
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
         {
             let mut index = self.index.borrow_mut();
-            for ((k, _v), (rel_start, size)) in pairs.iter().zip(layout.iter()) {
-                let entry = IndexEntry::new(active.file_id, base_offset + *rel_start as u64, *size);
+            for ((k, _v), (rel_start, size, tstamp)) in pairs.iter().zip(layout.iter()) {
+                let entry = IndexEntry::new(
+                    active.file_id,
+                    base_offset + *rel_start as u64,
+                    *size,
+                    *tstamp,
+                );
                 index.insert(k.clone(), entry, None);
             }
         }
@@ -416,6 +421,7 @@ impl NamespaceLog {
                     record_offset: e.record_offset,
                     record_size: e.record_size,
                     expires_at_ms: index.ttl(k),
+                    tstamp_ms: e.tstamp_ms,
                 })
                 .collect()
         };
@@ -526,6 +532,7 @@ impl NamespaceLog {
                     record_offset: e.record_offset,
                     record_size: e.record_size,
                     expires_at_ms: index.ttl(k),
+                    tstamp_ms: e.tstamp_ms,
                 })
                 .collect()
         };

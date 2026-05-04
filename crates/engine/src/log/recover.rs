@@ -81,7 +81,7 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
 
 fn apply_footer_entries(index: &mut NsIndex, file_id: u16, entries: &[FooterEntry]) {
     for e in entries {
-        let entry = IndexEntry::new(file_id, e.record_offset, e.record_size);
+        let entry = IndexEntry::new(file_id, e.record_offset, e.record_size, e.tstamp_ms);
         index.insert(e.key.clone(), entry, e.expires_at_ms);
     }
 }
@@ -213,7 +213,7 @@ fn apply_record(
         Ok(n) => n,
         Err(_) => return, // record > 4 GiB is invalid; skip silently
     };
-    let entry = IndexEntry::new(file_id, offset, record_size);
+    let entry = IndexEntry::new(file_id, offset, record_size, hdr.tstamp_ms);
     let ttl = if hdr.flags & rflags::NO_EXPIRY != 0 {
         None
     } else {

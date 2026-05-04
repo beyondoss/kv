@@ -191,10 +191,12 @@ impl ShardStore {
         if let Some((value, expires_at_ms, metadata)) =
             Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
         {
+            let revision = nslog.index.borrow().get(key).map_or(0, |e| e.tstamp_ms);
             return Ok(Some(Entry {
                 value,
                 expires_at: Self::instant_from_ms(expires_at_ms, now),
                 metadata,
+                revision,
             }));
         }
         let (entry, expires_at_ms) = {
@@ -215,6 +217,7 @@ impl ShardStore {
             value,
             expires_at: Self::instant_from_ms(expires_at_ms, now),
             metadata,
+            revision: entry.tstamp_ms,
         }))
     }
 
@@ -298,16 +301,19 @@ impl ShardStore {
 
     pub async fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Entry>> {
         let now = now_ms();
+        let nslog = self.ensure_ns(ns).await?;
+
         if let Some((value, expires_at_ms, metadata)) =
             Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
         {
+            let revision = nslog.index.borrow().get(key).map_or(0, |e| e.tstamp_ms);
             return Ok(Some(Entry {
                 value,
                 expires_at: Self::instant_from_ms(expires_at_ms, now),
                 metadata,
+                revision,
             }));
         }
-        let nslog = self.ensure_ns(ns).await?;
 
         let (entry, expires_at_ms) = {
             let idx = nslog.index.borrow();
@@ -334,6 +340,7 @@ impl ShardStore {
             value,
             expires_at: Self::instant_from_ms(expires_at_ms, now),
             metadata,
+            revision: entry.tstamp_ms,
         }))
     }
 
@@ -354,10 +361,12 @@ impl ShardStore {
             if let Some((value, expires_at_ms, metadata)) =
                 Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
             {
+                let revision = nslog.index.borrow().get(*key).map_or(0, |e| e.tstamp_ms);
                 results[i] = Some(Entry {
                     value,
                     expires_at: Self::instant_from_ms(expires_at_ms, now),
                     metadata,
+                    revision,
                 });
                 continue;
             }
@@ -387,8 +396,13 @@ impl ShardStore {
         }
 
         if !misses.is_empty() {
+            let miss_revisions: Vec<u64> = misses.iter().map(|(_, e)| e.tstamp_ms).collect();
             let read = nslog.bulk_read(misses).await?;
-            for ((slot, value, meta_bytes), ttl) in read.into_iter().zip(miss_ttls.into_iter()) {
+            for (((slot, value, meta_bytes), ttl), revision) in read
+                .into_iter()
+                .zip(miss_ttls.into_iter())
+                .zip(miss_revisions.into_iter())
+            {
                 let metadata = Self::metadata_from_bytes(&meta_bytes)?;
                 self.cache.insert(
                     Self::cache_key(ns, keys[slot]),
@@ -400,6 +414,7 @@ impl ShardStore {
                     value,
                     expires_at: Self::instant_from_ms(ttl, now),
                     metadata,
+                    revision,
                 });
             }
         }
@@ -563,10 +578,12 @@ impl ShardStore {
         let found = if let Some((cv, ce, cm)) =
             Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
         {
+            let revision = nslog.index.borrow().get(key).map_or(0, |e| e.tstamp_ms);
             Some(Entry {
                 value: cv,
                 expires_at: Self::instant_from_ms(ce, now),
                 metadata: cm,
+                revision,
             })
         } else {
             let lookup = {
@@ -592,6 +609,7 @@ impl ShardStore {
                         value: val,
                         expires_at: Self::instant_from_ms(expires_at_ms, now),
                         metadata,
+                        revision: entry.tstamp_ms,
                     })
                 }
             }
@@ -690,6 +708,64 @@ impl ShardStore {
         opts: SetOptions,
     ) -> Result<bool> {
         self.set_conditional(ns, key, value, opts, true).await
+    }
+
+    /// Compare-and-swap: write only if the current revision matches `expected_rev`.
+    /// Returns `Some(new_revision)` on success, `None` if the revision didn't match.
+    pub async fn setrev(
+        &self,
+        ns: &str,
+        key: &[u8],
+        value: Bytes,
+        opts: SetOptions,
+        expected_rev: u64,
+    ) -> Result<Option<u64>> {
+        let nslog = self.ensure_ns(ns).await?;
+        let now = now_ms();
+        let current_rev = {
+            let idx = nslog.index.borrow();
+            if idx.is_expired(key, now) {
+                None
+            } else {
+                idx.get(key).map(|e| e.tstamp_ms)
+            }
+        };
+        if current_rev != Some(expected_rev) {
+            return Ok(None);
+        }
+        let expires_at_ms = opts
+            .ttl
+            .map(|d| Self::validate_ttl(d).map(|ms| now + ms))
+            .transpose()?;
+        let meta_bytes: Vec<u8> = opts
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_vec(m))
+            .transpose()?
+            .unwrap_or_default();
+        let key_bytes = Bytes::copy_from_slice(key);
+        nslog
+            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
+            .await?;
+        let revision = nslog.last_revision();
+        self.cache.insert(
+            Self::cache_key(ns, key),
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+        );
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Set {
+                key: key_bytes,
+                value,
+                metadata: opts.metadata,
+                expires_at_ms,
+                revision,
+            },
+        );
+        Ok(Some(revision))
     }
 
     /// Subscribe to key or prefix mutations. Returns initial events (current state for

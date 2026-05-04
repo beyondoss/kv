@@ -57,7 +57,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         Command::Set { key, value, args } => {
             let opts = set_opts_from_args(&args.ttl);
 
-            // Handle NX / XX conditions
+            // Handle NX / XX / REV conditions
             match args.condition {
                 SetCondition::Nx => match store.setnx(&state.ns, &key, value, opts).await {
                     Ok(true) => r::ok(),
@@ -69,6 +69,13 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
                     Ok(false) => r::nil(),
                     Err(e) => r::error("ERR", &e.to_string()),
                 },
+                SetCondition::Rev(expected) => {
+                    match store.setrev(&state.ns, &key, value, opts, expected).await {
+                        Ok(Some(new_rev)) => r::integer(new_rev as i64),
+                        Ok(None) => r::nil(),
+                        Err(e) => r::error("ERR", &e.to_string()),
+                    }
+                }
                 SetCondition::Always => {
                     if args.get {
                         match store.getset(&state.ns, &key, value).await {

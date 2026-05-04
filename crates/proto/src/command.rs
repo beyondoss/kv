@@ -7,6 +7,8 @@ pub enum SetCondition {
     Always,
     Nx,
     Xx,
+    /// Compare-and-swap: only write if the current revision equals this value.
+    Rev(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -520,6 +522,13 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             b"XX" => condition = SetCondition::Xx,
             b"GET" => get = true,
             b"KEEPTTL" => {} // preserve existing TTL — engine is responsible for the semantics
+            b"REV" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
+                condition = SetCondition::Rev(parse_u64(&args[i])?);
+            }
             _ => return Err(ProtoError::Syntax { token: opt }),
         }
         i += 1;

@@ -86,9 +86,13 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
 
     const value = new Uint8Array(await res.arrayBuffer());
     const ttlHeader = res.headers.get("x-kv-ttl");
+    const revHeader = res.headers.get("x-kv-revision");
     const metaHeader = res.headers.get("x-kv-metadata");
 
-    const entry: KvEntry = { value };
+    const entry: KvEntry = {
+      value,
+      revision: revHeader != null ? Number(revHeader) : 0,
+    };
     if (ttlHeader != null) entry.ttl = Number(ttlHeader);
     if (metaHeader != null) {
       try {
@@ -109,6 +113,9 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
     if (setOpts?.ttl != null) headers["x-kv-ttl"] = String(setOpts.ttl);
     if (setOpts?.metadata != null) {
       headers["x-kv-metadata"] = JSON.stringify(setOpts.metadata);
+    }
+    if (setOpts?.ifMatch != null) {
+      headers["if-match"] = String(setOpts.ifMatch);
     }
 
     const url = setOpts?.nx

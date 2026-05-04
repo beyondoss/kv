@@ -51,7 +51,7 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         .exec() as [[null, Buffer | null], [null, number]];
 
       if (valueBuf === null) return null;
-      const entry: KvEntry = { value: new Uint8Array(valueBuf) };
+      const entry: KvEntry = { value: new Uint8Array(valueBuf), revision: 0 };
       if (ttlSecs >= 0) entry.ttl = ttlSecs;
       return entry;
     });
@@ -151,7 +151,10 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
           if (valueBuf === null) {
             out.push(null);
           } else {
-            const entry: KvEntry = { value: new Uint8Array(valueBuf) };
+            const entry: KvEntry = {
+              value: new Uint8Array(valueBuf),
+              revision: 0,
+            };
             if (ttlSecs >= 0) entry.ttl = ttlSecs;
             out.push(entry);
           }

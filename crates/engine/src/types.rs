@@ -7,6 +7,9 @@ pub struct Entry {
     pub value: Bytes,
     pub expires_at: Option<Instant>,
     pub metadata: Option<serde_json::Value>,
+    /// Monotonically-increasing write timestamp (ms since epoch). Used as a
+    /// revision for compare-and-swap. Populated on all reads; 0 if unknown.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone)]

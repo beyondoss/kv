@@ -80,7 +80,12 @@ pub async fn reclaim_namespace(
         let bytes = bytes_res?;
         let new_offset = new_file.append(bytes).await?;
         live_bytes += old_entry.record_size as u64;
-        let new_entry = IndexEntry::new(next_file_id, new_offset, old_entry.record_size);
+        let new_entry = IndexEntry::new(
+            next_file_id,
+            new_offset,
+            old_entry.record_size,
+            old_entry.tstamp_ms,
+        );
         new_entries.push((key.clone(), new_entry, *ttl));
         footer.push(footer_entry_from_index(key.clone(), &new_entry, *ttl));
     }

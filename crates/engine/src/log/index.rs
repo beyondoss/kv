@@ -1,30 +1,35 @@
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
-/// 16-byte packed entry pointing at a full record on disk.
+/// 24-byte packed entry pointing at a full record on disk.
 ///
 /// Single-I/O GET: `read_at(record_offset, record_size)` returns the full record
 /// (header + key + value + metadata). The header carries key/value/meta sizes so
 /// we can slice the value out in-memory.
 ///
-/// Layout: u64 + u32 + u16 = 14 bytes, rounded up to 16 by Rust's alignment rules
-/// (natural tail padding for u64 alignment).
+/// Layout: u64 + u32 + u16 + (2 pad) + u64 = 24 bytes.
 ///
 /// 4 GiB single-record limit (well above Redis's 512 MiB string ceiling).
 /// 65k files per namespace × `rotate_threshold` = comfortable disk ceiling.
+///
+/// `tstamp_ms` doubles as the per-key revision for CAS checks. It is the
+/// monotonically-increasing timestamp written into the record header — O(1)
+/// to compare without a disk read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexEntry {
     pub record_offset: u64,
     pub record_size: u32,
     pub file_id: u16,
+    pub tstamp_ms: u64,
 }
 
 impl IndexEntry {
-    pub fn new(file_id: u16, record_offset: u64, record_size: u32) -> Self {
+    pub fn new(file_id: u16, record_offset: u64, record_size: u32, tstamp_ms: u64) -> Self {
         Self {
             record_offset,
             record_size,
             file_id,
+            tstamp_ms,
         }
     }
 }
@@ -182,23 +187,24 @@ mod tests {
     }
 
     #[test]
-    fn entry_size_is_16() {
-        assert_eq!(std::mem::size_of::<IndexEntry>(), 16);
+    fn entry_size_is_24() {
+        assert_eq!(std::mem::size_of::<IndexEntry>(), 24);
     }
 
     #[test]
     fn insert_and_get() {
         let mut idx = NsIndex::new();
-        idx.insert(b("k"), IndexEntry::new(0, 100, 50), None);
+        idx.insert(b("k"), IndexEntry::new(0, 100, 50, 12345), None);
         let e = idx.get(b"k").unwrap();
         assert_eq!(e.record_offset, 100);
         assert_eq!(e.record_size, 50);
+        assert_eq!(e.tstamp_ms, 12345);
     }
 
     #[test]
     fn remove_drops_ttl_too() {
         let mut idx = NsIndex::new();
-        idx.insert(b("k"), IndexEntry::new(0, 0, 1), Some(1000));
+        idx.insert(b("k"), IndexEntry::new(0, 0, 1, 0), Some(1000));
         assert!(idx.ttl(b"k").is_some());
         idx.remove(b"k");
         assert!(idx.ttl(b"k").is_none());
@@ -208,8 +214,8 @@ mod tests {
     #[test]
     fn ttl_only_paid_for_expiring_keys() {
         let mut idx = NsIndex::new();
-        idx.insert(b("a"), IndexEntry::new(0, 0, 1), None);
-        idx.insert(b("b"), IndexEntry::new(0, 0, 1), Some(1000));
+        idx.insert(b("a"), IndexEntry::new(0, 0, 1, 0), None);
+        idx.insert(b("b"), IndexEntry::new(0, 0, 1, 0), Some(1000));
         assert_eq!(idx.ttl.len(), 1);
         assert_eq!(idx.map.len(), 2);
     }
@@ -217,7 +223,7 @@ mod tests {
     #[test]
     fn is_expired() {
         let mut idx = NsIndex::new();
-        idx.insert(b("k"), IndexEntry::new(0, 0, 1), Some(100));
+        idx.insert(b("k"), IndexEntry::new(0, 0, 1, 0), Some(100));
         assert!(idx.is_expired(b"k", 100));
         assert!(idx.is_expired(b"k", 200));
         assert!(!idx.is_expired(b"k", 99));
@@ -227,7 +233,11 @@ mod tests {
     fn scan_yields_all_keys_eventually() {
         let mut idx = NsIndex::new();
         for i in 0..50u8 {
-            idx.insert(Bytes::copy_from_slice(&[i]), IndexEntry::new(0, 0, 1), None);
+            idx.insert(
+                Bytes::copy_from_slice(&[i]),
+                IndexEntry::new(0, 0, 1, 0),
+                None,
+            );
         }
         let mut seen: Vec<Bytes> = Vec::new();
         let mut cursor = 0u64;
@@ -248,7 +258,7 @@ mod tests {
         for i in 0..10u8 {
             idx.insert(
                 Bytes::copy_from_slice(&[b'a' + i]),
-                IndexEntry::new(0, 0, 1),
+                IndexEntry::new(0, 0, 1, 0),
                 None,
             );
         }
@@ -268,8 +278,8 @@ mod tests {
     #[test]
     fn scan_skips_expired() {
         let mut idx = NsIndex::new();
-        idx.insert(b("live"), IndexEntry::new(0, 0, 1), None);
-        idx.insert(b("dead"), IndexEntry::new(0, 0, 1), Some(50));
+        idx.insert(b("live"), IndexEntry::new(0, 0, 1, 0), None);
+        idx.insert(b("dead"), IndexEntry::new(0, 0, 1, 0), Some(50));
         let (keys, _next) = idx.scan(0, 100, 100, |_| true);
         let strs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
         assert!(strs.contains(&b"live".as_ref()));

@@ -7,6 +7,12 @@ export interface KvEntry {
    * backend only; always `undefined` when using the RESP backend.
    */
   metadata?: unknown;
+  /**
+   * Monotonically-increasing revision (server write timestamp in ms).
+   * Use with `ifMatch` in `KvSetOptions` for compare-and-swap.
+   * HTTP backend only; `0` when using the RESP backend (use RESP `GET` + `SET … REV` directly).
+   */
+  revision: number;
 }
 
 export interface KvSetOptions {
@@ -21,6 +27,12 @@ export interface KvSetOptions {
   nx?: boolean;
   /** Set only if the key already exists. Throws `KvError` (409) if it does not. */
   xx?: boolean;
+  /**
+   * Compare-and-swap: only set if the current revision matches this value.
+   * Throws `KvError` (409) on mismatch. HTTP backend only.
+   * Obtain the current revision from `kv.get()`.
+   */
+  ifMatch?: number;
 }
 
 export interface KvMSetEntry {
