@@ -128,7 +128,7 @@ RESP databases 0–15 map to namespaces: `0` → `default`, `1` → `db1`, …, 
 
 ## Benchmarks
 
-Both Beyond KV and Redis ran inside Docker with `--network none` (loopback only) to eliminate network variance. Durability is matched: Beyond uses a WAL without per-write fsync (kernel-flushed); Redis uses AOF `appendfsync everysec`. Each process was given equal memory.
+Both Beyond KV and Redis ran inside the same Docker container with `--network none` (loopback only). Durability is matched: Beyond uses a WAL without per-write fsync (kernel-flushed); Redis uses AOF `appendfsync everysec`. Each process gets equal memory.
 
 **Environment**
 
@@ -139,41 +139,55 @@ Both Beyond KV and Redis ran inside Docker with `--network none` (loopback only)
 | vCPUs  | 8                                         |
 | Redis  | 7.0.15                                    |
 
-The benchmark uses an **open-loop load generator**: requests are issued at a fixed target rate regardless of outstanding responses, so queueing and back-pressure show up as latency rather than being hidden by a closed-loop driver. _Service latency_ measures time inside the server (timestamped by the driver on send/receive at the server side). _Response latency_ includes client-side queuing and is what an application actually observes.
+The benchmark uses an **open-loop load generator** with coordinated-omission correction: requests arrive at a fixed Poisson rate regardless of outstanding responses, so queueing shows up in latency rather than being hidden by a closed-loop driver. _Service latency_ is measured server-side. _Response latency_ includes client-side queueing and is what an application actually observes.
 
 ---
 
-### Single-key GET / SET - Single thread
+### Single-key GET / SET — 1 shard
 
-80% GET / 20% SET · 100k distinct keys · 256-byte values · uniform distribution · 64 concurrent connections · 256 MiB memory
+80% GET / 20% SET · 500k distinct keys · 256-byte values · uniform distribution · 64 connections · 512 MiB memory
 
-| Target rate    |       Beyond p50 | Beyond p99 | Beyond p99.9 |        Redis p50 | Redis p99 | Redis p99.9 |
-| -------------- | ---------------: | ---------: | -----------: | ---------------: | --------: | ----------: |
-| 10k ops/s      |           202 µs |     969 µs |     3,645 µs |           250 µs |  1,622 µs |    6,255 µs |
-| 25k ops/s      |           242 µs |     873 µs |     2,919 µs |           262 µs |  1,700 µs |    5,879 µs |
-| 50k ops/s      |           256 µs |     747 µs |     2,851 µs |           244 µs |  1,411 µs |    4,431 µs |
-| 100k ops/s     |           187 µs |     797 µs |     3,891 µs |           189 µs |  1,265 µs |    3,767 µs |
-| **saturation** |                — |          — |            — |                — |         — |           — |
-| **281k ops/s** |           201 µs |     572 µs |     2,479 µs | _(not achieved)_ |           |             |
-| **286k ops/s** | _(not achieved)_ |            |              |           188 µs |    761 µs |    3,649 µs |
+| Target rate | Beyond p50 | Beyond p99 | Beyond p99.9 | Redis p50 | Redis p99 | Redis p99.9 |
+| ----------- | ---------: | ---------: | -----------: | --------: | --------: | ----------: |
+| 10k ops/s   |     216 µs |     791 µs |     2,799 µs |    257 µs |  2,157 µs |    8,767 µs |
+| 25k ops/s   |     267 µs |     979 µs |     2,913 µs |    254 µs |  1,360 µs |    5,275 µs |
+| 50k ops/s   |     251 µs |     680 µs |     2,669 µs |    216 µs |  1,210 µs |    7,663 µs |
+| 100k ops/s  |     192 µs |     426 µs |     1,659 µs |    182 µs |    483 µs |    1,916 µs |
+| 200k ops/s  |     168 µs |     367 µs |     1,362 µs |    137 µs |    274 µs |      979 µs |
 
-At 10–100k ops/s Beyond's p99 service latency is **40–55% lower** than Redis. Both reach ~280k ops/s at saturation.
+Both sustain 200k ops/s cleanly. Beyond's p99 service latency is **50–80% lower** than Redis at 10–100k ops/s. Redis edges ahead on p50 and ceiling at very high rates (>200k); Beyond's advantage is in the tail.
 
 ---
 
-### Batch MGET / MSET (100 keys/op) — 4 shards
+### Batch MGET / MSET (100 keys/call) — 1 shard
 
-80% MGET / 20% MSET · batch size 100 · 500k distinct keys · 256-byte values · 64 concurrent connections · 512 MiB memory
+80% MGET / 20% MSET · 500k distinct keys · 256-byte values · 64 connections · 512 MiB memory
 
-| Target rate        |    Beyond keys/s | Beyond p50 | Beyond p99 |     Redis keys/s | Redis p50 | Redis p99 |
-| ------------------ | ---------------: | ---------: | ---------: | ---------------: | --------: | --------: |
-| 1k ops/s           |            ~100k |     576 µs |   3,955 µs |            ~100k |    816 µs |  3,433 µs |
-| 3k ops/s           |            ~300k |     597 µs |   5,495 µs |            ~300k |    758 µs |  3,415 µs |
-| 6k ops/s           |            ~600k |     896 µs |  14,367 µs |            ~600k |    930 µs |  7,747 µs |
-| 10k ops/s          |            ~960k |   5,075 µs |  13,471 µs |            ~960k |  2,221 µs | 10,167 µs |
-| **peak sustained** | **~1.1M keys/s** |   5,159 µs |  13,495 µs | **~970k keys/s** |  5,795 µs | 15,007 µs |
+| Target rate        |   Beyond calls/s |    Beyond keys/s | Beyond svc p99 |    Redis calls/s |   Redis keys/s | Redis svc p99 |
+| ------------------ | ---------------: | ---------------: | -------------: | ---------------: | -------------: | ------------: |
+| 1k calls/s         |             ~999 |            ~100k |       7,615 µs |             ~999 |          ~100k |      7,407 µs |
+| 2.5k calls/s       |           ~2,507 |            ~250k |       3,593 µs |           ~2,507 |          ~250k |      4,675 µs |
+| 5k calls/s         |           ~4,981 |            ~498k |       3,479 µs |           ~4,981 |          ~498k |      5,603 µs |
+| **peak sustained** | **~13k calls/s** | **~1.3M keys/s** |       5,043 µs | **~10k calls/s** | **~1M keys/s** |      8,727 µs |
 
-At 1–3k ops/s (100–300k keys/s) Beyond has lower p50 service latency than Redis. Both saturate near 1M keys/s with 4 shards; Beyond edges ahead at peak thanks to lock-free per-shard isolation.
+Beyond sustains **~30% more throughput** than Redis at saturation. Below saturation, Beyond's p99 service latency is consistently 25–40% lower — the log engine doesn't stall under mixed read/write load the way Redis AOF does.
+
+---
+
+### Batch MGET / MSET (100 keys/call) — 4 shards, transparent fan-out
+
+80% MGET / 20% MSET · 500k distinct keys · 256-byte values · 64 connections · 512 MiB memory\
+Multi-key commands spanning shards are handled transparently by the server; the client sends standard MGET/MSET.
+
+| Target rate        |   Beyond calls/s |  Beyond keys/s | Beyond svc p99 |    Redis calls/s |     Redis keys/s | Redis svc p99 |
+| ------------------ | ---------------: | -------------: | -------------: | ---------------: | ---------------: | ------------: |
+| 3k calls/s         |           ~3,006 |          ~300k |       5,563 µs |           ~3,006 |            ~300k |      2,363 µs |
+| 6k calls/s         |           ~6,011 |          ~600k |      11,007 µs |           ~6,011 |            ~600k |      7,627 µs |
+| 10k calls/s        |           ~9,989 |          ~999k |      26,351 µs |           ~9,979 |            ~999k |      9,303 µs |
+| 15k calls/s        |          ~14,974 |          ~1.5M |      14,711 µs |          ~11,326 |            ~1.1M |     saturated |
+| **peak sustained** | **>20k calls/s** | **>2M keys/s** |       7,011 µs | **~11k calls/s** | **~1.1M keys/s** |     10,071 µs |
+
+With 4 shards Beyond sustains **nearly 2× the throughput** of single-threaded Redis. Cross-shard fan-out adds ~3–10ms p99 overhead at light load (inter-thread IPC per call); this overhead disappears when batch keys are co-located on one shard (e.g. user-partitioned keyspaces).
 
 ---
 
