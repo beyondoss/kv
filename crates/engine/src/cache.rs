@@ -59,7 +59,11 @@ impl MemCache {
 
     /// Returns `(value, expires_at_ms, metadata)` if the key exists and is not expired.
     #[must_use]
-    pub fn get(&self, key: &[u8], now_ms: u64) -> Option<(Bytes, Option<u64>, Option<serde_json::Value>)> {
+    pub fn get(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Option<(Bytes, Option<u64>, Option<serde_json::Value>)> {
         let entries = self.entries.borrow();
         let entry = entries.get(key)?;
 
@@ -67,7 +71,8 @@ impl MemCache {
             let size = entry.size;
             drop(entries);
             self.entries.borrow_mut().remove(key);
-            self.current_bytes.set(self.current_bytes.get().saturating_sub(size));
+            self.current_bytes
+                .set(self.current_bytes.get().saturating_sub(size));
             return None;
         }
 
@@ -86,7 +91,8 @@ impl MemCache {
         metadata: Option<serde_json::Value>,
     ) {
         // Serialize once to get the byte size for memory accounting, then store the parsed value.
-        let meta_size = metadata.as_ref()
+        let meta_size = metadata
+            .as_ref()
             .and_then(|m| serde_json::to_vec(m).ok())
             .map_or(0, |b| b.len());
         let size = (key.len() + value.len() + meta_size).max(1);
@@ -137,7 +143,8 @@ impl MemCache {
         // Bind the result before the if-let so the RefMut drops here, not inside the block.
         let removed = self.entries.borrow_mut().remove(key);
         if let Some(entry) = removed {
-            self.current_bytes.set(self.current_bytes.get().saturating_sub(entry.size));
+            self.current_bytes
+                .set(self.current_bytes.get().saturating_sub(entry.size));
             let stale = self.stale_slots.get() + 1;
             self.stale_slots.set(stale);
             // Compact when stale slots dominate total queue length to bound memory growth.
@@ -152,7 +159,10 @@ impl MemCache {
     /// calling `remove` per-key for namespace flushes: one pass over the entry
     /// map, one compaction if needed.
     pub fn remove_by_prefix(&self, prefix: &[u8]) {
-        let to_remove: Vec<Bytes> = self.entries.borrow().keys()
+        let to_remove: Vec<Bytes> = self
+            .entries
+            .borrow()
+            .keys()
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect();
@@ -169,7 +179,8 @@ impl MemCache {
             }
         }
         if freed > 0 {
-            self.current_bytes.set(self.current_bytes.get().saturating_sub(freed));
+            self.current_bytes
+                .set(self.current_bytes.get().saturating_sub(freed));
         }
         let stale = self.stale_slots.get() + to_remove.len();
         self.stale_slots.set(stale);
@@ -182,8 +193,12 @@ impl MemCache {
     /// Remove stale slots (keys no longer in `entries`) from both queues.
     fn compact_queues(&self) {
         let entries = self.entries.borrow();
-        self.small.borrow_mut().retain(|s| entries.contains_key(s.key.as_ref()));
-        self.main.borrow_mut().retain(|s| entries.contains_key(s.key.as_ref()));
+        self.small
+            .borrow_mut()
+            .retain(|s| entries.contains_key(s.key.as_ref()));
+        self.main
+            .borrow_mut()
+            .retain(|s| entries.contains_key(s.key.as_ref()));
         self.stale_slots.set(0);
     }
 
@@ -208,7 +223,8 @@ impl MemCache {
             }
         }
         if freed > 0 {
-            self.current_bytes.set(self.current_bytes.get().saturating_sub(freed));
+            self.current_bytes
+                .set(self.current_bytes.get().saturating_sub(freed));
         }
         if freed_count > 0 {
             let stale = self.stale_slots.get() + freed_count;
@@ -239,7 +255,9 @@ impl MemCache {
         // Drain stale queue entries (already removed from set) and enforce the cap.
         while set.len() >= self.ghost_max {
             match queue.pop_front() {
-                Some(old) => { set.remove(&old); }
+                Some(old) => {
+                    set.remove(&old);
+                }
                 None => break,
             }
         }
@@ -288,7 +306,8 @@ impl MemCache {
                         drop(entries);
                         self.entries.borrow_mut().remove(key.as_ref());
                         self.ghost_insert(key);
-                        self.current_bytes.set(self.current_bytes.get().saturating_sub(size));
+                        self.current_bytes
+                            .set(self.current_bytes.get().saturating_sub(size));
                         return true;
                     }
                 }
@@ -316,7 +335,8 @@ impl MemCache {
                         let size = entry.size;
                         drop(entries);
                         self.entries.borrow_mut().remove(slot.key.as_ref());
-                        self.current_bytes.set(self.current_bytes.get().saturating_sub(size));
+                        self.current_bytes
+                            .set(self.current_bytes.get().saturating_sub(size));
                         return true;
                     }
                 }
@@ -362,7 +382,7 @@ mod tests {
     fn expiry_lazy_on_get() {
         let cache = MemCache::new(1024);
         cache.insert(b("k"), b("v"), Some(100), None);
-        assert!(cache.get(b"k", 50).is_some());  // not yet expired
+        assert!(cache.get(b"k", 50).is_some()); // not yet expired
         assert!(cache.get(b"k", 100).is_none()); // expired (ms <= now)
         assert!(cache.is_empty());
     }
@@ -434,12 +454,22 @@ mod tests {
         // Access key[0] so its freq=1 — it must be promoted to Main, not evicted.
         let cache = MemCache::new(100);
         for i in 0u8..5 {
-            cache.insert(Bytes::from(vec![i; 10]), Bytes::from(vec![i; 10]), None, None);
+            cache.insert(
+                Bytes::from(vec![i; 10]),
+                Bytes::from(vec![i; 10]),
+                None,
+                None,
+            );
         }
         let _ = cache.get(&[0u8; 10], 0); // set freq=1
         // Inserting 5 more forces eviction; key[0] should survive via promotion
         for i in 5u8..10 {
-            cache.insert(Bytes::from(vec![i; 10]), Bytes::from(vec![i; 10]), None, None);
+            cache.insert(
+                Bytes::from(vec![i; 10]),
+                Bytes::from(vec![i; 10]),
+                None,
+                None,
+            );
         }
         assert!(
             cache.get(&[0u8; 10], 0).is_some(),
@@ -454,13 +484,26 @@ mod tests {
         // Re-inserting key[0] should place it in Main (ghost hit), not Small.
         let cache = MemCache::new(100);
         for i in 0u8..5 {
-            cache.insert(Bytes::from(vec![i; 10]), Bytes::from(vec![i; 10]), None, None);
+            cache.insert(
+                Bytes::from(vec![i; 10]),
+                Bytes::from(vec![i; 10]),
+                None,
+                None,
+            );
         }
         // Insert 5 more — key[0] is evicted cold and lands in ghost
         for i in 5u8..10 {
-            cache.insert(Bytes::from(vec![i; 10]), Bytes::from(vec![i; 10]), None, None);
+            cache.insert(
+                Bytes::from(vec![i; 10]),
+                Bytes::from(vec![i; 10]),
+                None,
+                None,
+            );
         }
-        assert!(cache.get(&[0u8; 10], 0).is_none(), "key[0] should have been evicted");
+        assert!(
+            cache.get(&[0u8; 10], 0).is_none(),
+            "key[0] should have been evicted"
+        );
         // Re-insert key[0] — ghost hit means it targets Main, surviving where Small entry would not
         let new_val = Bytes::from(vec![99u8; 10]);
         cache.insert(Bytes::from(vec![0u8; 10]), new_val.clone(), None, None);

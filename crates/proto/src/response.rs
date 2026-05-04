@@ -41,10 +41,25 @@ pub fn scan_reply(cursor: Bytes, keys: Vec<Bytes>) -> Value {
 pub fn hello_reply(version: u8) -> Value {
     // RESP3 map response for HELLO
     Value::Map(vec![
-        (Value::SimpleString(Bytes::from_static(b"server")), Value::SimpleString(Bytes::from_static(b"beyond-kv"))),
-        (Value::SimpleString(Bytes::from_static(b"version")), Value::SimpleString(Bytes::from_static(env!("CARGO_PKG_VERSION").as_bytes()))),
-        (Value::SimpleString(Bytes::from_static(b"proto")), Value::Integer(version as i64)),
-        (Value::SimpleString(Bytes::from_static(b"mode")), Value::SimpleString(Bytes::from_static(b"standalone"))),
-        (Value::SimpleString(Bytes::from_static(b"role")), Value::SimpleString(Bytes::from_static(b"master"))),
+        (
+            Value::SimpleString(Bytes::from_static(b"server")),
+            Value::SimpleString(Bytes::from_static(b"beyond-kv")),
+        ),
+        (
+            Value::SimpleString(Bytes::from_static(b"version")),
+            Value::SimpleString(Bytes::from_static(env!("CARGO_PKG_VERSION").as_bytes())),
+        ),
+        (
+            Value::SimpleString(Bytes::from_static(b"proto")),
+            Value::Integer(version as i64),
+        ),
+        (
+            Value::SimpleString(Bytes::from_static(b"mode")),
+            Value::SimpleString(Bytes::from_static(b"standalone")),
+        ),
+        (
+            Value::SimpleString(Bytes::from_static(b"role")),
+            Value::SimpleString(Bytes::from_static(b"master")),
+        ),
     ])
 }

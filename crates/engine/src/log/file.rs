@@ -52,9 +52,13 @@ impl FooterEntry {
             return None;
         }
         let key_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let record_offset = u64::from_le_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
+        let record_offset = u64::from_le_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+        ]);
         let record_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let expires_ms = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+        let expires_ms = u64::from_le_bytes([
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+        ]);
         let has_expiry = buf[24];
         let total = 25 + key_size;
         if buf.len() < total {
@@ -66,7 +70,11 @@ impl FooterEntry {
                 key,
                 record_offset,
                 record_size,
-                expires_at_ms: if has_expiry != 0 { Some(expires_ms) } else { None },
+                expires_at_ms: if has_expiry != 0 {
+                    Some(expires_ms)
+                } else {
+                    None
+                },
             },
             total,
         ))
@@ -137,6 +145,27 @@ impl LogFile {
 
     pub fn write_offset(&self) -> u64 {
         self.write_offset.get()
+    }
+
+    /// Returns the byte offset where record data ends — stops before the footer
+    /// in sealed files so that `scan_since` doesn't misparse footer bytes as records.
+    pub async fn data_end_offset(&self) -> u64 {
+        let total = self.write_offset.get();
+        if total < FOOTER_TRAILER_LEN {
+            return total;
+        }
+        let Ok(magic_bytes) = self.read_exact(total - 8, 8).await else {
+            return total;
+        };
+        let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap_or([0u8; 8]));
+        if magic != FOOTER_MAGIC {
+            return total;
+        }
+        let Ok(blen_bytes) = self.read_exact(total - FOOTER_TRAILER_LEN, 8).await else {
+            return total;
+        };
+        let body_len = u64::from_le_bytes(blen_bytes.try_into().unwrap_or([0u8; 8]));
+        total.saturating_sub(FOOTER_TRAILER_LEN + body_len)
     }
 
     /// Append a buffer at an offset reserved atomically *before* awaiting the
@@ -213,9 +242,30 @@ impl LogFile {
         let trailer = self
             .read_exact(total_size - FOOTER_TRAILER_LEN, FOOTER_TRAILER_LEN as usize)
             .await?;
-        let body_len = u64::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3], trailer[4], trailer[5], trailer[6], trailer[7]]);
-        let stored_crc = u64::from_le_bytes([trailer[8], trailer[9], trailer[10], trailer[11], trailer[12], trailer[13], trailer[14], trailer[15]]);
-        let magic = u64::from_le_bytes([trailer[16], trailer[17], trailer[18], trailer[19], trailer[20], trailer[21], trailer[22], trailer[23]]);
+        let body_len = u64::from_le_bytes([
+            trailer[0], trailer[1], trailer[2], trailer[3], trailer[4], trailer[5], trailer[6],
+            trailer[7],
+        ]);
+        let stored_crc = u64::from_le_bytes([
+            trailer[8],
+            trailer[9],
+            trailer[10],
+            trailer[11],
+            trailer[12],
+            trailer[13],
+            trailer[14],
+            trailer[15],
+        ]);
+        let magic = u64::from_le_bytes([
+            trailer[16],
+            trailer[17],
+            trailer[18],
+            trailer[19],
+            trailer[20],
+            trailer[21],
+            trailer[22],
+            trailer[23],
+        ]);
         if magic != FOOTER_MAGIC {
             return Ok(None);
         }
@@ -229,18 +279,19 @@ impl LogFile {
         let body = self.read_exact(body_offset, body_len as usize).await?;
         let actual_crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Nvme, &body);
         if actual_crc != stored_crc {
-            return Err(EngineError::CrcMismatch { offset: body_offset });
+            return Err(EngineError::CrcMismatch {
+                offset: body_offset,
+            });
         }
 
         let mut entries: Vec<FooterEntry> = Vec::new();
         let mut cursor = 0usize;
         while cursor < body.len() {
-            let (entry, used) = FooterEntry::parse(&body[cursor..]).ok_or(
-                EngineError::BadRecord {
+            let (entry, used) =
+                FooterEntry::parse(&body[cursor..]).ok_or(EngineError::BadRecord {
                     offset: body_offset + cursor as u64,
                     reason: "malformed footer entry",
-                },
-            )?;
+                })?;
             entries.push(entry);
             cursor += used;
         }
@@ -285,9 +336,15 @@ pub fn list_data_files(dir: &Path) -> Result<Vec<(u16, PathBuf)>> {
             warn!(path = %path.display(), "skipping data directory entry with non-UTF-8 filename");
             continue;
         };
-        let Some(rest) = name.strip_prefix("data-") else { continue };
-        let Some(num) = rest.strip_suffix(".log") else { continue };
-        let Ok(file_id_u32) = num.parse::<u32>() else { continue };
+        let Some(rest) = name.strip_prefix("data-") else {
+            continue;
+        };
+        let Some(num) = rest.strip_suffix(".log") else {
+            continue;
+        };
+        let Ok(file_id_u32) = num.parse::<u32>() else {
+            continue;
+        };
         if file_id_u32 > u16::MAX as u32 {
             continue;
         }

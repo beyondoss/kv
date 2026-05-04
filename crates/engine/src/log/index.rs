@@ -118,10 +118,7 @@ impl NsIndex {
 
     /// Returns true if `expires_at_ms` is set and is at or before `now_ms`.
     pub fn is_expired(&self, key: &[u8], now_ms: u64) -> bool {
-        self.ttl
-            .get(key)
-            .copied()
-            .map_or(false, |ms| ms <= now_ms)
+        self.ttl.get(key).copied().map_or(false, |ms| ms <= now_ms)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &IndexEntry)> {
@@ -249,7 +246,11 @@ mod tests {
     fn scan_filter_applied() {
         let mut idx = NsIndex::new();
         for i in 0..10u8 {
-            idx.insert(Bytes::copy_from_slice(&[b'a' + i]), IndexEntry::new(0, 0, 1), None);
+            idx.insert(
+                Bytes::copy_from_slice(&[b'a' + i]),
+                IndexEntry::new(0, 0, 1),
+                None,
+            );
         }
         let mut seen: Vec<Bytes> = Vec::new();
         let mut cursor = 0u64;

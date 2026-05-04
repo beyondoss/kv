@@ -69,7 +69,11 @@ pub fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
     // Find first \n
     let nl1 = buf.iter().position(|&b| b == b'\n')?;
     // Array count between buf[1..nl1-1] (strip \r)
-    let count_end = if nl1 > 0 && buf[nl1 - 1] == b'\r' { nl1 - 1 } else { nl1 };
+    let count_end = if nl1 > 0 && buf[nl1 - 1] == b'\r' {
+        nl1 - 1
+    } else {
+        nl1
+    };
     let count_str = std::str::from_utf8(&buf[1..count_end]).ok()?;
     let count: usize = count_str.parse().ok()?;
     if count < 2 {
@@ -83,8 +87,15 @@ pub fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
     }
     let len_start = i + 1;
     let nl2 = len_start + buf[len_start..].iter().position(|&b| b == b'\n')?;
-    let len_end = if nl2 > 0 && buf[nl2 - 1] == b'\r' { nl2 - 1 } else { nl2 };
-    let cmd_len: usize = std::str::from_utf8(&buf[len_start..len_end]).ok()?.parse().ok()?;
+    let len_end = if nl2 > 0 && buf[nl2 - 1] == b'\r' {
+        nl2 - 1
+    } else {
+        nl2
+    };
+    let cmd_len: usize = std::str::from_utf8(&buf[len_start..len_end])
+        .ok()?
+        .parse()
+        .ok()?;
     i = nl2 + 1 + cmd_len + 2; // skip cmd bytes + \r\n
 
     // Read second bulk-string element's value
@@ -93,8 +104,15 @@ pub fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
     }
     let len_start = i + 1;
     let nl3 = len_start + buf[len_start..].iter().position(|&b| b == b'\n')?;
-    let len_end = if nl3 > 0 && buf[nl3 - 1] == b'\r' { nl3 - 1 } else { nl3 };
-    let key_len: usize = std::str::from_utf8(&buf[len_start..len_end]).ok()?.parse().ok()?;
+    let len_end = if nl3 > 0 && buf[nl3 - 1] == b'\r' {
+        nl3 - 1
+    } else {
+        nl3
+    };
+    let key_len: usize = std::str::from_utf8(&buf[len_start..len_end])
+        .ok()?
+        .parse()
+        .ok()?;
     let key_start = nl3 + 1;
     let key_end = key_start.checked_add(key_len)?;
     if key_end > buf.len() {
@@ -187,7 +205,10 @@ mod tests {
     #[test]
     fn percent_decode_routing_handles_encoded_chars() {
         assert_eq!(percent_decode_routing(b"a%2Fb"), b"a/b".to_vec());
-        assert_eq!(percent_decode_routing(b"hello%20world"), b"hello world".to_vec());
+        assert_eq!(
+            percent_decode_routing(b"hello%20world"),
+            b"hello world".to_vec()
+        );
         assert_eq!(percent_decode_routing(b"plain"), b"plain".to_vec());
     }
 }

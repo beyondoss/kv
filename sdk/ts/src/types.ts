@@ -54,3 +54,27 @@ export interface KvListResult {
 export interface KvListKey {
   name: string;
 }
+
+export type KvWatchEventType = "set" | "del" | "ready";
+
+export interface KvWatchEvent {
+  type: KvWatchEventType;
+  /** Key that changed. Absent on `"ready"` events. */
+  key?: string;
+  /** New value, base64-decoded. Present on `"set"` events. */
+  value?: Uint8Array;
+  metadata?: unknown;
+  /** Remaining TTL in seconds. Present on `"set"` events when the key has a TTL. */
+  ttl?: number;
+  /** Revision (server timestamp ms) of the write. 0 on `"ready"` events. */
+  revision: number;
+}
+
+export interface KvWatchOptions {
+  /** If true, treat `key` as a prefix and watch all matching keys. */
+  prefix?: boolean;
+  /** Resume from this revision (exclusive). 0 = deliver current state then live stream. */
+  since?: number;
+  /** Cancellation signal. */
+  signal?: AbortSignal;
+}

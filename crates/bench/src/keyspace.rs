@@ -29,7 +29,9 @@ impl std::str::FromStr for KeyDist {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> anyhow::Result<Self> {
         if let Some(rest) = s.strip_prefix("zipf:") {
-            Ok(KeyDist::Zipfian { theta: rest.parse()? })
+            Ok(KeyDist::Zipfian {
+                theta: rest.parse()?,
+            })
         } else {
             match s {
                 "uniform" => Ok(KeyDist::Uniform),
@@ -90,16 +92,23 @@ impl Keyspace {
         let size = indices.as_ref().map_or(total_keys, |v| v.len() as u64);
 
         let zipf = match dist {
-            KeyDist::Zipfian { theta } => Some(
-                Zipf::new(size, theta).map_err(|e| anyhow::anyhow!("invalid zipf: {e:?}"))?,
-            ),
+            KeyDist::Zipfian { theta } => {
+                Some(Zipf::new(size, theta).map_err(|e| anyhow::anyhow!("invalid zipf: {e:?}"))?)
+            }
             KeyDist::Uniform => None,
         };
 
-        Ok(Self { size, dist, zipf, indices })
+        Ok(Self {
+            size,
+            dist,
+            zipf,
+            indices,
+        })
     }
 
-    pub fn size(&self) -> u64 { self.size }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 
     /// Sample one key from this shard's partition.
     pub fn sample<R: Rng>(&self, rng: &mut R) -> Bytes {

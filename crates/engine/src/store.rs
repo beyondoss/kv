@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::future::join_all;
 use rustc_hash::FxHashMap;
 use tracing::info;
@@ -12,20 +13,27 @@ use crate::cache::MemCache;
 use crate::error::{EngineError, Result};
 use crate::log::config::LogConfig;
 use crate::log::index::IndexEntry;
-use crate::log::{now_ms, NamespaceLog};
+use crate::log::{NamespaceLog, now_ms};
 use crate::types::{Entry, GetExOp, ScanPage, SetOptions, TtlResult};
+use crate::watch::{KeyFilter, WatchEvent, WatchRegistry};
 
 pub const DEFAULT_NS: &str = "default";
 
 /// Map database index to a namespace name: 0 → "default", n → "db{n}".
 pub fn ns_name(db: u64) -> String {
-    if db == 0 { DEFAULT_NS.to_string() } else { format!("db{db}") }
+    if db == 0 {
+        DEFAULT_NS.to_string()
+    } else {
+        format!("db{db}")
+    }
 }
 
 fn is_valid_ns_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Per-shard KV store: one `NamespaceLog` per namespace (lazily opened) + one S3-FIFO L1 cache.
@@ -38,6 +46,7 @@ pub struct ShardStore {
     config: LogConfig,
     namespaces: RefCell<FxHashMap<String, Rc<NamespaceLog>>>,
     cache: MemCache,
+    watchers: RefCell<WatchRegistry>,
 }
 
 impl ShardStore {
@@ -58,10 +67,15 @@ impl ShardStore {
                 .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if is_valid_ns_name(&name) { Some((name, e.path())) } else { None }
+                    if is_valid_ns_name(&name) {
+                        Some((name, e.path()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
-            let futures: Vec<_> = dirs.iter()
+            let futures: Vec<_> = dirs
+                .iter()
                 .map(|(_, path)| NamespaceLog::open(path.clone(), config))
                 .collect();
             let opened = join_all(futures).await;
@@ -81,13 +95,16 @@ impl ShardStore {
             config,
             namespaces: RefCell::new(namespaces),
             cache: MemCache::new(memory_bytes),
+            watchers: RefCell::new(WatchRegistry::new()),
         })
     }
 
     /// Open the namespace if not already open, then return a cloned handle.
     async fn ensure_ns(&self, ns: &str) -> Result<Rc<NamespaceLog>> {
         if !is_valid_ns_name(ns) {
-            return Err(EngineError::InvalidNamespace { name: ns.to_owned() });
+            return Err(EngineError::InvalidNamespace {
+                name: ns.to_owned(),
+            });
         }
         if let Some(existing) = self.namespaces.borrow().get(ns).cloned() {
             return Ok(existing);
@@ -95,14 +112,24 @@ impl ShardStore {
         let dir = self.data_dir.join(ns);
         let nslog = Rc::new(NamespaceLog::open(dir, self.config).await?);
         // Re-check after the await — another spawned task may have beaten us.
-        Ok(self.namespaces.borrow_mut().entry(ns.to_string()).or_insert(nslog).clone())
+        Ok(self
+            .namespaces
+            .borrow_mut()
+            .entry(ns.to_string())
+            .or_insert(nslog)
+            .clone())
     }
 
     /// Test-only accessor that bypasses `ensure_ns` validation. Do not use in production code.
     #[cfg(test)]
     pub(crate) fn get_ns(&self, ns: &str) -> Result<Rc<NamespaceLog>> {
-        self.namespaces.borrow().get(ns).cloned()
-            .ok_or_else(|| EngineError::InvalidNamespace { name: ns.to_owned() })
+        self.namespaces
+            .borrow()
+            .get(ns)
+            .cloned()
+            .ok_or_else(|| EngineError::InvalidNamespace {
+                name: ns.to_owned(),
+            })
     }
 
     /// Build the composite cache key `ns\x00key` into a stack buffer for lookups,
@@ -146,8 +173,9 @@ impl ShardStore {
     }
 
     fn validate_ttl(d: Duration) -> Result<u64> {
-        u64::try_from(d.as_millis())
-            .map_err(|_| EngineError::CapacityExceeded { reason: "ttl exceeds u64::MAX milliseconds" })
+        u64::try_from(d.as_millis()).map_err(|_| EngineError::CapacityExceeded {
+            reason: "ttl exceeds u64::MAX milliseconds",
+        })
     }
 
     /// Inline get used by `getset` and `getdel`: check L1 cache, then index, then disk.
@@ -233,16 +261,38 @@ impl ShardStore {
         if live != require_live {
             return Ok(false);
         }
-        let expires_at_ms = opts.ttl
+        let expires_at_ms = opts
+            .ttl
             .map(|d| Self::validate_ttl(d).map(|ms| now + ms))
             .transpose()?;
-        let meta_bytes: Vec<u8> = opts.metadata.as_ref()
+        let meta_bytes: Vec<u8> = opts
+            .metadata
+            .as_ref()
             .map(|m| serde_json::to_vec(m))
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog.put_full(key_bytes, &value, &meta_bytes, expires_at_ms).await?;
-        self.cache.insert(Self::cache_key(ns, key), value, expires_at_ms, opts.metadata);
+        nslog
+            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
+            .await?;
+        let revision = nslog.last_revision();
+        self.cache.insert(
+            Self::cache_key(ns, key),
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+        );
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Set {
+                key: key_bytes,
+                value,
+                metadata: opts.metadata,
+                expires_at_ms,
+                revision,
+            },
+        );
         Ok(true)
     }
 
@@ -349,16 +399,38 @@ impl ShardStore {
 
     pub async fn set(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        let expires_at_ms = opts.ttl
+        let expires_at_ms = opts
+            .ttl
             .map(|d| Self::validate_ttl(d).map(|ms| now_ms() + ms))
             .transpose()?;
-        let meta_bytes: Vec<u8> = opts.metadata.as_ref()
+        let meta_bytes: Vec<u8> = opts
+            .metadata
+            .as_ref()
             .map(|m| serde_json::to_vec(m))
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog.put_full(key_bytes, &value, &meta_bytes, expires_at_ms).await?;
-        self.cache.insert(Self::cache_key(ns, key), value, expires_at_ms, opts.metadata);
+        nslog
+            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
+            .await?;
+        let revision = nslog.last_revision();
+        self.cache.insert(
+            Self::cache_key(ns, key),
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+        );
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Set {
+                key: key_bytes,
+                value,
+                metadata: opts.metadata,
+                expires_at_ms,
+                revision,
+            },
+        );
         Ok(())
     }
 
@@ -368,7 +440,24 @@ impl ShardStore {
         let nslog = self.ensure_ns(ns).await?;
         nslog.put_many(pairs).await?;
         for (key, value) in pairs {
-            self.cache.insert(Self::cache_key(ns, key), value.clone(), None, None);
+            self.cache
+                .insert(Self::cache_key(ns, key), value.clone(), None, None);
+        }
+        // Notify after all writes — revision is last_tstamp from the batch.
+        let revision = nslog.last_revision();
+        let mut w = self.watchers.borrow_mut();
+        for (key, value) in pairs {
+            w.notify(
+                ns,
+                key,
+                WatchEvent::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                    metadata: None,
+                    expires_at_ms: None,
+                    revision,
+                },
+            );
         }
         Ok(())
     }
@@ -388,6 +477,15 @@ impl ShardStore {
             Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             if was_present && !was_expired {
                 count += 1;
+                let revision = nslog.last_revision();
+                self.watchers.borrow_mut().notify(
+                    ns,
+                    key,
+                    WatchEvent::Del {
+                        key: Bytes::copy_from_slice(key),
+                        revision,
+                    },
+                );
             }
         }
         Ok(count)
@@ -430,7 +528,11 @@ impl ShardStore {
         let now = now_ms();
         let (present, has_ttl, expired) = {
             let idx = nslog.index.borrow();
-            (idx.get(key).is_some(), idx.ttl(key).is_some(), idx.is_expired(key, now))
+            (
+                idx.get(key).is_some(),
+                idx.ttl(key).is_some(),
+                idx.is_expired(key, now),
+            )
         };
         if !present || !has_ttl || expired {
             return Ok(false);
@@ -452,7 +554,11 @@ impl ShardStore {
         let found = if let Some((cv, ce, cm)) =
             Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
         {
-            Some(Entry { value: cv, expires_at: Self::instant_from_ms(ce, now), metadata: cm })
+            Some(Entry {
+                value: cv,
+                expires_at: Self::instant_from_ms(ce, now),
+                metadata: cm,
+            })
         } else {
             let lookup = {
                 let idx = nslog.index.borrow();
@@ -519,7 +625,8 @@ impl ShardStore {
         // Inline set — same nslog, no second ensure_ns call.
         let key_bytes = Bytes::copy_from_slice(key);
         nslog.put_full(key_bytes, &value, &[], None).await?;
-        self.cache.insert(Self::cache_key(ns, key), value, None, None);
+        self.cache
+            .insert(Self::cache_key(ns, key), value, None, None);
         Ok(old)
     }
 
@@ -532,12 +639,56 @@ impl ShardStore {
         Ok(old)
     }
 
-    pub async fn setnx(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<bool> {
+    pub async fn setnx(
+        &self,
+        ns: &str,
+        key: &[u8],
+        value: Bytes,
+        opts: SetOptions,
+    ) -> Result<bool> {
         self.set_conditional(ns, key, value, opts, false).await
     }
 
-    pub async fn setxx(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<bool> {
+    pub async fn setxx(
+        &self,
+        ns: &str,
+        key: &[u8],
+        value: Bytes,
+        opts: SetOptions,
+    ) -> Result<bool> {
         self.set_conditional(ns, key, value, opts, true).await
+    }
+
+    /// Subscribe to key or prefix mutations. Returns initial events (current state for
+    /// since=0, catch-up log scan for since>0) plus a live receiver. Subscribe BEFORE
+    /// scanning to avoid missing live events produced between scan and subscribe.
+    pub async fn watch_subscribe(
+        &self,
+        ns: &str,
+        filter: KeyFilter<'_>,
+        since: u64,
+    ) -> Result<(Vec<WatchEvent>, UnboundedReceiver<WatchEvent>)> {
+        let ns_b = Bytes::copy_from_slice(ns.as_bytes());
+
+        let rx = match &filter {
+            KeyFilter::Exact(k) => self
+                .watchers
+                .borrow_mut()
+                .subscribe_key(ns_b, Bytes::copy_from_slice(k)),
+            KeyFilter::Prefix(p) => self
+                .watchers
+                .borrow_mut()
+                .subscribe_prefix(ns_b, Bytes::copy_from_slice(p)),
+        };
+
+        let nslog = self.ensure_ns(ns).await?;
+        let initial = if since == 0 {
+            nslog.current_entries(&filter, now_ms()).await?
+        } else {
+            nslog.scan_since(&filter, since).await?
+        };
+
+        Ok((initial, rx))
     }
 
     pub fn sweep_cache(&self) {
@@ -603,14 +754,20 @@ impl ShardStore {
         } else if cursor.len() == 8 {
             cursor.try_into().map(u64::from_le_bytes).unwrap_or(0)
         } else {
-            return Err(EngineError::BadRecord { offset: 0, reason: "invalid scan cursor" });
+            return Err(EngineError::BadRecord {
+                offset: 0,
+                reason: "invalid scan cursor",
+            });
         };
 
         let pat = pattern;
         let (keys, next_cursor_pos) =
-            nslog.index.borrow().scan(cursor_pos, count as usize, now, |k| {
-                pat.map_or(true, |p| glob_match(p, k))
-            });
+            nslog
+                .index
+                .borrow()
+                .scan(cursor_pos, count as usize, now, |k| {
+                    pat.map_or(true, |p| glob_match(p, k))
+                });
 
         let next_cursor = if next_cursor_pos == 0 {
             Bytes::from_static(b"0")
@@ -691,9 +848,14 @@ mod tests {
     }
 
     async fn set(s: &ShardStore, key: &[u8], value: &[u8]) {
-        s.set("default", key, Bytes::copy_from_slice(value), SetOptions::default())
-            .await
-            .unwrap();
+        s.set(
+            "default",
+            key,
+            Bytes::copy_from_slice(value),
+            SetOptions::default(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn set_ttl(s: &ShardStore, key: &[u8], value: &[u8], ttl: Duration) {
@@ -701,7 +863,10 @@ mod tests {
             "default",
             key,
             Bytes::copy_from_slice(value),
-            SetOptions { ttl: Some(ttl), metadata: None },
+            SetOptions {
+                ttl: Some(ttl),
+                metadata: None,
+            },
         )
         .await
         .unwrap();
@@ -785,7 +950,10 @@ mod tests {
         let path = tmp.path().to_path_buf();
         run(async move {
             let s = open_store(&path).await;
-            assert_eq!(s.exists("default", &[b"no-such".as_ref()]).await.unwrap(), 0);
+            assert_eq!(
+                s.exists("default", &[b"no-such".as_ref()]).await.unwrap(),
+                0
+            );
         });
     }
 
@@ -807,10 +975,16 @@ mod tests {
         let path = tmp.path().to_path_buf();
         run(async move {
             let s = open_store(&path).await;
-            assert!(s
-                .setnx("default", b"snx", Bytes::from_static(b"v"), SetOptions::default())
+            assert!(
+                s.setnx(
+                    "default",
+                    b"snx",
+                    Bytes::from_static(b"v"),
+                    SetOptions::default()
+                )
                 .await
-                .unwrap());
+                .unwrap()
+            );
             assert_eq!(get_value(&s, b"snx").await.unwrap().as_ref(), b"v");
         });
     }
@@ -822,11 +996,20 @@ mod tests {
         run(async move {
             let s = open_store(&path).await;
             set(&s, b"snx-dup", b"original").await;
-            assert!(!s
-                .setnx("default", b"snx-dup", Bytes::from_static(b"clobber"), SetOptions::default())
+            assert!(
+                !s.setnx(
+                    "default",
+                    b"snx-dup",
+                    Bytes::from_static(b"clobber"),
+                    SetOptions::default()
+                )
                 .await
-                .unwrap());
-            assert_eq!(get_value(&s, b"snx-dup").await.unwrap().as_ref(), b"original");
+                .unwrap()
+            );
+            assert_eq!(
+                get_value(&s, b"snx-dup").await.unwrap().as_ref(),
+                b"original"
+            );
         });
     }
 
@@ -837,7 +1020,11 @@ mod tests {
         run(async move {
             let s = open_store(&path).await;
             set(&s, b"k", b"v").await;
-            assert!(s.expire("default", b"k", Duration::from_secs(60)).await.unwrap());
+            assert!(
+                s.expire("default", b"k", Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
         });
     }
 
@@ -847,7 +1034,11 @@ mod tests {
         let path = tmp.path().to_path_buf();
         run(async move {
             let s = open_store(&path).await;
-            assert!(!s.expire("default", b"miss", Duration::from_secs(60)).await.unwrap());
+            assert!(
+                !s.expire("default", b"miss", Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
         });
     }
 
@@ -883,7 +1074,10 @@ mod tests {
             set(&s, b"a", b"va").await;
             set(&s, b"b", b"vb").await;
             let res = s
-                .mget("default", &[b"a".as_ref(), b"missing".as_ref(), b"b".as_ref()])
+                .mget(
+                    "default",
+                    &[b"a".as_ref(), b"missing".as_ref(), b"b".as_ref()],
+                )
                 .await
                 .unwrap();
             assert_eq!(res.len(), 3);
@@ -908,7 +1102,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let res = s.mget("default", &[b"k1".as_ref(), b"k2".as_ref()]).await.unwrap();
+            let res = s
+                .mget("default", &[b"k1".as_ref(), b"k2".as_ref()])
+                .await
+                .unwrap();
             assert_eq!(res[0].as_ref().unwrap().value.as_ref(), b"v1");
             assert_eq!(res[1].as_ref().unwrap().value.as_ref(), b"v2");
         });
@@ -935,9 +1132,14 @@ mod tests {
         run(async move {
             let s = open_store(&path).await;
             set(&s, b"k", b"in-default").await;
-            s.set("db3", b"k", Bytes::from_static(b"in-db3"), SetOptions::default())
-                .await
-                .unwrap();
+            s.set(
+                "db3",
+                b"k",
+                Bytes::from_static(b"in-db3"),
+                SetOptions::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(get_value(&s, b"k").await.unwrap().as_ref(), b"in-default");
             assert_eq!(
                 s.get("db3", b"k").await.unwrap().unwrap().value.as_ref(),
@@ -1043,7 +1245,10 @@ mod tests {
                 "default",
                 b"k",
                 Bytes::from_static(b"v"),
-                SetOptions { ttl: Some(Duration::from_secs(3600)), metadata: None },
+                SetOptions {
+                    ttl: Some(Duration::from_secs(3600)),
+                    metadata: None,
+                },
             )
             .await
             .unwrap();
@@ -1063,9 +1268,13 @@ mod tests {
         run(async move {
             let s = open_store(&path).await;
             let big = Bytes::from(vec![b'x'; 1_000_000]);
-            s.set("default", b"big", big, SetOptions::default()).await.unwrap();
+            s.set("default", b"big", big, SetOptions::default())
+                .await
+                .unwrap();
             let pre = active_size(&s, "default").await;
-            s.expire("default", b"big", Duration::from_secs(60)).await.unwrap();
+            s.expire("default", b"big", Duration::from_secs(60))
+                .await
+                .unwrap();
             let post = active_size(&s, "default").await;
             let delta = post - pre;
             assert!(
@@ -1103,6 +1312,157 @@ mod tests {
                 pre_inode, post_inode,
                 "FLUSHDB must unlink + recreate (different inode), not truncate in place"
             );
+        });
+    }
+
+    // ── watch / watch_subscribe ───────────────────────────────────────────────
+
+    #[test]
+    fn watch_subscribe_delivers_set_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            let (initial, mut rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"wk"), 0)
+                .await
+                .unwrap();
+            assert!(initial.is_empty(), "key does not exist yet");
+
+            set(&s, b"wk", b"v1").await;
+
+            let event = rx.try_recv().unwrap();
+            match event {
+                WatchEvent::Set {
+                    key,
+                    value,
+                    revision,
+                    ..
+                } => {
+                    assert_eq!(key.as_ref(), b"wk");
+                    assert_eq!(value.as_ref(), b"v1");
+                    assert!(revision > 0);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn watch_subscribe_delivers_del_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"wdel", b"v").await;
+            let (_, mut rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"wdel"), 0)
+                .await
+                .unwrap();
+
+            s.del("default", &[b"wdel".as_ref()]).await.unwrap();
+
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event, WatchEvent::Del { .. }));
+        });
+    }
+
+    #[test]
+    fn watch_subscribe_initial_returns_current_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"wexist", b"hello").await;
+
+            let (initial, _rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"wexist"), 0)
+                .await
+                .unwrap();
+            assert_eq!(initial.len(), 1);
+            match &initial[0] {
+                WatchEvent::Set { key, value, .. } => {
+                    assert_eq!(key.as_ref(), b"wexist");
+                    assert_eq!(value.as_ref(), b"hello");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn watch_subscribe_prefix_receives_matching_keys() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            use futures_channel::mpsc::TryRecvError;
+            let s = open_store(&path).await;
+            let (_, mut rx) = s
+                .watch_subscribe("default", KeyFilter::Prefix(b"cfg/"), 0)
+                .await
+                .unwrap();
+
+            set(&s, b"cfg/a", b"1").await;
+            set(&s, b"other/b", b"2").await; // should not arrive
+            set(&s, b"cfg/b", b"3").await;
+
+            let e1 = rx.try_recv().unwrap();
+            let e2 = rx.try_recv().unwrap();
+            // third try should be empty (other/b filtered out)
+            assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
+
+            let keys: Vec<_> = [e1, e2]
+                .iter()
+                .map(|e| match e {
+                    WatchEvent::Set { key, .. } => key.clone(),
+                    _ => panic!("expected Set"),
+                })
+                .collect();
+            assert!(keys.iter().any(|k| k.as_ref() == b"cfg/a"));
+            assert!(keys.iter().any(|k| k.as_ref() == b"cfg/b"));
+        });
+    }
+
+    #[test]
+    fn watch_subscribe_scan_since_replays_missed_writes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            // Write before subscribing so we can replay via since.
+            set(&s, b"repl", b"v1").await;
+            let revision_after_v1 = s.ensure_ns("default").await.unwrap().last_revision();
+            set(&s, b"repl", b"v2").await;
+            s.del("default", &[b"repl".as_ref()]).await.unwrap();
+
+            // Subscribe with since = revision_after_v1 — should replay v2 set + del.
+            let (initial, _rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"repl"), revision_after_v1)
+                .await
+                .unwrap();
+
+            assert_eq!(initial.len(), 2, "expected set(v2) + del");
+            assert!(matches!(initial[0], WatchEvent::Set { .. }));
+            assert!(matches!(initial[1], WatchEvent::Del { .. }));
+        });
+    }
+
+    #[test]
+    fn watch_dead_sender_cleaned_up() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            let (_initial, rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"cleanup"), 0)
+                .await
+                .unwrap();
+            // Drop the receiver — sender is now dead.
+            drop(rx);
+            // Notify should not panic; dead sender gets pruned.
+            set(&s, b"cleanup", b"v").await;
+            // A second set also works (prune already happened).
+            set(&s, b"cleanup", b"v2").await;
         });
     }
 

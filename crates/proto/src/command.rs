@@ -40,40 +40,107 @@ pub enum GetExTtl {
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    Get { key: Bytes },
-    Set { key: Bytes, value: Bytes, args: SetArgs },
-    Del { keys: Vec<Bytes> },
-    Exists { keys: Vec<Bytes> },
-    Expire { key: Bytes, secs: u64 },
-    PExpire { key: Bytes, millis: u64 },
-    ExpireAt { key: Bytes, unix_secs: u64 },
-    PExpireAt { key: Bytes, unix_millis: u64 },
-    Ttl { key: Bytes },
-    PTtl { key: Bytes },
-    Persist { key: Bytes },
-    Keys { pattern: Option<Bytes> },
-    Scan { cursor: Bytes, args: ScanArgs },
-    MGet { keys: Vec<Bytes> },
-    MSet { pairs: Vec<(Bytes, Bytes)> },
-    GetSet { key: Bytes, value: Bytes },
-    SetNx { key: Bytes, value: Bytes },
-    GetDel { key: Bytes },
-    GetEx { key: Bytes, ttl: Option<GetExTtl> },
-    Hello { version: Option<u8> },
-    Ping { message: Option<Bytes> },
-    Select { db: u64 },
+    Get {
+        key: Bytes,
+    },
+    Set {
+        key: Bytes,
+        value: Bytes,
+        args: SetArgs,
+    },
+    Del {
+        keys: Vec<Bytes>,
+    },
+    Exists {
+        keys: Vec<Bytes>,
+    },
+    Expire {
+        key: Bytes,
+        secs: u64,
+    },
+    PExpire {
+        key: Bytes,
+        millis: u64,
+    },
+    ExpireAt {
+        key: Bytes,
+        unix_secs: u64,
+    },
+    PExpireAt {
+        key: Bytes,
+        unix_millis: u64,
+    },
+    Ttl {
+        key: Bytes,
+    },
+    PTtl {
+        key: Bytes,
+    },
+    Persist {
+        key: Bytes,
+    },
+    Keys {
+        pattern: Option<Bytes>,
+    },
+    Scan {
+        cursor: Bytes,
+        args: ScanArgs,
+    },
+    MGet {
+        keys: Vec<Bytes>,
+    },
+    MSet {
+        pairs: Vec<(Bytes, Bytes)>,
+    },
+    GetSet {
+        key: Bytes,
+        value: Bytes,
+    },
+    SetNx {
+        key: Bytes,
+        value: Bytes,
+    },
+    GetDel {
+        key: Bytes,
+    },
+    GetEx {
+        key: Bytes,
+        ttl: Option<GetExTtl>,
+    },
+    Hello {
+        version: Option<u8>,
+    },
+    Ping {
+        message: Option<Bytes>,
+    },
+    Select {
+        db: u64,
+    },
     DbSize,
     FlushDb,
     BgRewriteAof,
     Quit,
     Reset,
+    /// WATCH key [key ...] [SINCE <revision>]
+    Watch {
+        keys: Vec<Bytes>,
+        since: Option<u64>,
+    },
+    /// PWATCH prefix [SINCE <revision>]
+    PWatch {
+        prefix: Bytes,
+        since: Option<u64>,
+    },
+    Unwatch,
 }
 
 fn bulk(v: &beyond_resp::Value) -> Result<Bytes, ProtoError> {
     match v {
         beyond_resp::Value::BulkString(b) => Ok(b.clone()),
         beyond_resp::Value::SimpleString(b) => Ok(b.clone()),
-        _ => Err(ProtoError::InvalidFormat { reason: "expected bulk string" }),
+        _ => Err(ProtoError::InvalidFormat {
+            reason: "expected bulk string",
+        }),
     }
 }
 
@@ -85,12 +152,15 @@ fn parse_u64(v: &beyond_resp::Value) -> Result<u64, ProtoError> {
         .ok_or_else(|| ProtoError::InvalidInteger { raw: b })
 }
 
-
 impl Command {
     pub fn parse(value: beyond_resp::Value) -> Result<Self, ProtoError> {
         let args = match value {
             beyond_resp::Value::Array(v) if !v.is_empty() => v,
-            _ => return Err(ProtoError::InvalidFormat { reason: "expected non-empty array" }),
+            _ => {
+                return Err(ProtoError::InvalidFormat {
+                    reason: "expected non-empty array",
+                });
+            }
         };
 
         let name_bytes = bulk(&args[0])?;
@@ -111,7 +181,9 @@ impl Command {
                 if args.len() != 2 {
                     return Err(ProtoError::WrongArity { cmd: "GET" });
                 }
-                Ok(Command::Get { key: bulk(&args[1])? })
+                Ok(Command::Get {
+                    key: bulk(&args[1])?,
+                })
             }
             b"SET" => parse_set(&args),
             b"DEL" => {
@@ -132,46 +204,68 @@ impl Command {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "EXPIRE" });
                 }
-                Ok(Command::Expire { key: bulk(&args[1])?, secs: parse_u64(&args[2])? })
+                Ok(Command::Expire {
+                    key: bulk(&args[1])?,
+                    secs: parse_u64(&args[2])?,
+                })
             }
             b"PEXPIRE" => {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "PEXPIRE" });
                 }
-                Ok(Command::PExpire { key: bulk(&args[1])?, millis: parse_u64(&args[2])? })
+                Ok(Command::PExpire {
+                    key: bulk(&args[1])?,
+                    millis: parse_u64(&args[2])?,
+                })
             }
             b"EXPIREAT" => {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "EXPIREAT" });
                 }
-                Ok(Command::ExpireAt { key: bulk(&args[1])?, unix_secs: parse_u64(&args[2])? })
+                Ok(Command::ExpireAt {
+                    key: bulk(&args[1])?,
+                    unix_secs: parse_u64(&args[2])?,
+                })
             }
             b"PEXPIREAT" => {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "PEXPIREAT" });
                 }
-                Ok(Command::PExpireAt { key: bulk(&args[1])?, unix_millis: parse_u64(&args[2])? })
+                Ok(Command::PExpireAt {
+                    key: bulk(&args[1])?,
+                    unix_millis: parse_u64(&args[2])?,
+                })
             }
             b"TTL" => {
                 if args.len() != 2 {
                     return Err(ProtoError::WrongArity { cmd: "TTL" });
                 }
-                Ok(Command::Ttl { key: bulk(&args[1])? })
+                Ok(Command::Ttl {
+                    key: bulk(&args[1])?,
+                })
             }
             b"PTTL" => {
                 if args.len() != 2 {
                     return Err(ProtoError::WrongArity { cmd: "PTTL" });
                 }
-                Ok(Command::PTtl { key: bulk(&args[1])? })
+                Ok(Command::PTtl {
+                    key: bulk(&args[1])?,
+                })
             }
             b"PERSIST" => {
                 if args.len() != 2 {
                     return Err(ProtoError::WrongArity { cmd: "PERSIST" });
                 }
-                Ok(Command::Persist { key: bulk(&args[1])? })
+                Ok(Command::Persist {
+                    key: bulk(&args[1])?,
+                })
             }
             b"KEYS" => {
-                let pattern = if args.len() >= 2 { Some(bulk(&args[1])?) } else { None };
+                let pattern = if args.len() >= 2 {
+                    Some(bulk(&args[1])?)
+                } else {
+                    None
+                };
                 Ok(Command::Keys { pattern })
             }
             b"SCAN" => {
@@ -186,7 +280,9 @@ impl Command {
                     let opt = bulk(&args[i])?;
                     let mut opt_upper = [0u8; 5];
                     let opt_up: &[u8] = if opt.len() <= 5 {
-                        for (j, b) in opt.iter().enumerate() { opt_upper[j] = b.to_ascii_uppercase(); }
+                        for (j, b) in opt.iter().enumerate() {
+                            opt_upper[j] = b.to_ascii_uppercase();
+                        }
                         &opt_upper[..opt.len()]
                     } else {
                         return Err(ProtoError::Syntax { token: opt });
@@ -210,7 +306,10 @@ impl Command {
                     }
                     i += 1;
                 }
-                Ok(Command::Scan { cursor, args: ScanArgs { pattern, count } })
+                Ok(Command::Scan {
+                    cursor,
+                    args: ScanArgs { pattern, count },
+                })
             }
             b"MGET" => {
                 if args.len() < 2 {
@@ -223,7 +322,8 @@ impl Command {
                 if args.len() < 3 || (args.len() - 1) % 2 != 0 {
                     return Err(ProtoError::WrongArity { cmd: "MSET" });
                 }
-                let pairs = args[1..].chunks(2)
+                let pairs = args[1..]
+                    .chunks(2)
                     .map(|c| Ok((bulk(&c[0])?, bulk(&c[1])?)))
                     .collect::<Result<_, ProtoError>>()?;
                 Ok(Command::MSet { pairs })
@@ -232,29 +332,37 @@ impl Command {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "GETSET" });
                 }
-                Ok(Command::GetSet { key: bulk(&args[1])?, value: bulk(&args[2])? })
+                Ok(Command::GetSet {
+                    key: bulk(&args[1])?,
+                    value: bulk(&args[2])?,
+                })
             }
             b"SETNX" => {
                 if args.len() != 3 {
                     return Err(ProtoError::WrongArity { cmd: "SETNX" });
                 }
-                Ok(Command::SetNx { key: bulk(&args[1])?, value: bulk(&args[2])? })
+                Ok(Command::SetNx {
+                    key: bulk(&args[1])?,
+                    value: bulk(&args[2])?,
+                })
             }
             b"GETDEL" => {
                 if args.len() != 2 {
                     return Err(ProtoError::WrongArity { cmd: "GETDEL" });
                 }
-                Ok(Command::GetDel { key: bulk(&args[1])? })
+                Ok(Command::GetDel {
+                    key: bulk(&args[1])?,
+                })
             }
             b"GETEX" => parse_getex(&args),
             b"HELLO" => {
                 let version = if args.len() >= 2 {
                     let raw = bulk(&args[1])?;
-                    let v: u64 = std::str::from_utf8(&raw).ok()
+                    let v: u64 = std::str::from_utf8(&raw)
+                        .ok()
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
-                    let ver = u8::try_from(v)
-                        .map_err(|_| ProtoError::InvalidInteger { raw })?;
+                    let ver = u8::try_from(v).map_err(|_| ProtoError::InvalidInteger { raw })?;
                     Some(ver)
                 } else {
                     None
@@ -262,7 +370,11 @@ impl Command {
                 Ok(Command::Hello { version })
             }
             b"PING" => {
-                let message = if args.len() >= 2 { Some(bulk(&args[1])?) } else { None };
+                let message = if args.len() >= 2 {
+                    Some(bulk(&args[1])?)
+                } else {
+                    None
+                };
                 Ok(Command::Ping { message })
             }
             b"SELECT" => {
@@ -282,6 +394,54 @@ impl Command {
             }
             b"QUIT" => Ok(Command::Quit),
             b"RESET" => Ok(Command::Reset),
+            b"WATCH" => {
+                if args.len() < 2 {
+                    return Err(ProtoError::WrongArity { cmd: "WATCH" });
+                }
+                // Parse: WATCH key [key ...] [SINCE <u64>]
+                // If last two args are SINCE <n>, strip them.
+                let mut since = None;
+                let mut key_end = args.len();
+                if args.len() >= 3 {
+                    let maybe_since = bulk(&args[args.len() - 2])?;
+                    let mut buf = [0u8; 5];
+                    if maybe_since.len() <= 5 {
+                        for (i, b) in maybe_since.iter().enumerate() {
+                            buf[i] = b.to_ascii_uppercase();
+                        }
+                        if &buf[..maybe_since.len()] == b"SINCE" {
+                            since = Some(parse_u64(&args[args.len() - 1])?);
+                            key_end = args.len() - 2;
+                        }
+                    }
+                }
+                let keys = args[1..key_end]
+                    .iter()
+                    .map(bulk)
+                    .collect::<Result<_, _>>()?;
+                Ok(Command::Watch { keys, since })
+            }
+            b"PWATCH" => {
+                if args.len() < 2 {
+                    return Err(ProtoError::WrongArity { cmd: "PWATCH" });
+                }
+                let mut since = None;
+                let prefix = bulk(&args[1])?;
+                if args.len() >= 4 {
+                    let maybe_since = bulk(&args[2])?;
+                    let mut buf = [0u8; 5];
+                    if maybe_since.len() <= 5 {
+                        for (i, b) in maybe_since.iter().enumerate() {
+                            buf[i] = b.to_ascii_uppercase();
+                        }
+                        if &buf[..maybe_since.len()] == b"SINCE" {
+                            since = Some(parse_u64(&args[3])?);
+                        }
+                    }
+                }
+                Ok(Command::PWatch { prefix, since })
+            }
+            b"UNWATCH" => Ok(Command::Unwatch),
             // Satisfy clients that probe server capabilities
             b"COMMAND" => Ok(Command::Ping { message: None }),
             _ => Err(ProtoError::UnknownCommand { cmd: name_bytes }),
@@ -304,7 +464,9 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         // Buffer sized for the longest option: KEEPTTL (7 bytes)
         let mut buf = [0u8; 7];
         let opt_up: &[u8] = if opt.len() <= 7 {
-            for (j, b) in opt.iter().enumerate() { buf[j] = b.to_ascii_uppercase(); }
+            for (j, b) in opt.iter().enumerate() {
+                buf[j] = b.to_ascii_uppercase();
+            }
             &buf[..opt.len()]
         } else {
             return Err(ProtoError::Syntax { token: opt });
@@ -312,30 +474,46 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         match opt_up {
             b"EX" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
                 ttl = Some(SetTtl::Seconds(v));
             }
             b"PX" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
                 ttl = Some(SetTtl::Millis(v));
             }
             b"EXAT" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
                 ttl = Some(SetTtl::UnixSecs(parse_u64(&args[i])?));
             }
             b"PXAT" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
                 ttl = Some(SetTtl::UnixMillis(parse_u64(&args[i])?));
             }
             b"NX" => condition = SetCondition::Nx,
@@ -346,7 +524,15 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         }
         i += 1;
     }
-    Ok(Command::Set { key, value, args: SetArgs { ttl, condition, get } })
+    Ok(Command::Set {
+        key,
+        value,
+        args: SetArgs {
+            ttl,
+            condition,
+            get,
+        },
+    })
 }
 
 fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
@@ -361,7 +547,9 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         // Buffer sized for the longest option: PERSIST (7 bytes)
         let mut buf = [0u8; 7];
         let opt_up: &[u8] = if opt.len() <= 7 {
-            for (j, b) in opt.iter().enumerate() { buf[j] = b.to_ascii_uppercase(); }
+            for (j, b) in opt.iter().enumerate() {
+                buf[j] = b.to_ascii_uppercase();
+            }
             &buf[..opt.len()]
         } else {
             return Err(ProtoError::Syntax { token: opt });
@@ -369,30 +557,46 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         match opt_up {
             b"EX" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "GETEX" });
+                }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
                 ttl = Some(GetExTtl::Set(SetTtl::Seconds(v)));
             }
             b"PX" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "GETEX" });
+                }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                let v: u64 = std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
+                if v == 0 {
+                    return Err(ProtoError::InvalidExpiry { raw });
+                }
                 ttl = Some(GetExTtl::Set(SetTtl::Millis(v)));
             }
             b"EXAT" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "GETEX" });
+                }
                 ttl = Some(GetExTtl::Set(SetTtl::UnixSecs(parse_u64(&args[i])?)));
             }
             b"PXAT" => {
                 i += 1;
-                if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "GETEX" });
+                }
                 ttl = Some(GetExTtl::Set(SetTtl::UnixMillis(parse_u64(&args[i])?)));
             }
             b"PERSIST" => ttl = Some(GetExTtl::Persist),
@@ -409,7 +613,12 @@ mod tests {
     use beyond_resp::Value;
 
     fn arr(parts: &[&[u8]]) -> Value {
-        Value::Array(parts.iter().map(|b| Value::BulkString(Bytes::copy_from_slice(b))).collect())
+        Value::Array(
+            parts
+                .iter()
+                .map(|b| Value::BulkString(Bytes::copy_from_slice(b)))
+                .collect(),
+        )
     }
 
     // --- GET ---
@@ -618,7 +827,9 @@ mod tests {
     fn scan_with_match() {
         let cmd = Command::parse(arr(&[b"SCAN", b"0", b"MATCH", b"foo*"])).unwrap();
         match cmd {
-            Command::Scan { args, .. } => assert_eq!(args.pattern.as_deref(), Some(b"foo*".as_ref())),
+            Command::Scan { args, .. } => {
+                assert_eq!(args.pattern.as_deref(), Some(b"foo*".as_ref()))
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -681,7 +892,13 @@ mod tests {
     #[test]
     fn getex_persist() {
         let cmd = Command::parse(arr(&[b"GETEX", b"k", b"PERSIST"])).unwrap();
-        assert!(matches!(cmd, Command::GetEx { ttl: Some(GetExTtl::Persist), .. }));
+        assert!(matches!(
+            cmd,
+            Command::GetEx {
+                ttl: Some(GetExTtl::Persist),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -689,7 +906,10 @@ mod tests {
         let cmd = Command::parse(arr(&[b"GETEX", b"k", b"EX", b"60"])).unwrap();
         assert!(matches!(
             cmd,
-            Command::GetEx { ttl: Some(GetExTtl::Set(SetTtl::Seconds(60))), .. }
+            Command::GetEx {
+                ttl: Some(GetExTtl::Set(SetTtl::Seconds(60))),
+                ..
+            }
         ));
     }
 

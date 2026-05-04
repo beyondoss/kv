@@ -25,7 +25,10 @@ pub struct Resp {
 
 impl Resp {
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
-        Self { name: name.into(), url: url.into() }
+        Self {
+            name: name.into(),
+            url: url.into(),
+        }
     }
 
     /// Parse a `name=url` spec from the CLI, e.g. `beyond=redis://127.0.0.1:6379`.
@@ -39,7 +42,9 @@ impl Resp {
 
 #[async_trait]
 impl Target for Resp {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn connect(&self) -> anyhow::Result<Box<dyn Client>> {
         let client = redis::Client::open(self.url.as_str())

@@ -46,12 +46,10 @@ impl TestServer {
 
         let (resp_tx, resp_rx) =
             std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
-        let (resp_wakeup_read, resp_wakeup_write) =
-            std::os::unix::net::UnixStream::pair().unwrap();
+        let (resp_wakeup_read, resp_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
         let (http_tx, http_rx) =
             std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
-        let (http_wakeup_read, http_wakeup_write) =
-            std::os::unix::net::UnixStream::pair().unwrap();
+        let (http_wakeup_read, http_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
 
         // RESP accept thread.
         std::thread::spawn(move || {
@@ -129,7 +127,12 @@ impl TestServer {
         wait_for_port(http_port);
         wait_for_port(resp_port);
 
-        Self { _serial, _tmp: tmp, http_port, resp_port }
+        Self {
+            _serial,
+            _tmp: tmp,
+            http_port,
+            resp_port,
+        }
     }
 
     // ── URL construction ──────────────────────────────────────────────────────
@@ -139,7 +142,11 @@ impl TestServer {
     }
 
     pub fn value_url(&self, ns: &str, key: &str) -> String {
-        format!("{}/namespaces/{ns}/values/{}", self.base(), urlencoding::encode(key))
+        format!(
+            "{}/namespaces/{ns}/values/{}",
+            self.base(),
+            urlencoding::encode(key)
+        )
     }
 
     pub fn keys_url(&self, ns: &str) -> String {
@@ -340,8 +347,15 @@ fn raw_send(req: ureq::Request, body: &[u8]) -> KvResponse {
 fn read_response(res: ureq::Response) -> KvResponse {
     let status = res.status();
     let ttl = res.header("x-kv-ttl").and_then(|s| s.parse().ok());
-    let metadata = res.header("x-kv-metadata").and_then(|s| serde_json::from_str(s).ok());
+    let metadata = res
+        .header("x-kv-metadata")
+        .and_then(|s| serde_json::from_str(s).ok());
     let mut body = Vec::new();
     res.into_reader().read_to_end(&mut body).unwrap();
-    KvResponse { status, body, ttl, metadata }
+    KvResponse {
+        status,
+        body,
+        ttl,
+        metadata,
+    }
 }

@@ -56,7 +56,11 @@ fn delete_removes_key() {
 fn delete_is_idempotent_on_missing_key() {
     let srv = TestServer::start();
     let res = srv.delete("ghost");
-    assert!(res.is_ok(), "DELETE on missing key must not error; got {}", res.status);
+    assert!(
+        res.is_ok(),
+        "DELETE on missing key must not error; got {}",
+        res.status
+    );
 }
 
 #[test]
@@ -65,7 +69,11 @@ fn delete_then_delete_again_is_ok() {
     srv.put("k", b"v");
     srv.delete("k");
     let res = srv.delete("k");
-    assert!(res.is_ok(), "second DELETE must be idempotent; got {}", res.status);
+    assert!(
+        res.is_ok(),
+        "second DELETE must be idempotent; got {}",
+        res.status
+    );
 }
 
 // ── NX (set-if-not-exists) ────────────────────────────────────────────────────
@@ -73,7 +81,15 @@ fn delete_then_delete_again_is_ok() {
 #[test]
 fn put_nx_succeeds_on_fresh_key() {
     let srv = TestServer::start();
-    let res = srv.put_opts("default", "nx-key", b"v", PutOptions { nx: true, ..Default::default() });
+    let res = srv.put_opts(
+        "default",
+        "nx-key",
+        b"v",
+        PutOptions {
+            nx: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(res.status, 204);
 }
 
@@ -81,7 +97,15 @@ fn put_nx_succeeds_on_fresh_key() {
 fn put_nx_returns_409_on_existing_key() {
     let srv = TestServer::start();
     srv.put("nx-dup", b"existing");
-    let res = srv.put_opts("default", "nx-dup", b"new", PutOptions { nx: true, ..Default::default() });
+    let res = srv.put_opts(
+        "default",
+        "nx-dup",
+        b"new",
+        PutOptions {
+            nx: true,
+            ..Default::default()
+        },
+    );
     assert!(res.is_conflict());
     assert_eq!(res.json()["error"], "conflict");
 }
@@ -90,7 +114,15 @@ fn put_nx_returns_409_on_existing_key() {
 fn put_nx_does_not_overwrite_value() {
     let srv = TestServer::start();
     srv.put("nx-safe", b"original");
-    srv.put_opts("default", "nx-safe", b"clobbered", PutOptions { nx: true, ..Default::default() });
+    srv.put_opts(
+        "default",
+        "nx-safe",
+        b"clobbered",
+        PutOptions {
+            nx: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(srv.get("nx-safe").body, b"original");
 }
 
@@ -100,8 +132,13 @@ fn put_nx_does_not_overwrite_value() {
 fn put_with_ttl_header_reflects_in_get() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default", "ttl-key", b"v",
-        PutOptions { ttl_header: Some(60), ..Default::default() },
+        "default",
+        "ttl-key",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
     );
     let res = srv.get("ttl-key");
     assert_eq!(res.status, 200);
@@ -113,8 +150,13 @@ fn put_with_ttl_header_reflects_in_get() {
 fn put_with_ttl_query_param_reflects_in_get() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default", "ttl-q", b"v",
-        PutOptions { ttl_query: Some(60), ..Default::default() },
+        "default",
+        "ttl-q",
+        b"v",
+        PutOptions {
+            ttl_query: Some(60),
+            ..Default::default()
+        },
     );
     let ttl = srv.get("ttl-q").ttl.expect("x-kv-ttl missing");
     assert!(ttl > 0 && ttl <= 60);
@@ -124,12 +166,20 @@ fn put_with_ttl_query_param_reflects_in_get() {
 fn key_expires_after_ttl() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default", "expiring", b"soon-gone",
-        PutOptions { ttl_header: Some(1), ..Default::default() },
+        "default",
+        "expiring",
+        b"soon-gone",
+        PutOptions {
+            ttl_header: Some(1),
+            ..Default::default()
+        },
     );
     assert_eq!(srv.get("expiring").status, 200);
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    assert!(srv.get("expiring").is_not_found(), "key should have expired");
+    assert!(
+        srv.get("expiring").is_not_found(),
+        "key should have expired"
+    );
 }
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
@@ -139,8 +189,13 @@ fn put_with_metadata_round_trips() {
     let srv = TestServer::start();
     let meta = serde_json::json!({"score": 42, "tags": ["a", "b"]});
     srv.put_opts(
-        "default", "meta-key", b"data",
-        PutOptions { metadata: Some(meta.clone()), ..Default::default() },
+        "default",
+        "meta-key",
+        b"data",
+        PutOptions {
+            metadata: Some(meta.clone()),
+            ..Default::default()
+        },
     );
     let res = srv.get("meta-key");
     assert_eq!(res.metadata, Some(meta));
@@ -260,7 +315,15 @@ fn list_with_prefix_filters_keys() {
     for k in ["user:1", "user:2", "session:abc"] {
         srv.put(k, b"v");
     }
-    let body = srv.list_opts("default", ListOptions { prefix: Some("user:".into()), ..Default::default() }).json();
+    let body = srv
+        .list_opts(
+            "default",
+            ListOptions {
+                prefix: Some("user:".into()),
+                ..Default::default()
+            },
+        )
+        .json();
     let names: Vec<String> = body["keys"]
         .as_array()
         .unwrap()
@@ -277,11 +340,22 @@ fn list_with_limit_caps_page_size() {
     for i in 0..10 {
         srv.put(&format!("item:{i:02}"), b"v");
     }
-    let body = srv.list_opts("default", ListOptions { limit: Some(3), ..Default::default() }).json();
+    let body = srv
+        .list_opts(
+            "default",
+            ListOptions {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .json();
     let keys = body["keys"].as_array().unwrap();
     assert_eq!(keys.len(), 3);
     assert_eq!(body["complete"], false);
-    assert!(body["cursor"].as_str().is_some(), "expect a cursor for the next page");
+    assert!(
+        body["cursor"].as_str().is_some(),
+        "expect a cursor for the next page"
+    );
 }
 
 #[test]
@@ -314,14 +388,25 @@ fn list_pagination_covers_all_keys() {
     all_names.sort();
     let mut want_sorted = want.clone();
     want_sorted.sort();
-    assert_eq!(all_names, want_sorted, "paginated scan missed or duplicated keys");
+    assert_eq!(
+        all_names, want_sorted,
+        "paginated scan missed or duplicated keys"
+    );
 }
 
 #[test]
 fn expired_keys_not_returned_in_list() {
     let srv = TestServer::start();
     srv.put_opts("default", "live", b"v", PutOptions::default());
-    srv.put_opts("default", "dead", b"v", PutOptions { ttl_header: Some(1), ..Default::default() });
+    srv.put_opts(
+        "default",
+        "dead",
+        b"v",
+        PutOptions {
+            ttl_header: Some(1),
+            ..Default::default()
+        },
+    );
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let body = srv.list("default").json();
     let names: Vec<&str> = body["keys"]
@@ -331,7 +416,10 @@ fn expired_keys_not_returned_in_list() {
         .map(|e| e["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"live"));
-    assert!(!names.contains(&"dead"), "expired key must not appear in list");
+    assert!(
+        !names.contains(&"dead"),
+        "expired key must not appear in list"
+    );
 }
 
 // ── Malformed requests ────────────────────────────────────────────────────────
@@ -350,7 +438,10 @@ fn malformed_ttl_header_is_silently_ignored_key_stored_without_ttl() {
     let got = srv.get("bad-ttl-key");
     assert_eq!(got.status, 200);
     assert_eq!(got.body, b"value");
-    assert!(got.ttl.is_none(), "no TTL should have been set when header was non-numeric");
+    assert!(
+        got.ttl.is_none(),
+        "no TTL should have been set when header was non-numeric"
+    );
 }
 
 #[test]
@@ -365,7 +456,10 @@ fn malformed_metadata_header_is_silently_ignored() {
     assert_eq!(res.status(), 204);
     let got = srv.get("bad-meta-key");
     assert_eq!(got.status, 200);
-    assert!(got.metadata.is_none(), "invalid metadata header must be silently dropped");
+    assert!(
+        got.metadata.is_none(),
+        "invalid metadata header must be silently dropped"
+    );
 }
 
 #[test]
@@ -395,5 +489,8 @@ fn zero_ttl_header_results_in_no_ttl() {
         .send_bytes(b"zero-ttl-value");
     // Key may or may not persist depending on implementation; just confirm no 5xx
     let got = srv.get("ttl-zero");
-    assert!(got.status == 200 || got.status == 404, "zero TTL must not cause 5xx");
+    assert!(
+        got.status == 200 || got.status == 404,
+        "zero TTL must not cause 5xx"
+    );
 }

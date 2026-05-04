@@ -1,6 +1,14 @@
-import type { KvEntry, KvListOptions, KvListResult, KvMSetEntry, KvSetOptions } from "./types.js";
 import { createHttpKvClient } from "./http.js";
 import { createRespKvClient } from "./resp.js";
+import type {
+  KvEntry,
+  KvListOptions,
+  KvListResult,
+  KvMSetEntry,
+  KvSetOptions,
+  KvWatchEvent,
+  KvWatchOptions,
+} from "./types.js";
 
 export interface KvCommandEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
@@ -18,13 +26,27 @@ export interface KvResponseEvent {
 export interface KvClient {
   get(key: string): Promise<KvEntry | null>;
   getOrThrow(key: string): Promise<KvEntry>;
-  set(key: string, value: string | Uint8Array, opts?: KvSetOptions): Promise<void>;
+  set(
+    key: string,
+    value: string | Uint8Array,
+    opts?: KvSetOptions,
+  ): Promise<void>;
   delete(key: string): Promise<void>;
   list(opts?: KvListOptions): Promise<KvListResult>;
   /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: parallel requests. */
   mget(keys: string[]): Promise<(KvEntry | null)[]>;
   /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: parallel requests. */
   mset(entries: KvMSetEntry[]): Promise<void>;
+  /**
+   * Subscribe to changes on a key or prefix.
+   *
+   * Yields `"ready"` once the initial state has been delivered, then streams
+   * `"set"` / `"del"` events as mutations arrive. Pass `since` to resume a
+   * previous stream from a known revision (catches up on any missed mutations).
+   *
+   * HTTP backend only — RESP backend throws immediately.
+   */
+  watch(key: string, opts?: KvWatchOptions): AsyncGenerator<KvWatchEvent>;
   /** Release underlying connections. Call when the client is no longer needed. */
   close(): Promise<void>;
 }

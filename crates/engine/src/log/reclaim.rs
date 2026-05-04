@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::error::{EngineError, Result};
 use crate::log::file::{
-    data_filename, footer_entry_from_index, reclaim_tmp_filename, FooterEntry, LogFile,
+    FooterEntry, LogFile, data_filename, footer_entry_from_index, reclaim_tmp_filename,
 };
 use crate::log::index::IndexEntry;
 

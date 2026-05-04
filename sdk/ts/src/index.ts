@@ -13,4 +13,7 @@ export type {
   KvListResult,
   KvMSetEntry,
   KvSetOptions,
+  KvWatchEvent,
+  KvWatchEventType,
+  KvWatchOptions,
 } from "./types.js";

@@ -12,13 +12,24 @@ use crate::keyspace::Keyspace;
 
 #[derive(Debug, Clone)]
 pub enum Op {
-    Get { key: Bytes },
-    Set { key: Bytes, value: Bytes },
-    Del { key: Bytes },
+    Get {
+        key: Bytes,
+    },
+    Set {
+        key: Bytes,
+        value: Bytes,
+    },
+    Del {
+        key: Bytes,
+    },
     /// Batched read. One round-trip, `keys.len()` logical operations.
-    MGet { keys: Vec<Bytes> },
+    MGet {
+        keys: Vec<Bytes>,
+    },
     /// Batched write. One round-trip, `pairs.len()` logical operations.
-    MSet { pairs: Vec<(Bytes, Bytes)> },
+    MSet {
+        pairs: Vec<(Bytes, Bytes)>,
+    },
 }
 
 impl Op {
@@ -49,8 +60,13 @@ pub enum OpKind {
 
 impl OpKind {
     pub const COUNT: usize = 5;
-    pub const ALL: [OpKind; Self::COUNT] =
-        [OpKind::Get, OpKind::Set, OpKind::Del, OpKind::MGet, OpKind::MSet];
+    pub const ALL: [OpKind; Self::COUNT] = [
+        OpKind::Get,
+        OpKind::Set,
+        OpKind::Del,
+        OpKind::MGet,
+        OpKind::MSet,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             OpKind::Get => "GET",
@@ -79,7 +95,9 @@ pub enum OpMix {
     GetOnly,
     SetOnly,
     /// Mix of GET/SET. `read_pct` is in `[0, 100]`.
-    Mixed { read_pct: u8 },
+    Mixed {
+        read_pct: u8,
+    },
 }
 
 impl std::str::FromStr for OpMix {
@@ -119,12 +137,23 @@ impl Workload {
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i as u8).wrapping_add(0x20);
         }
-        Self { keyspace, mix, value: Bytes::from(buf), batch: batch.max(1) }
+        Self {
+            keyspace,
+            mix,
+            value: Bytes::from(buf),
+            batch: batch.max(1),
+        }
     }
 
-    pub fn keyspace(&self) -> &Keyspace { &self.keyspace }
-    pub fn value(&self) -> &Bytes { &self.value }
-    pub fn batch(&self) -> usize { self.batch }
+    pub fn keyspace(&self) -> &Keyspace {
+        &self.keyspace
+    }
+    pub fn value(&self) -> &Bytes {
+        &self.value
+    }
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
 
     pub fn next<R: Rng>(&self, rng: &mut R) -> Op {
         let pick_read = match self.mix {
@@ -137,11 +166,13 @@ impl Workload {
             if pick_read {
                 Op::Get { key }
             } else {
-                Op::Set { key, value: self.value.clone() }
+                Op::Set {
+                    key,
+                    value: self.value.clone(),
+                }
             }
         } else if pick_read {
-            let keys: Vec<Bytes> =
-                (0..self.batch).map(|_| self.keyspace.sample(rng)).collect();
+            let keys: Vec<Bytes> = (0..self.batch).map(|_| self.keyspace.sample(rng)).collect();
             Op::MGet { keys }
         } else {
             let pairs: Vec<(Bytes, Bytes)> = (0..self.batch)

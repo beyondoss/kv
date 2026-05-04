@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
+import type { KvClient } from "../client.js";
 import { KvError, KvNotFoundError } from "../errors.js";
-import { dec, enc, getHttpUrl, httpClient, uniqueKey, uniqueNs } from "./harness.js";
+import type { KvWatchEvent } from "../types.js";
+import type { KvWatchOptions } from "../types.js";
+import {
+  dec,
+  enc,
+  getHttpUrl,
+  httpClient,
+  uniqueKey,
+  uniqueNs,
+} from "./harness.js";
 
 // Each test gets its own namespace via httpClient() so tests never share state.
 
@@ -98,7 +108,8 @@ describe("HTTP backend — getOrThrow", () => {
 describe("HTTP backend — NX / XX", () => {
   it("nx succeeds on a missing key", async () => {
     const kv = httpClient();
-    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves.toBeUndefined();
+    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves
+      .toBeUndefined();
   });
 
   it("nx throws KvError(409) when the key already exists", async () => {
@@ -172,7 +183,11 @@ describe("HTTP backend — list", () => {
     let complete = false;
 
     while (!complete) {
-      const page = await kv.list({ prefix, cursor, limit: 2 });
+      const page = await kv.list({
+        prefix,
+        limit: 2,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
       seen.push(...page.keys.map((k) => k.name));
       complete = page.complete;
       cursor = page.cursor;
@@ -333,7 +348,12 @@ describe("HTTP backend — retry on 5xx", () => {
       return realFetch(input, init);
     };
 
-    const kv = createKvClient({ url: getHttpUrl(), namespace: ns, fetch: mockFetch, retries: 2 });
+    const kv = createKvClient({
+      url: getHttpUrl(),
+      namespace: ns,
+      fetch: mockFetch,
+      retries: 2,
+    });
     await kv.set(key, "v");
     expect(attempt).toBeGreaterThan(1);
   });
@@ -363,7 +383,10 @@ describe("HTTP backend — timeout", () => {
     // Fetch that hangs forever until aborted.
     const hangingFetch: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+        );
       });
 
     const kv = createKvClient({
@@ -382,5 +405,253 @@ describe("HTTP backend — close", () => {
   it("close() resolves without error", async () => {
     const kv = httpClient();
     await expect(kv.close()).resolves.toBeUndefined();
+  });
+});
+
+// ── watch helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Subscribe to `kv.watch(key, opts)`, wait for the `"ready"` event, call
+ * `act()`, then collect events until `predicate(events)` returns true or
+ * the timeout fires (default 5 s).  Returns all collected events including
+ * `"ready"`.
+ */
+async function watchCollect(
+  kv: KvClient,
+  key: string,
+  opts: KvWatchOptions,
+  predicate: (events: KvWatchEvent[]) => boolean,
+  act: () => Promise<void>,
+): Promise<KvWatchEvent[]> {
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), 5_000);
+  const events: KvWatchEvent[] = [];
+
+  let readyResolve!: () => void;
+  const readyPromise = new Promise<void>((r) => {
+    readyResolve = r;
+  });
+
+  const collectTask = (async () => {
+    for await (const ev of kv.watch(key, { ...opts, signal: ac.signal })) {
+      events.push(ev);
+      if (ev.type === "ready") readyResolve();
+      if (predicate(events)) break;
+    }
+  })();
+
+  await readyPromise;
+  await act();
+  await collectTask;
+  clearTimeout(timeout);
+  ac.abort();
+  return events;
+}
+
+function nonReady(events: KvWatchEvent[]): KvWatchEvent[] {
+  return events.filter((e) => e.type !== "ready");
+}
+
+// ── watch tests ───────────────────────────────────────────────────────────────
+
+describe("HTTP backend — watch (exact key)", () => {
+  it("emits a ready event on subscription", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => evs.some((e) => e.type === "ready"),
+      async () => {},
+    );
+    expect(events.find((e) => e.type === "ready")).toBeDefined();
+  });
+
+  it("delivers a set event when a key is written after subscription", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => nonReady(evs).length >= 1,
+      async () => kv.set(key, "hello"),
+    );
+    const setEvent = events.find((e) => e.type === "set");
+    expect(setEvent).toBeDefined();
+    expect(dec(setEvent!.value!)).toBe("hello");
+    expect(setEvent!.key).toBe(key);
+    expect(setEvent!.revision).toBeGreaterThan(0);
+  });
+
+  it("includes the current value immediately when the key already exists (since=0)", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, "preexisting");
+
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => evs.some((e) => e.type === "ready"),
+      async () => {},
+    );
+    // The initial set event should arrive before ready
+    const setEvent = events.find((e) => e.type === "set");
+    expect(setEvent).toBeDefined();
+    expect(dec(setEvent!.value!)).toBe("preexisting");
+  });
+
+  it("delivers a del event when the key is deleted", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    await kv.set(key, "will-be-deleted");
+
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => nonReady(evs).some((e) => e.type === "del"),
+      async () => kv.delete(key),
+    );
+    const delEvent = events.find((e) => e.type === "del");
+    expect(delEvent).toBeDefined();
+    expect(delEvent!.key).toBe(key);
+    expect(delEvent!.revision).toBeGreaterThan(0);
+  });
+
+  it("delivers multiple sequential mutations in order", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => nonReady(evs).length >= 3,
+      async () => {
+        await kv.set(key, "v1");
+        await kv.set(key, "v2");
+        await kv.delete(key);
+      },
+    );
+    const mutations = nonReady(events);
+    expect(mutations).toHaveLength(3);
+    expect(mutations[0]!.type).toBe("set");
+    expect(dec(mutations[0]!.value!)).toBe("v1");
+    expect(mutations[1]!.type).toBe("set");
+    expect(dec(mutations[1]!.value!)).toBe("v2");
+    expect(mutations[2]!.type).toBe("del");
+  });
+
+  it("revisions are strictly increasing", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    const events = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => nonReady(evs).length >= 2,
+      async () => {
+        await kv.set(key, "a");
+        await kv.set(key, "b");
+      },
+    );
+    const mutations = nonReady(events);
+    expect(mutations[1]!.revision).toBeGreaterThan(mutations[0]!.revision);
+  });
+
+  it("cancellation via AbortSignal stops the stream cleanly", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+    const ac = new AbortController();
+
+    const events: KvWatchEvent[] = [];
+    const watchTask = (async () => {
+      for await (const ev of kv.watch(key, { signal: ac.signal })) {
+        events.push(ev);
+        if (ev.type === "ready") ac.abort();
+      }
+    })();
+
+    await watchTask;
+    expect(events.find((e) => e.type === "ready")).toBeDefined();
+    // No mutations were emitted — only the ready sentinel
+    expect(nonReady(events)).toHaveLength(0);
+  });
+
+  it("since=revision replays mutations missed between reconnects", async () => {
+    const kv = httpClient();
+    const key = uniqueKey();
+
+    // First subscription: record the revision of a write
+    const firstEvents = await watchCollect(
+      kv,
+      key,
+      {},
+      (evs) => nonReady(evs).length >= 1,
+      async () => kv.set(key, "first"),
+    );
+    const firstRev = nonReady(firstEvents)[0]!.revision;
+
+    // Write a second value while "disconnected" (no active watch)
+    await kv.set(key, "second");
+
+    // Reconnect with since=firstRev — must replay the "second" write
+    const replayEvents = await watchCollect(
+      kv,
+      key,
+      { since: firstRev },
+      (evs) => evs.some((e) => e.type === "ready"),
+      async () => {},
+    );
+    const replayed = replayEvents.filter((e) => e.type === "set");
+    expect(replayed.length).toBeGreaterThanOrEqual(1);
+    const lastValue = dec(replayed[replayed.length - 1]!.value!);
+    expect(lastValue).toBe("second");
+  });
+});
+
+describe("HTTP backend — watch (prefix)", () => {
+  it("streams set events for all keys matching the prefix", async () => {
+    const kv = httpClient();
+    const prefix = `cfg:${crypto.randomUUID()}:`;
+    const k1 = `${prefix}alpha`;
+    const k2 = `${prefix}beta`;
+
+    const events = await watchCollect(
+      kv,
+      prefix,
+      { prefix: true },
+      (evs) => nonReady(evs).length >= 2,
+      async () => {
+        await kv.set(k1, "v1");
+        await kv.set(k2, "v2");
+      },
+    );
+    const mutations = nonReady(events);
+    expect(mutations).toHaveLength(2);
+    expect(mutations.map((e) => e.key).sort()).toEqual([k1, k2].sort());
+  });
+
+  it("does not emit events for keys outside the prefix", async () => {
+    const kv = httpClient();
+    const prefix = `watch-pfx:${crypto.randomUUID()}:`;
+    const inside = `${prefix}inside`;
+    const outside = uniqueKey("other");
+
+    const events = await watchCollect(
+      kv,
+      prefix,
+      { prefix: true },
+      (evs) => nonReady(evs).length >= 1,
+      async () => {
+        await kv.set(outside, "should-not-appear");
+        await kv.set(inside, "appears");
+      },
+    );
+    const keys = nonReady(events).map((e) => e.key);
+    expect(keys).not.toContain(outside);
+    expect(keys).toContain(inside);
   });
 });

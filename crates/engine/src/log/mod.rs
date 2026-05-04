@@ -17,9 +17,9 @@
 pub mod config;
 pub mod file;
 pub mod index;
+pub mod reclaim;
 pub mod record;
 pub mod recover;
-pub mod reclaim;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -33,9 +33,9 @@ use tracing::warn;
 
 use crate::error::{EngineError, Result};
 use crate::log::config::LogConfig;
-use crate::log::file::{data_filename, FooterEntry, LogFile};
+use crate::log::file::{FooterEntry, LogFile, data_filename};
 use crate::log::index::{IndexEntry, NsIndex};
-use crate::log::record::{flags as rflags, parse_header, HEADER_LEN};
+use crate::log::record::{HEADER_LEN, flags as rflags, parse_header};
 
 pub fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -73,7 +73,8 @@ pub struct NamespaceLog {
 impl NamespaceLog {
     pub async fn open(dir: PathBuf, config: LogConfig) -> Result<Self> {
         let opened = recover::open_namespace(dir.clone()).await?;
-        let sealed: FxHashMap<u16, Rc<LogFile>> = opened.sealed
+        let sealed: FxHashMap<u16, Rc<LogFile>> = opened
+            .sealed
             .into_iter()
             .map(|f| (f.file_id, Rc::new(f)))
             .collect();
@@ -107,6 +108,10 @@ impl NamespaceLog {
         self.index.borrow().len()
     }
 
+    pub fn last_revision(&self) -> u64 {
+        self.last_tstamp.get()
+    }
+
     pub fn sealed_file_count(&self) -> usize {
         self.sealed.borrow().len()
     }
@@ -136,7 +141,8 @@ impl NamespaceLog {
 
         let active = self.active();
         let offset = active.append(buf).await?;
-        self.unsynced_bytes.set(self.unsynced_bytes.get() + record_size as u64);
+        self.unsynced_bytes
+            .set(self.unsynced_bytes.get() + record_size as u64);
         let entry = IndexEntry::new(active.file_id, offset, record_size);
         self.index.borrow_mut().insert(key, entry, expires_at_ms);
         if active.write_offset() >= self.config.rotate_threshold {
@@ -242,11 +248,14 @@ impl NamespaceLog {
     }
 
     async fn read_record(&self, entry: IndexEntry) -> Result<Vec<u8>> {
-        let file = self.locate_file(entry.file_id).ok_or(EngineError::BadRecord {
-            offset: entry.record_offset,
-            reason: "file_id not found",
-        })?;
-        file.read_exact(entry.record_offset, entry.record_size as usize).await
+        let file = self
+            .locate_file(entry.file_id)
+            .ok_or(EngineError::BadRecord {
+                offset: entry.record_offset,
+                reason: "file_id not found",
+            })?;
+        file.read_exact(entry.record_offset, entry.record_size as usize)
+            .await
     }
 
     fn extract_value_meta(bytes: &[u8]) -> Result<(Bytes, Bytes)> {
@@ -295,6 +304,72 @@ impl NamespaceLog {
         Ok(out)
     }
 
+    /// Return all live keys matching `filter` as `WatchEvent::Set` for initial-subscribe
+    /// (since = 0). Reads from the in-memory index then fetches values from disk.
+    pub async fn current_entries(
+        &self,
+        filter: &crate::watch::KeyFilter<'_>,
+        now: u64,
+    ) -> Result<Vec<crate::watch::WatchEvent>> {
+        use crate::watch::WatchEvent;
+
+        let live: Vec<(Bytes, index::IndexEntry, Option<u64>)> = {
+            let idx = self.index.borrow();
+            idx.iter()
+                .filter(|(k, _)| filter.matches(k) && !idx.is_expired(k, now))
+                .map(|(k, e)| (k.clone(), *e, idx.ttl(k)))
+                .collect()
+        };
+
+        let mut events = Vec::with_capacity(live.len());
+        for (key, entry, expires_at_ms) in live {
+            let (value, meta_bytes) = self.read_value(entry).await?;
+            let metadata = if meta_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice(&meta_bytes).ok()
+            };
+            events.push(WatchEvent::Set {
+                key,
+                value,
+                metadata,
+                expires_at_ms,
+                revision: 0,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Scan all log files for mutations with `tstamp_ms > since_revision` that match
+    /// `filter`. Returns events in chronological order. Used for catch-up replay on
+    /// reconnect.
+    pub async fn scan_since(
+        &self,
+        filter: &crate::watch::KeyFilter<'_>,
+        since_revision: u64,
+    ) -> Result<Vec<crate::watch::WatchEvent>> {
+        let mut files: Vec<(u16, Rc<LogFile>)> = self
+            .sealed
+            .borrow()
+            .iter()
+            .map(|(&id, f)| (id, f.clone()))
+            .collect();
+        files.sort_by_key(|(id, _)| *id);
+        files.push((self.active.borrow().file_id, self.active()));
+
+        let mut events = Vec::new();
+        for (_, file) in &files {
+            let end = file.data_end_offset().await;
+            scan_file_records(file, end, filter, since_revision, &mut events).await?;
+        }
+        // Sort by revision so callers see a clean chronological stream.
+        events.sort_by_key(|e| match e {
+            crate::watch::WatchEvent::Set { revision, .. } => *revision,
+            crate::watch::WatchEvent::Del { revision, .. } => *revision,
+        });
+        Ok(events)
+    }
+
     /// Seal the current active file (writing its footer) and open a new active file.
     /// Called automatically when `active.write_offset() >= config.rotate_threshold`.
     ///
@@ -329,7 +404,12 @@ impl NamespaceLog {
         old_active.write_footer(&footer).await?;
         let next_id = {
             let sealed = self.sealed.borrow();
-            let max_existing = sealed.keys().copied().max().unwrap_or(0).max(old_active.file_id);
+            let max_existing = sealed
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(old_active.file_id);
             max_existing
                 .checked_add(1)
                 .ok_or(EngineError::CapacityExceeded {
@@ -424,12 +504,18 @@ impl NamespaceLog {
                 .collect()
         };
         old_active.write_footer(&footer).await?;
-        self.sealed.borrow_mut().insert(old_active.file_id, old_active.clone());
+        self.sealed
+            .borrow_mut()
+            .insert(old_active.file_id, old_active.clone());
 
         // Pick the next file_id as max(existing) + 1.
         let next_id = {
             let sealed = self.sealed.borrow();
-            sealed.keys().copied().max().unwrap_or(0)
+            sealed
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0)
                 .checked_add(1)
                 .ok_or(EngineError::CapacityExceeded {
                     reason: "file_id overflow: namespace has too many log files",
@@ -446,7 +532,10 @@ impl NamespaceLog {
         // Snapshot live entries outside the await so the reclaim doesn't hold an index borrow.
         let live: Vec<(Bytes, IndexEntry, Option<u64>)> = {
             let index = self.index.borrow();
-            index.iter().map(|(k, e)| (k.clone(), *e, index.ttl(k))).collect()
+            index
+                .iter()
+                .map(|(k, e)| (k.clone(), *e, index.ttl(k)))
+                .collect()
         };
 
         let (report, new_entries) =
@@ -476,3 +565,83 @@ impl NamespaceLog {
     }
 }
 
+/// Scan one log file for mutation records newer than `since_revision` that
+/// match `filter`, appending decoded `WatchEvent`s to `events`.
+async fn scan_file_records(
+    file: &LogFile,
+    end_offset: u64,
+    filter: &crate::watch::KeyFilter<'_>,
+    since_revision: u64,
+    events: &mut Vec<crate::watch::WatchEvent>,
+) -> Result<()> {
+    use crate::watch::WatchEvent;
+
+    let mut offset = 0u64;
+    while offset + record::HEADER_LEN as u64 <= end_offset {
+        let hdr_bytes = match file.read_exact(offset, record::HEADER_LEN).await {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let hdr = match record::parse_header(&hdr_bytes, offset) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        // Guard against garbage sizes that would produce an absurd record_len.
+        if hdr.key_size == 0 {
+            break;
+        }
+        let record_len = hdr.record_len() as u64;
+        if offset + record_len > end_offset {
+            break;
+        }
+
+        // Only decode records newer than the client's last-seen revision, skip TTL-only updates.
+        let is_ttl = hdr.flags & record::flags::TTL_UPDATE != 0;
+        if hdr.tstamp_ms > since_revision && !is_ttl {
+            let body = match file
+                .read_exact(offset + record::HEADER_LEN as u64, hdr.body_len())
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let key = &body[..hdr.key_size as usize];
+            if filter.matches(key) {
+                let is_tombstone = hdr.flags & record::flags::TOMBSTONE != 0;
+                let key_b = Bytes::copy_from_slice(key);
+                if is_tombstone {
+                    events.push(WatchEvent::Del {
+                        key: key_b,
+                        revision: hdr.tstamp_ms,
+                    });
+                } else {
+                    let val_start = hdr.key_size as usize;
+                    let val_end = val_start + hdr.val_size as usize;
+                    let meta_end = val_end + hdr.meta_size as usize;
+                    let value = Bytes::copy_from_slice(&body[val_start..val_end]);
+                    let meta_bytes = &body[val_end..meta_end];
+                    let metadata = if meta_bytes.is_empty() {
+                        None
+                    } else {
+                        serde_json::from_slice(meta_bytes).ok()
+                    };
+                    let expires_at_ms = if hdr.flags & record::flags::NO_EXPIRY != 0 {
+                        None
+                    } else {
+                        Some(hdr.expires_at_ms)
+                    };
+                    events.push(WatchEvent::Set {
+                        key: key_b,
+                        value,
+                        metadata,
+                        expires_at_ms,
+                        revision: hdr.tstamp_ms,
+                    });
+                }
+            }
+        }
+
+        offset += record_len;
+    }
+    Ok(())
+}

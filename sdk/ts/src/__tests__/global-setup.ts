@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -32,18 +32,22 @@ async function waitForHealthy(url: string, timeoutMs = 30_000): Promise<void> {
     }
     await new Promise<void>((r) => setTimeout(r, 150));
   }
-  throw new Error(`beyond-kv did not become healthy at ${url} within ${timeoutMs}ms`);
+  throw new Error(
+    `beyond-kv did not become healthy at ${url} within ${timeoutMs}ms`,
+  );
 }
 
 export async function setup(): Promise<void> {
-  const [httpPort, respPort] = await Promise.all([findFreePort(), findFreePort()]);
+  const [httpPort, respPort] = await Promise.all([
+    findFreePort(),
+    findFreePort(),
+  ]);
 
   tempDataDir = mkdtempSync(join(tmpdir(), "beyond-kv-test-"));
 
   // Allow overriding the binary path via env for CI (e.g. release build).
-  const binaryPath =
-    process.env["BEYOND_KV_BINARY"] ??
-    resolve(__dirname, "../../../../target/debug/beyond-kv");
+  const binaryPath = process.env["BEYOND_KV_BINARY"]
+    ?? resolve(__dirname, "../../../../target/debug/beyond-kv");
 
   serverProcess = spawn(binaryPath, [], {
     env: {

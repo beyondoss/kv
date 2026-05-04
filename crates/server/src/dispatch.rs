@@ -14,9 +14,9 @@ const KEYS_SCAN_LIMIT: usize = 1_000_000;
 pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
     tracing::debug!(cmd = cmd_name(&cmd), ns = %state.ns);
     match cmd {
-        Command::Ping { message } => {
-            message.map(r::bulk).unwrap_or_else(|| Value::SimpleString(bytes::Bytes::from_static(b"PONG")))
-        }
+        Command::Ping { message } => message
+            .map(r::bulk)
+            .unwrap_or_else(|| Value::SimpleString(bytes::Bytes::from_static(b"PONG"))),
 
         Command::Hello { version } => {
             let v = version.unwrap_or(2).clamp(2, 3);
@@ -29,14 +29,12 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             r::ok()
         }
 
-        Command::BgRewriteAof => {
-            match store.reclaim(&state.ns).await {
-                Ok(()) => Value::SimpleString(bytes::Bytes::from_static(
-                    b"Background append only file rewriting started",
-                )),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::BgRewriteAof => match store.reclaim(&state.ns).await {
+            Ok(()) => Value::SimpleString(bytes::Bytes::from_static(
+                b"Background append only file rewriting started",
+            )),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
         Command::Quit => {
             state.quit = true;
@@ -50,33 +48,27 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             Value::SimpleString(bytes::Bytes::from_static(b"RESET"))
         }
 
-        Command::Get { key } => {
-            match store.get(&state.ns, &key).await {
-                Ok(Some(entry)) => r::bulk(entry.value),
-                Ok(None) => r::nil(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::Get { key } => match store.get(&state.ns, &key).await {
+            Ok(Some(entry)) => r::bulk(entry.value),
+            Ok(None) => r::nil(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
         Command::Set { key, value, args } => {
             let opts = set_opts_from_args(&args.ttl);
 
             // Handle NX / XX conditions
             match args.condition {
-                SetCondition::Nx => {
-                    match store.setnx(&state.ns, &key, value, opts).await {
-                        Ok(true) => r::ok(),
-                        Ok(false) => r::nil(),
-                        Err(e) => r::error("ERR", &e.to_string()),
-                    }
-                }
-                SetCondition::Xx => {
-                    match store.setxx(&state.ns, &key, value, opts).await {
-                        Ok(true) => r::ok(),
-                        Ok(false) => r::nil(),
-                        Err(e) => r::error("ERR", &e.to_string()),
-                    }
-                }
+                SetCondition::Nx => match store.setnx(&state.ns, &key, value, opts).await {
+                    Ok(true) => r::ok(),
+                    Ok(false) => r::nil(),
+                    Err(e) => r::error("ERR", &e.to_string()),
+                },
+                SetCondition::Xx => match store.setxx(&state.ns, &key, value, opts).await {
+                    Ok(true) => r::ok(),
+                    Ok(false) => r::nil(),
+                    Err(e) => r::error("ERR", &e.to_string()),
+                },
                 SetCondition::Always => {
                     if args.get {
                         match store.getset(&state.ns, &key, value).await {
@@ -111,7 +103,10 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Expire { key, secs } => {
-            match store.expire(&state.ns, &key, Duration::from_secs(secs)).await {
+            match store
+                .expire(&state.ns, &key, Duration::from_secs(secs))
+                .await
+            {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -119,7 +114,10 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::PExpire { key, millis } => {
-            match store.expire(&state.ns, &key, Duration::from_millis(millis)).await {
+            match store
+                .expire(&state.ns, &key, Duration::from_millis(millis))
+                .await
+            {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -160,31 +158,25 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::Ttl { key } => {
-            match store.ttl(&state.ns, &key).await {
-                Ok(beyond_kv_engine::types::TtlResult::Remaining(s)) => r::integer(s as i64),
-                Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
-                Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::Ttl { key } => match store.ttl(&state.ns, &key).await {
+            Ok(beyond_kv_engine::types::TtlResult::Remaining(s)) => r::integer(s as i64),
+            Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
+            Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
-        Command::PTtl { key } => {
-            match store.pttl(&state.ns, &key).await {
-                Ok(beyond_kv_engine::types::TtlResult::Remaining(ms)) => r::integer(ms as i64),
-                Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
-                Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::PTtl { key } => match store.pttl(&state.ns, &key).await {
+            Ok(beyond_kv_engine::types::TtlResult::Remaining(ms)) => r::integer(ms as i64),
+            Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
+            Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
-        Command::Persist { key } => {
-            match store.persist(&state.ns, &key).await {
-                Ok(true) => r::integer(1),
-                Ok(false) => r::integer(0),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::Persist { key } => match store.persist(&state.ns, &key).await {
+            Ok(true) => r::integer(1),
+            Ok(false) => r::integer(0),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
         Command::MGet { keys } => {
             // Bulk lookup: store.mget batches L1 misses through io_uring via
@@ -206,36 +198,33 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::MSet { pairs } => {
-            match store.mset(&state.ns, &pairs).await {
-                Ok(()) => r::ok(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::MSet { pairs } => match store.mset(&state.ns, &pairs).await {
+            Ok(()) => r::ok(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
-        Command::GetSet { key, value } => {
-            match store.getset(&state.ns, &key, value).await {
-                Ok(Some(old)) => r::bulk(old.value),
-                Ok(None) => r::nil(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::GetSet { key, value } => match store.getset(&state.ns, &key, value).await {
+            Ok(Some(old)) => r::bulk(old.value),
+            Ok(None) => r::nil(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
         Command::SetNx { key, value } => {
-            match store.setnx(&state.ns, &key, value, SetOptions::default()).await {
+            match store
+                .setnx(&state.ns, &key, value, SetOptions::default())
+                .await
+            {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
-        Command::GetDel { key } => {
-            match store.getdel(&state.ns, &key).await {
-                Ok(Some(entry)) => r::bulk(entry.value),
-                Ok(None) => r::nil(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::GetDel { key } => match store.getdel(&state.ns, &key).await {
+            Ok(Some(entry)) => r::bulk(entry.value),
+            Ok(None) => r::nil(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
         Command::GetEx { key, ttl } => {
             use beyond_kv_engine::types::GetExOp;
@@ -255,16 +244,24 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             let mut all_keys: Vec<Value> = Vec::new();
             let mut cursor = bytes::Bytes::from_static(b"0");
             loop {
-                match store.scan(&state.ns, &cursor, pattern.as_deref(), CHUNK).await {
+                match store
+                    .scan(&state.ns, &cursor, pattern.as_deref(), CHUNK)
+                    .await
+                {
                     Err(e) => return r::error("ERR", &e.to_string()),
                     Ok(page) => {
                         let done = page.next_cursor == b"0".as_ref();
                         all_keys.extend(page.keys.into_iter().map(r::bulk));
                         if all_keys.len() >= KEYS_SCAN_LIMIT {
-                            return r::error("ERR", "KEYS result too large; use SCAN to paginate large keyspaces");
+                            return r::error(
+                                "ERR",
+                                "KEYS result too large; use SCAN to paginate large keyspaces",
+                            );
                         }
                         cursor = page.next_cursor;
-                        if done { break; }
+                        if done {
+                            break;
+                        }
                         yield_now().await;
                     }
                 }
@@ -273,25 +270,30 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Scan { cursor, args } => {
-            match store.scan(&state.ns, &cursor, args.pattern.as_deref(), args.count).await {
+            match store
+                .scan(&state.ns, &cursor, args.pattern.as_deref(), args.count)
+                .await
+            {
                 Ok(page) => r::scan_reply(page.next_cursor, page.keys),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
-        Command::DbSize => {
-            match store.db_size(&state.ns).await {
-                Ok(n) => r::integer(n as i64),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::DbSize => match store.db_size(&state.ns).await {
+            Ok(n) => r::integer(n as i64),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
 
-        Command::FlushDb => {
-            match store.flush_db(&state.ns).await {
-                Ok(()) => r::ok(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::FlushDb => match store.flush_db(&state.ns).await {
+            Ok(()) => r::ok(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
+
+        // Watch commands are intercepted in handle_conn before dispatch reaches here.
+        Command::Watch { .. } | Command::PWatch { .. } | Command::Unwatch => r::error(
+            "ERR",
+            "WATCH must be sent as the first command after HELLO 3",
+        ),
     }
 }
 
@@ -325,7 +327,10 @@ fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
 }
 
 fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
-    SetOptions { ttl: ttl.as_ref().map(ttl_duration_from_spec), metadata: None }
+    SetOptions {
+        ttl: ttl.as_ref().map(ttl_duration_from_spec),
+        metadata: None,
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -370,6 +375,9 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Scan { .. } => "SCAN",
         Command::DbSize => "DBSIZE",
         Command::FlushDb => "FLUSHDB",
+        Command::Watch { .. } => "WATCH",
+        Command::PWatch { .. } => "PWATCH",
+        Command::Unwatch => "UNWATCH",
     }
 }
 
@@ -405,8 +413,13 @@ mod tests {
     }
 
     fn set_key(s: &ShardStore, key: &[u8], value: &[u8]) {
-        rt_block_on(s.set("default", key, Bytes::copy_from_slice(value), EngineSetOptions::default()))
-            .unwrap();
+        rt_block_on(s.set(
+            "default",
+            key,
+            Bytes::copy_from_slice(value),
+            EngineSetOptions::default(),
+        ))
+        .unwrap();
     }
 
     fn set_with_ttl(s: &ShardStore, key: &[u8], value: &[u8], ttl: Duration) {
@@ -414,7 +427,10 @@ mod tests {
             "default",
             key,
             Bytes::copy_from_slice(value),
-            EngineSetOptions { ttl: Some(ttl), metadata: None },
+            EngineSetOptions {
+                ttl: Some(ttl),
+                metadata: None,
+            },
         ))
         .unwrap();
     }
@@ -432,7 +448,9 @@ mod tests {
     fn ping_with_message_echoes_it() {
         let (s, _t) = store();
         let res = run(
-            Command::Ping { message: Some(Bytes::from_static(b"hi")) },
+            Command::Ping {
+                message: Some(Bytes::from_static(b"hi")),
+            },
             &s,
             &mut state(),
         );
@@ -479,7 +497,13 @@ mod tests {
     #[test]
     fn get_missing_key_returns_nil() {
         let (s, _t) = store();
-        let res = run(Command::Get { key: Bytes::from_static(b"nope") }, &s, &mut state());
+        let res = run(
+            Command::Get {
+                key: Bytes::from_static(b"nope"),
+            },
+            &s,
+            &mut state(),
+        );
         assert!(matches!(res, Value::Null));
     }
 
@@ -491,12 +515,22 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"hello"),
-                args: SetArgs { ttl: None, condition: SetCondition::Always, get: false },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Always,
+                    get: false,
+                },
             },
             &s,
             &mut st,
         );
-        let res = run(Command::Get { key: Bytes::from_static(b"k") }, &s, &mut st);
+        let res = run(
+            Command::Get {
+                key: Bytes::from_static(b"k"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(res, Value::BulkString(ref b) if b.as_ref() == b"hello"));
     }
 
@@ -507,7 +541,11 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"nx"),
                 value: Bytes::from_static(b"v"),
-                args: SetArgs { ttl: None, condition: SetCondition::Nx, get: false },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Nx,
+                    get: false,
+                },
             },
             &s,
             &mut state(),
@@ -524,13 +562,23 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"nx-dup"),
                 value: Bytes::from_static(b"clobber"),
-                args: SetArgs { ttl: None, condition: SetCondition::Nx, get: false },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Nx,
+                    get: false,
+                },
             },
             &s,
             &mut st,
         );
         assert!(matches!(res, Value::Null));
-        let got = run(Command::Get { key: Bytes::from_static(b"nx-dup") }, &s, &mut st);
+        let got = run(
+            Command::Get {
+                key: Bytes::from_static(b"nx-dup"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(got, Value::BulkString(ref b) if b.as_ref() == b"original"));
     }
 
@@ -541,7 +589,11 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"xx-miss"),
                 value: Bytes::from_static(b"v"),
-                args: SetArgs { ttl: None, condition: SetCondition::Xx, get: false },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Xx,
+                    get: false,
+                },
             },
             &s,
             &mut state(),
@@ -558,13 +610,23 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"xx-live"),
                 value: Bytes::from_static(b"new"),
-                args: SetArgs { ttl: None, condition: SetCondition::Xx, get: false },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Xx,
+                    get: false,
+                },
             },
             &s,
             &mut st,
         );
         assert!(matches!(res, Value::SimpleString(_)));
-        let val = run(Command::Get { key: Bytes::from_static(b"xx-live") }, &s, &mut st);
+        let val = run(
+            Command::Get {
+                key: Bytes::from_static(b"xx-live"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(val, Value::BulkString(ref b) if b.as_ref() == b"new"));
     }
 
@@ -577,7 +639,11 @@ mod tests {
             Command::Set {
                 key: Bytes::from_static(b"gf"),
                 value: Bytes::from_static(b"new"),
-                args: SetArgs { ttl: None, condition: SetCondition::Always, get: true },
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Always,
+                    get: true,
+                },
             },
             &s,
             &mut st,
@@ -592,7 +658,13 @@ mod tests {
         let (s, _t) = store();
         let mut st = state();
         set_key(&s, b"del-k", b"v");
-        let res = run(Command::Del { keys: vec![Bytes::from_static(b"del-k")] }, &s, &mut st);
+        let res = run(
+            Command::Del {
+                keys: vec![Bytes::from_static(b"del-k")],
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(res, Value::Integer(1)));
     }
 
@@ -600,7 +672,9 @@ mod tests {
     fn del_missing_returns_0() {
         let (s, _t) = store();
         let res = run(
-            Command::Del { keys: vec![Bytes::from_static(b"ghost")] },
+            Command::Del {
+                keys: vec![Bytes::from_static(b"ghost")],
+            },
             &s,
             &mut state(),
         );
@@ -613,7 +687,9 @@ mod tests {
         let mut st = state();
         set_key(&s, b"ex-k", b"v");
         let res = run(
-            Command::Exists { keys: vec![Bytes::from_static(b"ex-k")] },
+            Command::Exists {
+                keys: vec![Bytes::from_static(b"ex-k")],
+            },
             &s,
             &mut st,
         );
@@ -625,7 +701,13 @@ mod tests {
     #[test]
     fn ttl_on_missing_returns_neg_two() {
         let (s, _t) = store();
-        let res = run(Command::Ttl { key: Bytes::from_static(b"miss") }, &s, &mut state());
+        let res = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"miss"),
+            },
+            &s,
+            &mut state(),
+        );
         assert!(matches!(res, Value::Integer(-2)));
     }
 
@@ -634,7 +716,13 @@ mod tests {
         let (s, _t) = store();
         let mut st = state();
         set_key(&s, b"no-ttl", b"v");
-        let res = run(Command::Ttl { key: Bytes::from_static(b"no-ttl") }, &s, &mut st);
+        let res = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"no-ttl"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(res, Value::Integer(-1)));
     }
 
@@ -644,12 +732,21 @@ mod tests {
         let mut st = state();
         set_key(&s, b"exp-live", b"v");
         let res = run(
-            Command::Expire { key: Bytes::from_static(b"exp-live"), secs: 60 },
+            Command::Expire {
+                key: Bytes::from_static(b"exp-live"),
+                secs: 60,
+            },
             &s,
             &mut st,
         );
         assert!(matches!(res, Value::Integer(1)));
-        let ttl = run(Command::Ttl { key: Bytes::from_static(b"exp-live") }, &s, &mut st);
+        let ttl = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"exp-live"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(ttl, Value::Integer(n) if n > 0));
     }
 
@@ -657,7 +754,10 @@ mod tests {
     fn expire_on_missing_key_returns_0() {
         let (s, _t) = store();
         let res = run(
-            Command::Expire { key: Bytes::from_static(b"exp-miss"), secs: 60 },
+            Command::Expire {
+                key: Bytes::from_static(b"exp-miss"),
+                secs: 60,
+            },
             &s,
             &mut state(),
         );
@@ -674,8 +774,21 @@ mod tests {
             .unwrap()
             .as_secs()
             - 1;
-        run(Command::ExpireAt { key: Bytes::from_static(b"expat"), unix_secs: past }, &s, &mut st);
-        let got = run(Command::Get { key: Bytes::from_static(b"expat") }, &s, &mut st);
+        run(
+            Command::ExpireAt {
+                key: Bytes::from_static(b"expat"),
+                unix_secs: past,
+            },
+            &s,
+            &mut st,
+        );
+        let got = run(
+            Command::Get {
+                key: Bytes::from_static(b"expat"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(got, Value::Null));
     }
 
@@ -684,9 +797,21 @@ mod tests {
         let (s, _t) = store();
         let mut st = state();
         set_with_ttl(&s, b"persist-k", b"v", Duration::from_secs(60));
-        let res = run(Command::Persist { key: Bytes::from_static(b"persist-k") }, &s, &mut st);
+        let res = run(
+            Command::Persist {
+                key: Bytes::from_static(b"persist-k"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(res, Value::Integer(1)));
-        let ttl = run(Command::Ttl { key: Bytes::from_static(b"persist-k") }, &s, &mut st);
+        let ttl = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"persist-k"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(ttl, Value::Integer(-1)));
     }
 
@@ -744,7 +869,13 @@ mod tests {
             &mut st,
         );
         assert!(matches!(res, Value::BulkString(ref b) if b.as_ref() == b"old"));
-        let got = run(Command::Get { key: Bytes::from_static(b"gs") }, &s, &mut st);
+        let got = run(
+            Command::Get {
+                key: Bytes::from_static(b"gs"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(got, Value::BulkString(ref b) if b.as_ref() == b"new"));
     }
 
@@ -753,9 +884,21 @@ mod tests {
         let (s, _t) = store();
         let mut st = state();
         set_key(&s, b"gd", b"bye");
-        let res = run(Command::GetDel { key: Bytes::from_static(b"gd") }, &s, &mut st);
+        let res = run(
+            Command::GetDel {
+                key: Bytes::from_static(b"gd"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(res, Value::BulkString(ref b) if b.as_ref() == b"bye"));
-        let gone = run(Command::Get { key: Bytes::from_static(b"gd") }, &s, &mut st);
+        let gone = run(
+            Command::Get {
+                key: Bytes::from_static(b"gd"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(gone, Value::Null));
     }
 
@@ -772,8 +915,17 @@ mod tests {
             &s,
             &mut st,
         );
-        let ttl = run(Command::Ttl { key: Bytes::from_static(b"gex") }, &s, &mut st);
-        assert!(matches!(ttl, Value::Integer(n) if n > 0), "GETEX EX should set TTL");
+        let ttl = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"gex"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(
+            matches!(ttl, Value::Integer(n) if n > 0),
+            "GETEX EX should set TTL"
+        );
     }
 
     #[test]
@@ -782,11 +934,20 @@ mod tests {
         let mut st = state();
         set_with_ttl(&s, b"gex-ttl", b"v", Duration::from_secs(60));
         run(
-            Command::GetEx { key: Bytes::from_static(b"gex-ttl"), ttl: Some(GetExTtl::Persist) },
+            Command::GetEx {
+                key: Bytes::from_static(b"gex-ttl"),
+                ttl: Some(GetExTtl::Persist),
+            },
             &s,
             &mut st,
         );
-        let ttl = run(Command::Ttl { key: Bytes::from_static(b"gex-ttl") }, &s, &mut st);
+        let ttl = run(
+            Command::Ttl {
+                key: Bytes::from_static(b"gex-ttl"),
+            },
+            &s,
+            &mut st,
+        );
         assert!(matches!(ttl, Value::Integer(-1)));
     }
 
@@ -809,7 +970,16 @@ mod tests {
         let mut st = state();
         set_key(&s, b"ns-k", b"in-default");
         run(Command::Select { db: 3 }, &s, &mut st);
-        let res = run(Command::Get { key: Bytes::from_static(b"ns-k") }, &s, &mut st);
-        assert!(matches!(res, Value::Null), "key from default must be invisible in db3");
+        let res = run(
+            Command::Get {
+                key: Bytes::from_static(b"ns-k"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(
+            matches!(res, Value::Null),
+            "key from default must be invisible in db3"
+        );
     }
 }

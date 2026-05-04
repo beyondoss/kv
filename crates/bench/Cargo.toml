@@ -22,9 +22,9 @@ futures = "0.3"
 hdrhistogram = "7"
 humantime = "2"
 rand = "0.8"
-rustc-hash = { workspace = true }
 rand_distr = "0.4"
 redis = { version = "0.26", default-features = false, features = ["tokio-comp"] }
+rustc-hash = { workspace = true }
 tabled = "0.15"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

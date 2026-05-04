@@ -2,7 +2,15 @@ import Redis from "ioredis";
 
 import type { KvClient, KvClientOptions } from "./client.js";
 import { KvError, KvNotFoundError } from "./errors.js";
-import type { KvEntry, KvListOptions, KvListResult, KvMSetEntry, KvSetOptions } from "./types.js";
+import type {
+  KvEntry,
+  KvListOptions,
+  KvListResult,
+  KvMSetEntry,
+  KvSetOptions,
+  KvWatchEvent,
+  KvWatchOptions,
+} from "./types.js";
 
 export function createRespKvClient(opts: KvClientOptions): KvClient {
   const redis = new Redis(opts.url, {
@@ -15,12 +23,22 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
 
   const { onCommand, onResponse } = opts;
 
-  function track<T>(command: string, keyCount: number, fn: () => Promise<T>): Promise<T> {
+  function track<T>(
+    command: string,
+    keyCount: number,
+    fn: () => Promise<T>,
+  ): Promise<T> {
     onCommand?.({ command, keyCount });
     const start = Date.now();
     return fn().then(
-      (v) => { onResponse?.({ command, keyCount, durationMs: Date.now() - start }); return v; },
-      (e) => { onResponse?.({ command, keyCount, durationMs: Date.now() - start }); throw e; },
+      (v) => {
+        onResponse?.({ command, keyCount, durationMs: Date.now() - start });
+        return v;
+      },
+      (e) => {
+        onResponse?.({ command, keyCount, durationMs: Date.now() - start });
+        throw e;
+      },
     );
   }
 
@@ -39,9 +57,15 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
     });
   }
 
-  async function set(key: string, value: string | Uint8Array, setOpts?: KvSetOptions): Promise<void> {
+  async function set(
+    key: string,
+    value: string | Uint8Array,
+    setOpts?: KvSetOptions,
+  ): Promise<void> {
     return track("SET", 1, async () => {
-      const buf = value instanceof Uint8Array ? Buffer.from(value) : Buffer.from(value);
+      const buf = value instanceof Uint8Array
+        ? Buffer.from(value)
+        : Buffer.from(value);
       const ttl = setOpts?.ttl;
       const nx = setOpts?.nx ?? false;
       const xx = setOpts?.xx ?? false;
@@ -88,11 +112,20 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         const cursor = listOpts?.cursor ?? "0";
         const count = listOpts?.limit ?? 100;
         const [nextCursor, keys] = listOpts?.prefix
-          ? await redis.scan(cursor, "MATCH", `${listOpts.prefix}*`, "COUNT", count)
+          ? await redis.scan(
+            cursor,
+            "MATCH",
+            `${listOpts.prefix}*`,
+            "COUNT",
+            count,
+          )
           : await redis.scan(cursor, "COUNT", count);
 
         const done = nextCursor === "0";
-        const result: KvListResult = { keys: keys.map((name) => ({ name })), complete: done };
+        const result: KvListResult = {
+          keys: keys.map((name) => ({ name })),
+          complete: done,
+        };
         if (!done) result.cursor = nextCursor;
         return result;
       });
@@ -108,7 +141,9 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
           pipeline.getBuffer(key);
           pipeline.ttl(key);
         }
-        const results = await pipeline.exec() as Array<[null, Buffer | null | number]>;
+        const results = await pipeline.exec() as Array<
+          [null, Buffer | null | number]
+        >;
         const out: (KvEntry | null)[] = [];
         for (let i = 0; i < keys.length; i++) {
           const valueBuf = results[i * 2]![1] as Buffer | null;
@@ -136,17 +171,36 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         if (plain.length > 0) {
           const pairs: (string | Buffer)[] = [];
           for (const { key, value } of plain) {
-            pairs.push(key, value instanceof Uint8Array ? Buffer.from(value) : Buffer.from(value));
+            pairs.push(
+              key,
+              value instanceof Uint8Array
+                ? Buffer.from(value)
+                : Buffer.from(value),
+            );
           }
           pipeline.mset(...(pairs as [string, string, ...string[]]));
         }
         for (const { key, value, opts } of withTtl) {
-          const buf = value instanceof Uint8Array ? Buffer.from(value) : Buffer.from(value);
+          const buf = value instanceof Uint8Array
+            ? Buffer.from(value)
+            : Buffer.from(value);
           pipeline.set(key, buf, "EX", opts!.ttl!);
         }
 
         await pipeline.exec();
       });
+    },
+
+    // eslint-disable-next-line require-yield
+    async *watch(
+      _key: string,
+      _opts?: KvWatchOptions,
+    ): AsyncGenerator<KvWatchEvent> {
+      throw new KvError(
+        "not_supported",
+        "WATCH is not supported by the RESP backend; use the HTTP backend",
+        501,
+      );
     },
 
     close(): Promise<void> {

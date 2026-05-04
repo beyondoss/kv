@@ -17,7 +17,10 @@ pub struct SetOptions {
 
 impl Default for SetOptions {
     fn default() -> Self {
-        Self { ttl: None, metadata: None }
+        Self {
+            ttl: None,
+            metadata: None,
+        }
     }
 }
 

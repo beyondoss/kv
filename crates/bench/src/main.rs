@@ -7,15 +7,20 @@ use std::time::Duration;
 use beyond_kv_bench::client::Target;
 use beyond_kv_bench::driver::{Driver, Mode, Plan};
 use beyond_kv_bench::keyspace::{KeyDist, Keyspace};
-use beyond_kv_bench::metrics::{BenchRun, KindReport, ModeSummary, PlanSummary, Report, RunMetadata};
+use beyond_kv_bench::metrics::{
+    BenchRun, KindReport, ModeSummary, PlanSummary, Report, RunMetadata,
+};
 use beyond_kv_bench::targets::Resp;
 use beyond_kv_bench::workload::{OpMix, Workload};
 
 use clap::Parser;
-use tabled::{settings::Style, Table, Tabled};
+use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Parser, Debug)]
-#[command(name = "kv-bench", about = "Honest KV benchmarks for Beyond and friends")]
+#[command(
+    name = "kv-bench",
+    about = "Honest KV benchmarks for Beyond and friends"
+)]
 struct Cli {
     /// One or more `name=url` targets, e.g. `--target beyond=redis://127.0.0.1:6379`.
     #[arg(long = "target", required = true, value_parser = Resp::parse_spec)]
@@ -91,15 +96,11 @@ struct Cli {
     label: Option<String>,
 
     /// Total number of Beyond shards (= `--threads` passed to beyond-kv).
-    /// When > 1, each target must pair with a `--shard-index`.
+    /// When > 1, the bench pre-filters N keyspace partitions (one per shard)
+    /// and assigns connections round-robin so each shard's L1 cache covers
+    /// exactly its 1/N slice of the dataset.
     #[arg(long, default_value_t = 1)]
     shards: usize,
-
-    /// Which shard this run targets (0-based). The keyspace is pre-filtered to
-    /// only the keys that Beyond's router sends to this shard, so the shard's
-    /// L1 cache covers exactly its 1/N slice of the dataset.
-    #[arg(long, default_value_t = 0)]
-    shard_index: usize,
 }
 
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
@@ -148,18 +149,26 @@ async fn main() -> anyhow::Result<()> {
         seed: cli.seed,
     };
 
-    if cli.shards > 1 {
+    let driver = if cli.shards <= 1 {
+        let keyspace = Keyspace::new_sharded(cli.keys, cli.keydist, 0, 1)?;
+        Driver::new(
+            Workload::new(keyspace, cli.workload, cli.value_size, cli.batch),
+            plan,
+        )
+    } else {
         eprintln!(
-            "shard filter: shard {}/{} — pre-filtering keyspace (this may take a moment for large key counts)",
-            cli.shard_index, cli.shards,
+            "shards={} — pre-filtering {} keyspace partitions (this may take a moment)",
+            cli.shards, cli.shards,
         );
-    }
-    let keyspace = Keyspace::new_sharded(cli.keys, cli.keydist, cli.shard_index, cli.shards)?;
-    if cli.shards > 1 {
-        eprintln!("shard filter: {} keys in this shard's partition", keyspace.size());
-    }
-    let workload = Workload::new(keyspace, cli.workload, cli.value_size, cli.batch);
-    let driver = Driver::new(workload, plan);
+        let shard_workloads = (0..cli.shards)
+            .map(|s| {
+                let ks = Keyspace::new_sharded(cli.keys, cli.keydist, s, cli.shards)?;
+                Ok(Workload::new(ks, cli.workload, cli.value_size, cli.batch))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        eprintln!("shards={} — partitions ready", cli.shards);
+        Driver::new_sharded(shard_workloads, plan)
+    };
 
     print_plan(&cli, &driver.plan);
 
@@ -195,11 +204,17 @@ async fn main() -> anyhow::Result<()> {
             metadata: RunMetadata {
                 timestamp: env_or("BENCH_TIMESTAMP", current_timestamp()),
                 label: cli.label.clone(),
-                git_sha: std::env::var("BENCH_GIT_SHA").ok().filter(|s| !s.is_empty()),
+                git_sha: std::env::var("BENCH_GIT_SHA")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
                 kernel: std::env::var("BENCH_KERNEL").ok().filter(|s| !s.is_empty()),
                 cpu_count: num_cpus(),
-                memory_bytes: std::env::var("BENCH_MEMORY_BYTES").ok().and_then(|s| s.parse().ok()),
-                redis_version: std::env::var("BENCH_REDIS_VERSION").ok().filter(|s| !s.is_empty()),
+                memory_bytes: std::env::var("BENCH_MEMORY_BYTES")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                redis_version: std::env::var("BENCH_REDIS_VERSION")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
             },
             plan: PlanSummary {
                 concurrency: driver.plan.concurrency,
@@ -226,13 +241,19 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn env_or(key: &str, fallback: String) -> String {
-    std::env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or(fallback)
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
 }
 
 fn current_timestamp() -> String {
     // RFC3339 UTC, second precision — minimal so we don't pull `chrono`.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // Days-since-epoch + h/m/s decomposition (UTC, leap-seconds ignored — fine
     // for a "when did this run happen" tag).
     let (days, sec_of_day) = (secs / 86_400, secs % 86_400);
@@ -257,7 +278,9 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 fn mode_summary(m: &Mode) -> ModeSummary {
@@ -269,7 +292,7 @@ fn mode_summary(m: &Mode) -> ModeSummary {
 
 fn print_plan(cli: &Cli, plan: &Plan) {
     let shard_info = if cli.shards > 1 {
-        format!(" shard={}/{}", cli.shard_index, cli.shards)
+        format!(" shards={}", cli.shards)
     } else {
         String::new()
     };

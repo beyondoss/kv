@@ -87,12 +87,18 @@ mod tests {
     #[test]
     fn explicit_flags_override_defaults() {
         let cfg = parse(&[
-            "--resp-port", "7000",
-            "--http-port", "8000",
-            "--threads", "4",
-            "--memory-bytes", "134217728",
-            "--data-dir", "/tmp/kv-test",
-        ]).unwrap();
+            "--resp-port",
+            "7000",
+            "--http-port",
+            "8000",
+            "--threads",
+            "4",
+            "--memory-bytes",
+            "134217728",
+            "--data-dir",
+            "/tmp/kv-test",
+        ])
+        .unwrap();
         assert_eq!(cfg.resp_port, 7000);
         assert_eq!(cfg.http_port, 8000);
         assert_eq!(cfg.threads, Some(4));

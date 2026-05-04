@@ -78,6 +78,7 @@ docker run \
     --network none \
     --init \
     --volume "$RESULTS_DIR:/results" \
+    --volume "$HERE/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro" \
     --env "BENCH_GIT_SHA=$GIT_SHA" \
     --env "BENCH_TIMESTAMP=$TIMESTAMP" \
     --env "BEYOND_SHARDS=$SHARDS" \

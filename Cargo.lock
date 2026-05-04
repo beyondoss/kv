@@ -127,11 +127,14 @@ name = "beyond-kv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "beyond-kv-engine",
  "beyond-kv-proto",
  "beyond-resp",
  "bytes",
  "clap",
+ "futures-channel",
+ "futures-util",
  "http",
  "mimalloc",
  "monoio",
@@ -179,6 +182,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc-fast",
+ "futures-channel",
  "futures-util",
  "monoio",
  "rustc-hash",

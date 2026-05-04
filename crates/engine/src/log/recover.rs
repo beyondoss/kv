@@ -4,9 +4,9 @@ use bytes::Bytes;
 use tracing::warn;
 
 use crate::error::{EngineError, Result};
-use crate::log::file::{list_data_files, FooterEntry, LogFile};
+use crate::log::file::{FooterEntry, LogFile, list_data_files};
 use crate::log::index::{IndexEntry, NsIndex};
-use crate::log::record::{flags as rflags, parse_header, verify_crc, HEADER_LEN};
+use crate::log::record::{HEADER_LEN, flags as rflags, parse_header, verify_crc};
 
 /// Result of opening a namespace directory.
 pub struct OpenedFiles {
@@ -39,11 +39,17 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
         // Fresh namespace — create active file id 0.
         let path = dir.join(crate::log::file::data_filename(0));
         let active = LogFile::open_rw(path, 0).await?;
-        return Ok(OpenedFiles { sealed, active, index });
+        return Ok(OpenedFiles {
+            sealed,
+            active,
+            index,
+        });
     }
 
-    let (active_id, active_path) = data_files.pop()
-        .ok_or(EngineError::BadRecord { offset: 0, reason: "data file list unexpectedly empty" })?;
+    let (active_id, active_path) = data_files.pop().ok_or(EngineError::BadRecord {
+        offset: 0,
+        reason: "data file list unexpectedly empty",
+    })?;
 
     for (file_id, path) in data_files {
         let file = LogFile::open_ro(path, file_id).await?;
@@ -66,7 +72,11 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
     let active = LogFile::open_rw(active_path, active_id).await?;
     replay_active(&active, active_id, &mut index).await?;
 
-    Ok(OpenedFiles { sealed, active, index })
+    Ok(OpenedFiles {
+        sealed,
+        active,
+        index,
+    })
 }
 
 fn apply_footer_entries(index: &mut NsIndex, file_id: u16, entries: &[FooterEntry]) {
@@ -151,7 +161,11 @@ async fn replay_active(file: &LogFile, file_id: u16, index: &mut NsIndex) -> Res
     }
 
     if last_good < total {
-        warn!(truncate_to = last_good, was = total, "truncating active file at last good boundary");
+        warn!(
+            truncate_to = last_good,
+            was = total,
+            "truncating active file at last good boundary"
+        );
         file.truncate_to(last_good).await?;
     }
     Ok(())

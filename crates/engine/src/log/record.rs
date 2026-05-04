@@ -1,17 +1,23 @@
 use crate::error::{EngineError, Result};
-use crc_fast::{checksum, CrcAlgorithm};
+use crc_fast::{CrcAlgorithm, checksum};
 
 fn u64_le(buf: &[u8], off: usize, at: u64) -> Result<u64> {
     buf.get(off..off + 8)
         .and_then(|s| s.try_into().ok())
         .map(u64::from_le_bytes)
-        .ok_or(EngineError::BadRecord { offset: at, reason: "truncated u64 field" })
+        .ok_or(EngineError::BadRecord {
+            offset: at,
+            reason: "truncated u64 field",
+        })
 }
 fn u32_le(buf: &[u8], off: usize, at: u64) -> Result<u32> {
     buf.get(off..off + 4)
         .and_then(|s| s.try_into().ok())
         .map(u32::from_le_bytes)
-        .ok_or(EngineError::BadRecord { offset: at, reason: "truncated u32 field" })
+        .ok_or(EngineError::BadRecord {
+            offset: at,
+            reason: "truncated u32 field",
+        })
 }
 
 /// Algorithm used for record + footer CRCs.
@@ -83,7 +89,12 @@ pub fn parse_header(buf: &[u8], offset: u64) -> Result<RecordHeader> {
 }
 
 /// Verify a header's CRC against the bytes that follow it.
-pub fn verify_crc(header: &RecordHeader, header_bytes: &[u8], body: &[u8], offset: u64) -> Result<()> {
+pub fn verify_crc(
+    header: &RecordHeader,
+    header_bytes: &[u8],
+    body: &[u8],
+    offset: u64,
+) -> Result<()> {
     debug_assert_eq!(header_bytes.len(), HEADER_LEN);
     debug_assert_eq!(body.len(), header.body_len());
     // CRC covers everything after the CRC field itself: tstamp_ms..end of body.
@@ -116,7 +127,10 @@ pub fn encode_into(
         .and_then(|n| n.checked_add(value.len()))
         .and_then(|n| n.checked_add(metadata.len()))
         .filter(|&n| n <= u32::MAX as usize)
-        .ok_or(EngineError::BadRecord { offset: 0, reason: "record exceeds 4 GiB limit" })?;
+        .ok_or(EngineError::BadRecord {
+            offset: 0,
+            reason: "record exceeds 4 GiB limit",
+        })?;
     let _ = record_len;
     let key_size = key.len() as u32;
     let val_size = value.len() as u32;
@@ -151,7 +165,15 @@ pub fn encode(
     metadata: &[u8],
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(HEADER_LEN + key.len() + value.len() + metadata.len());
-    encode_into(&mut buf, tstamp_ms, flags, expires_at_ms, key, value, metadata)?;
+    encode_into(
+        &mut buf,
+        tstamp_ms,
+        flags,
+        expires_at_ms,
+        key,
+        value,
+        metadata,
+    )?;
     Ok(buf)
 }
 

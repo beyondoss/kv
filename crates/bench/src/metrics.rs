@@ -117,15 +117,21 @@ impl KindStats {
     }
 
     pub fn merge_into(&self, into: &mut KindStats) {
-        into.service.add(&self.service).expect("compatible histograms");
-        into.response.add(&self.response).expect("compatible histograms");
+        into.service
+            .add(&self.service)
+            .expect("compatible histograms");
+        into.response
+            .add(&self.response)
+            .expect("compatible histograms");
         into.completed += self.completed;
         into.keys += self.keys;
     }
 }
 
 impl Default for KindStats {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct WorkerStats {
@@ -148,7 +154,9 @@ impl WorkerStats {
 }
 
 impl Default for WorkerStats {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Serialize)]

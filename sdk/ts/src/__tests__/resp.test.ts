@@ -87,7 +87,8 @@ describe("RESP backend — getOrThrow", () => {
 
 describe("RESP backend — NX / XX", () => {
   it("nx succeeds on a missing key", async () => {
-    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves.toBeUndefined();
+    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves
+      .toBeUndefined();
   });
 
   it("nx throws KvError(409) when the key already exists", async () => {
@@ -156,7 +157,11 @@ describe("RESP backend — list / scan", () => {
     let complete = false;
 
     while (!complete) {
-      const page = await kv.list({ prefix, cursor, limit: 2 });
+      const page = await kv.list({
+        prefix,
+        limit: 2,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
       seen.push(...page.keys.map((k) => k.name));
       complete = page.complete;
       cursor = page.cursor;
@@ -286,11 +291,15 @@ describe("RESP backend — observability hooks", () => {
     tracked3 = createKvClient({
       url: getRespUrl(),
       db: 0,
-      onCommand: (e) => { if (e.command === "MGET") mgetCounts.push(e.keyCount); },
+      onCommand: (e) => {
+        if (e.command === "MGET") mgetCounts.push(e.keyCount);
+      },
     });
   });
 
-  afterAll(() => Promise.all([tracked1.close(), tracked2.close(), tracked3.close()]));
+  afterAll(() =>
+    Promise.all([tracked1.close(), tracked2.close(), tracked3.close()])
+  );
 
   it("fires onCommand and onResponse for each operation", async () => {
     const key = uniqueKey();

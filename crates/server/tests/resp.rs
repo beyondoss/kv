@@ -1,5 +1,5 @@
 mod common;
-use common::{scan_all, TestServer};
+use common::{TestServer, scan_all};
 use redis::Commands;
 
 // ── PING ──────────────────────────────────────────────────────────────────────
@@ -54,7 +54,11 @@ fn binary_value_round_trips_via_resp() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let data: Vec<u8> = (0u8..=255).collect();
-    let _: () = redis::cmd("SET").arg("bin").arg(&data).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("bin")
+        .arg(&data)
+        .query(&mut con)
+        .unwrap();
     let got: Vec<u8> = redis::cmd("GET").arg("bin").query(&mut con).unwrap();
     assert_eq!(got, data);
 }
@@ -65,9 +69,16 @@ fn binary_value_round_trips_via_resp() {
 fn set_nx_succeeds_on_fresh_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let res: redis::Value =
-        redis::cmd("SET").arg("nx-fresh").arg("v").arg("NX").query(&mut con).unwrap();
-    assert!(matches!(res, redis::Value::Okay | redis::Value::SimpleString(_)));
+    let res: redis::Value = redis::cmd("SET")
+        .arg("nx-fresh")
+        .arg("v")
+        .arg("NX")
+        .query(&mut con)
+        .unwrap();
+    assert!(matches!(
+        res,
+        redis::Value::Okay | redis::Value::SimpleString(_)
+    ));
 }
 
 #[test]
@@ -75,9 +86,16 @@ fn set_nx_returns_nil_on_existing_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("nx-dup", "original").unwrap();
-    let res: redis::Value =
-        redis::cmd("SET").arg("nx-dup").arg("clobber").arg("NX").query(&mut con).unwrap();
-    assert!(matches!(res, redis::Value::Nil), "SET NX on existing key must return nil");
+    let res: redis::Value = redis::cmd("SET")
+        .arg("nx-dup")
+        .arg("clobber")
+        .arg("NX")
+        .query(&mut con)
+        .unwrap();
+    assert!(
+        matches!(res, redis::Value::Nil),
+        "SET NX on existing key must return nil"
+    );
     let still: String = con.get("nx-dup").unwrap();
     assert_eq!(still, "original");
 }
@@ -86,8 +104,12 @@ fn set_nx_returns_nil_on_existing_key() {
 fn set_xx_returns_nil_on_missing_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let res: redis::Value =
-        redis::cmd("SET").arg("xx-missing").arg("v").arg("XX").query(&mut con).unwrap();
+    let res: redis::Value = redis::cmd("SET")
+        .arg("xx-missing")
+        .arg("v")
+        .arg("XX")
+        .query(&mut con)
+        .unwrap();
     assert!(matches!(res, redis::Value::Nil));
 }
 
@@ -96,9 +118,16 @@ fn set_xx_succeeds_on_existing_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("xx-present", "old").unwrap();
-    let res: redis::Value =
-        redis::cmd("SET").arg("xx-present").arg("new").arg("XX").query(&mut con).unwrap();
-    assert!(matches!(res, redis::Value::Okay | redis::Value::SimpleString(_)));
+    let res: redis::Value = redis::cmd("SET")
+        .arg("xx-present")
+        .arg("new")
+        .arg("XX")
+        .query(&mut con)
+        .unwrap();
+    assert!(matches!(
+        res,
+        redis::Value::Okay | redis::Value::SimpleString(_)
+    ));
     let val: String = con.get("xx-present").unwrap();
     assert_eq!(val, "new");
 }
@@ -108,8 +137,12 @@ fn set_with_get_flag_returns_old_value() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("get-flag", "old").unwrap();
-    let old: Vec<u8> =
-        redis::cmd("SET").arg("get-flag").arg("new").arg("GET").query(&mut con).unwrap();
+    let old: Vec<u8> = redis::cmd("SET")
+        .arg("get-flag")
+        .arg("new")
+        .arg("GET")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(old, b"old");
     let new_val: String = con.get("get-flag").unwrap();
     assert_eq!(new_val, "new");
@@ -119,8 +152,12 @@ fn set_with_get_flag_returns_old_value() {
 fn set_with_get_flag_on_missing_returns_nil() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let res: redis::Value =
-        redis::cmd("SET").arg("get-flag-miss").arg("v").arg("GET").query(&mut con).unwrap();
+    let res: redis::Value = redis::cmd("SET")
+        .arg("get-flag-miss")
+        .arg("v")
+        .arg("GET")
+        .query(&mut con)
+        .unwrap();
     assert!(matches!(res, redis::Value::Nil));
 }
 
@@ -130,7 +167,13 @@ fn set_with_get_flag_on_missing_returns_nil() {
 fn set_ex_key_has_ttl_and_expires() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = redis::cmd("SET").arg("ex-key").arg("v").arg("EX").arg(2).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("ex-key")
+        .arg("v")
+        .arg("EX")
+        .arg(2)
+        .query(&mut con)
+        .unwrap();
     let ttl: i64 = con.ttl("ex-key").unwrap();
     assert!(ttl > 0 && ttl <= 2, "TTL should be 1–2s, got {ttl}");
 }
@@ -139,8 +182,13 @@ fn set_ex_key_has_ttl_and_expires() {
 fn set_px_key_has_pttl_and_expires() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("px-key").arg("v").arg("PX").arg(200).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("px-key")
+        .arg("v")
+        .arg("PX")
+        .arg(200)
+        .query(&mut con)
+        .unwrap();
     let pttl: i64 = con.pttl("px-key").unwrap();
     assert!(pttl > 0 && pttl <= 200, "PTTL should be ≤200ms, got {pttl}");
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -157,8 +205,13 @@ fn set_pxat_in_past_sets_key_that_is_immediately_expired() {
         .unwrap()
         .as_millis() as u64
         - 1000;
-    let _: () =
-        redis::cmd("SET").arg("pxat-past").arg("v").arg("PXAT").arg(past_ms).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("pxat-past")
+        .arg("v")
+        .arg("PXAT")
+        .arg(past_ms)
+        .query(&mut con)
+        .unwrap();
     // Key may or may not be stored, but any read should return nil
     let val: Option<String> = con.get("pxat-past").unwrap();
     assert!(val.is_none(), "PXAT in past should yield expired key");
@@ -185,10 +238,18 @@ fn ttl_on_missing_key_returns_neg_two() {
 fn pttl_on_key_with_expiry_returns_millis() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("pttl-k").arg("v").arg("PX").arg(5000).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("pttl-k")
+        .arg("v")
+        .arg("PX")
+        .arg(5000)
+        .query(&mut con)
+        .unwrap();
     let pttl: i64 = con.pttl("pttl-k").unwrap();
-    assert!(pttl > 4000 && pttl <= 5000, "PTTL should be ~5000ms, got {pttl}");
+    assert!(
+        pttl > 4000 && pttl <= 5000,
+        "PTTL should be ~5000ms, got {pttl}"
+    );
 }
 
 // ── EXPIRE / PEXPIRE ──────────────────────────────────────────────────────────
@@ -232,11 +293,17 @@ fn expireat_with_past_timestamp_deletes_key() {
         .unwrap()
         .as_secs()
         - 1;
-    let res: i64 =
-        redis::cmd("EXPIREAT").arg("expat-past").arg(past).query(&mut con).unwrap();
+    let res: i64 = redis::cmd("EXPIREAT")
+        .arg("expat-past")
+        .arg(past)
+        .query(&mut con)
+        .unwrap();
     assert_eq!(res, 1);
     let val: Option<String> = con.get("expat-past").unwrap();
-    assert!(val.is_none(), "EXPIREAT in the past should have deleted the key");
+    assert!(
+        val.is_none(),
+        "EXPIREAT in the past should have deleted the key"
+    );
 }
 
 #[test]
@@ -249,22 +316,31 @@ fn expireat_with_future_timestamp_expires_key_at_correct_time() {
         .unwrap()
         .as_secs()
         + 2;
-    let res: i64 =
-        redis::cmd("EXPIREAT").arg("expat-future").arg(future_secs).query(&mut con).unwrap();
+    let res: i64 = redis::cmd("EXPIREAT")
+        .arg("expat-future")
+        .arg(future_secs)
+        .query(&mut con)
+        .unwrap();
     assert_eq!(res, 1, "EXPIREAT on a live key must return 1");
     let live: Option<String> = con.get("expat-future").unwrap();
     assert!(live.is_some(), "key must be accessible before expiry");
     std::thread::sleep(std::time::Duration::from_millis(2200));
     let gone: Option<String> = con.get("expat-future").unwrap();
-    assert!(gone.is_none(), "key must have expired after EXPIREAT timestamp");
+    assert!(
+        gone.is_none(),
+        "key must have expired after EXPIREAT timestamp"
+    );
 }
 
 #[test]
 fn expireat_on_missing_key_returns_0() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let res: i64 =
-        redis::cmd("EXPIREAT").arg("expat-no-key").arg(9999999999u64).query(&mut con).unwrap();
+    let res: i64 = redis::cmd("EXPIREAT")
+        .arg("expat-no-key")
+        .arg(9999999999u64)
+        .query(&mut con)
+        .unwrap();
     assert_eq!(res, 0);
 }
 
@@ -278,14 +354,20 @@ fn pexpireat_with_future_timestamp_expires_key_at_correct_time() {
         .unwrap()
         .as_millis() as u64
         + 300;
-    let res: i64 =
-        redis::cmd("PEXPIREAT").arg("pexpat-future").arg(future_ms).query(&mut con).unwrap();
+    let res: i64 = redis::cmd("PEXPIREAT")
+        .arg("pexpat-future")
+        .arg(future_ms)
+        .query(&mut con)
+        .unwrap();
     assert_eq!(res, 1, "PEXPIREAT on a live key must return 1");
     let live: Option<String> = con.get("pexpat-future").unwrap();
     assert!(live.is_some(), "key must be accessible before expiry");
     std::thread::sleep(std::time::Duration::from_millis(500));
     let gone: Option<String> = con.get("pexpat-future").unwrap();
-    assert!(gone.is_none(), "key must have expired after PEXPIREAT timestamp");
+    assert!(
+        gone.is_none(),
+        "key must have expired after PEXPIREAT timestamp"
+    );
 }
 
 // ── PERSIST ───────────────────────────────────────────────────────────────────
@@ -294,8 +376,13 @@ fn pexpireat_with_future_timestamp_expires_key_at_correct_time() {
 fn persist_removes_ttl() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("persist-k").arg("v").arg("EX").arg(60).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("persist-k")
+        .arg("v")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
     let res: i64 = con.persist("persist-k").unwrap();
     assert_eq!(res, 1);
     assert_eq!(con.ttl::<_, i64>("persist-k").unwrap(), -1);
@@ -344,8 +431,13 @@ fn del_multiple_keys_returns_count_of_deleted() {
 fn del_expired_key_counts_as_0() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("del-exp").arg("v").arg("PX").arg(50).query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("del-exp")
+        .arg("v")
+        .arg("PX")
+        .arg(50)
+        .query(&mut con)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     let n: i64 = con.del("del-exp").unwrap();
     assert_eq!(n, 0, "expired keys don't count as deleted");
@@ -372,7 +464,11 @@ fn exists_counts_duplicates() {
     let mut con = srv.resp();
     let _: () = con.set("dup-k", "v").unwrap();
     // EXISTS k k counts k twice
-    let n: i64 = redis::cmd("EXISTS").arg("dup-k").arg("dup-k").query(&mut con).unwrap();
+    let n: i64 = redis::cmd("EXISTS")
+        .arg("dup-k")
+        .arg("dup-k")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(n, 2);
 }
 
@@ -382,9 +478,14 @@ fn exists_counts_duplicates() {
 fn mset_then_mget_returns_all_values() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("mk1", "mv1"), ("mk2", "mv2"), ("mk3", "mv3")]).unwrap();
+    let _: () = con
+        .mset(&[("mk1", "mv1"), ("mk2", "mv2"), ("mk3", "mv3")])
+        .unwrap();
     let vals: Vec<Option<String>> = con.mget(&["mk1", "mk2", "mk3"]).unwrap();
-    assert_eq!(vals, vec![Some("mv1".into()), Some("mv2".into()), Some("mv3".into())]);
+    assert_eq!(
+        vals,
+        vec![Some("mv1".into()), Some("mv2".into()), Some("mv3".into())]
+    );
 }
 
 #[test]
@@ -403,7 +504,9 @@ fn mset_writes_all_keys_atomically_via_write_batch() {
     // This test confirms all keys land together; no partial state is observable.
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("batch-a", "1"), ("batch-b", "2"), ("batch-c", "3")]).unwrap();
+    let _: () = con
+        .mset(&[("batch-a", "1"), ("batch-b", "2"), ("batch-c", "3")])
+        .unwrap();
     let a: String = con.get("batch-a").unwrap();
     let b: String = con.get("batch-b").unwrap();
     let c: String = con.get("batch-c").unwrap();
@@ -419,7 +522,11 @@ fn getset_returns_old_value_and_stores_new() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("gs-k", "old").unwrap();
-    let old: String = redis::cmd("GETSET").arg("gs-k").arg("new").query(&mut con).unwrap();
+    let old: String = redis::cmd("GETSET")
+        .arg("gs-k")
+        .arg("new")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(old, "old");
     assert_eq!(con.get::<_, String>("gs-k").unwrap(), "new");
 }
@@ -428,17 +535,34 @@ fn getset_returns_old_value_and_stores_new() {
 fn getset_clears_ttl_on_existing_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("gs-ttl").arg("v").arg("EX").arg(60).query(&mut con).unwrap();
-    let _: String = redis::cmd("GETSET").arg("gs-ttl").arg("new").query(&mut con).unwrap();
-    assert_eq!(con.ttl::<_, i64>("gs-ttl").unwrap(), -1, "GETSET should clear TTL");
+    let _: () = redis::cmd("SET")
+        .arg("gs-ttl")
+        .arg("v")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
+    let _: String = redis::cmd("GETSET")
+        .arg("gs-ttl")
+        .arg("new")
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(
+        con.ttl::<_, i64>("gs-ttl").unwrap(),
+        -1,
+        "GETSET should clear TTL"
+    );
 }
 
 #[test]
 fn setnx_returns_1_on_fresh_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let n: i64 = redis::cmd("SETNX").arg("snx-fresh").arg("v").query(&mut con).unwrap();
+    let n: i64 = redis::cmd("SETNX")
+        .arg("snx-fresh")
+        .arg("v")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(n, 1);
 }
 
@@ -447,7 +571,11 @@ fn setnx_returns_0_on_existing_key() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("snx-dup", "original").unwrap();
-    let n: i64 = redis::cmd("SETNX").arg("snx-dup").arg("clobber").query(&mut con).unwrap();
+    let n: i64 = redis::cmd("SETNX")
+        .arg("snx-dup")
+        .arg("clobber")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(n, 0);
     assert_eq!(con.get::<_, String>("snx-dup").unwrap(), "original");
 }
@@ -477,8 +605,12 @@ fn getex_with_ex_sets_ttl() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let _: () = con.set("gex-k", "v").unwrap();
-    let val: String =
-        redis::cmd("GETEX").arg("gex-k").arg("EX").arg(60).query(&mut con).unwrap();
+    let val: String = redis::cmd("GETEX")
+        .arg("gex-k")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
     assert_eq!(val, "v");
     let ttl: i64 = con.ttl("gex-k").unwrap();
     assert!(ttl > 0 && ttl <= 60);
@@ -488,9 +620,18 @@ fn getex_with_ex_sets_ttl() {
 fn getex_with_persist_removes_ttl() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () =
-        redis::cmd("SET").arg("gex-ttl").arg("v").arg("EX").arg(60).query(&mut con).unwrap();
-    let _: String = redis::cmd("GETEX").arg("gex-ttl").arg("PERSIST").query(&mut con).unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("gex-ttl")
+        .arg("v")
+        .arg("EX")
+        .arg(60)
+        .query(&mut con)
+        .unwrap();
+    let _: String = redis::cmd("GETEX")
+        .arg("gex-ttl")
+        .arg("PERSIST")
+        .query(&mut con)
+        .unwrap();
     assert_eq!(con.ttl::<_, i64>("gex-ttl").unwrap(), -1);
 }
 
@@ -498,8 +639,12 @@ fn getex_with_persist_removes_ttl() {
 fn getex_on_missing_key_returns_nil() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let res: redis::Value =
-        redis::cmd("GETEX").arg("gex-miss").arg("EX").arg(10).query(&mut con).unwrap();
+    let res: redis::Value = redis::cmd("GETEX")
+        .arg("gex-miss")
+        .arg("EX")
+        .arg(10)
+        .query(&mut con)
+        .unwrap();
     assert!(matches!(res, redis::Value::Nil));
 }
 
@@ -509,7 +654,9 @@ fn getex_on_missing_key_returns_nil() {
 fn keys_returns_all_live_keys() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("ka1", "v"), ("ka2", "v"), ("ka3", "v")]).unwrap();
+    let _: () = con
+        .mset(&[("ka1", "v"), ("ka2", "v"), ("ka3", "v")])
+        .unwrap();
     let mut keys: Vec<String> = redis::cmd("KEYS").arg("*").query(&mut con).unwrap();
     keys.sort();
     assert!(keys.contains(&"ka1".to_owned()));
@@ -521,7 +668,9 @@ fn keys_returns_all_live_keys() {
 fn keys_with_pattern_filters() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("user:1", "v"), ("user:2", "v"), ("session:x", "v")]).unwrap();
+    let _: () = con
+        .mset(&[("user:1", "v"), ("user:2", "v"), ("session:x", "v")])
+        .unwrap();
     let keys: Vec<String> = redis::cmd("KEYS").arg("user:*").query(&mut con).unwrap();
     assert_eq!(keys.len(), 2);
     assert!(keys.iter().all(|k| k.starts_with("user:")));
@@ -536,7 +685,10 @@ fn scan_returns_all_keys_via_cursor_iteration() {
     let _: () = con.mset(&pair_refs).unwrap();
     let all = scan_all(&mut con, None);
     for i in 0..20 {
-        assert!(all.contains(&format!("sc-{i:02}")), "sc-{i:02} missing from SCAN");
+        assert!(
+            all.contains(&format!("sc-{i:02}")),
+            "sc-{i:02} missing from SCAN"
+        );
     }
 }
 
@@ -544,7 +696,9 @@ fn scan_returns_all_keys_via_cursor_iteration() {
 fn scan_with_match_pattern_filters() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("pfx:a", "v"), ("pfx:b", "v"), ("other:c", "v")]).unwrap();
+    let _: () = con
+        .mset(&[("pfx:a", "v"), ("pfx:b", "v"), ("other:c", "v")])
+        .unwrap();
     let keys = scan_all(&mut con, Some("pfx:*"));
     assert_eq!(keys.len(), 2);
     assert!(keys.iter().all(|k| k.starts_with("pfx:")));
@@ -556,7 +710,9 @@ fn scan_with_match_pattern_filters() {
 fn dbsize_reflects_live_key_count() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let _: () = con.mset(&[("sz1", "v"), ("sz2", "v"), ("sz3", "v")]).unwrap();
+    let _: () = con
+        .mset(&[("sz1", "v"), ("sz2", "v"), ("sz3", "v")])
+        .unwrap();
     let n: i64 = redis::cmd("DBSIZE").query(&mut con).unwrap();
     assert!(n >= 3, "DBSIZE should be at least 3, got {n}");
 }
@@ -610,7 +766,10 @@ fn select_max_db_index_15_is_valid() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     let res: redis::Value = redis::cmd("SELECT").arg(15).query(&mut con).unwrap();
-    assert!(matches!(res, redis::Value::Okay | redis::Value::SimpleString(_)));
+    assert!(matches!(
+        res,
+        redis::Value::Okay | redis::Value::SimpleString(_)
+    ));
 }
 
 // ── HELLO ─────────────────────────────────────────────────────────────────────
@@ -641,7 +800,10 @@ fn select_large_db_succeeds() {
     let mut con = srv.resp();
     // SELECT accepts any non-negative integer, not just 0-15.
     let res: redis::Value = redis::cmd("SELECT").arg(16u32).query(&mut con).unwrap();
-    assert!(matches!(res, redis::Value::Okay), "SELECT 16 must return OK");
+    assert!(
+        matches!(res, redis::Value::Okay),
+        "SELECT 16 must return OK"
+    );
 }
 
 #[test]
@@ -668,7 +830,10 @@ fn hello_3_is_accepted_and_commands_work_after() {
     let mut con = srv.resp();
     // HELLO 3 switches the server to RESP3 encoding
     let res: redis::Value = redis::cmd("HELLO").arg(3).query(&mut con).unwrap();
-    assert!(!matches!(res, redis::Value::Nil), "HELLO 3 must return server info");
+    assert!(
+        !matches!(res, redis::Value::Nil),
+        "HELLO 3 must return server info"
+    );
     // After protocol switch, basic commands must still work
     let _: () = con.set("hello3-key", "hello3-val").unwrap();
     let got: String = con.get("hello3-key").unwrap();
@@ -681,9 +846,14 @@ fn hello_3_is_accepted_and_commands_work_after() {
 fn unknown_command_returns_error() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let err = redis::cmd("NOTACOMMAND").query::<redis::Value>(&mut con).unwrap_err();
+    let err = redis::cmd("NOTACOMMAND")
+        .query::<redis::Value>(&mut con)
+        .unwrap_err();
     let msg = err.to_string().to_lowercase();
-    assert!(msg.contains("err") || msg.contains("unknown"), "expected ERR: {msg}");
+    assert!(
+        msg.contains("err") || msg.contains("unknown"),
+        "expected ERR: {msg}"
+    );
 }
 
 #[test]
@@ -691,7 +861,12 @@ fn wrong_arity_returns_error() {
     let srv = TestServer::start();
     let mut con = srv.resp();
     // GET requires exactly 1 arg
-    let err = redis::cmd("GET").query::<redis::Value>(&mut con).unwrap_err();
+    let err = redis::cmd("GET")
+        .query::<redis::Value>(&mut con)
+        .unwrap_err();
     let msg = err.to_string().to_lowercase();
-    assert!(msg.contains("err") || msg.contains("wrong") || msg.contains("arity"), "{msg}");
+    assert!(
+        msg.contains("err") || msg.contains("wrong") || msg.contains("arity"),
+        "{msg}"
+    );
 }

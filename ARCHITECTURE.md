@@ -71,6 +71,8 @@ http.rs router
   ├─ PUT    /namespaces/{ns}/values/{key}     → ShardStore::set() / setnx()
   ├─ DELETE /namespaces/{ns}/values/{key}     → ShardStore::del()
   ├─ GET    /namespaces/{ns}/keys             → ShardStore::scan() (paginated)
+  ├─ GET    /namespaces/{ns}/watch/{key}      → SSE stream (exact key)
+  ├─ GET    /namespaces/{ns}/watch?prefix=…   → SSE stream (prefix)
   └─ GET    /healthz                          → 200 OK
   │
   ▼
@@ -115,23 +117,24 @@ SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
 
 ## Concepts & Terminology
 
-| Term | What It Controls | NOT |
-|------|-----------------|-----|
-| Namespace (`ns`) | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary |
-| Shard / ShardStore | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache | Not a partition of data; all shards hold the full key space |
-| L1 / MemCache | In-process S3-FIFO cache that short-circuits disk reads | Not write-through durable storage |
-| L2 / NamespaceLog | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth | Not the hot path for reads after first access |
-| Active file | The currently-writable log file. Records are appended, fsynced, then made visible via the index | Not modified in place; only appended |
-| Sealed file | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries | Not deleted until reclaim runs again |
-| Ghost Set | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue | Not a tombstone or deletion marker |
-| Cursor `"0"` | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states | Not a literal zero integer |
-| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page | Not a user-visible value; internal to scan |
+| Term                   | What It Controls                                                                                                                                                       | NOT                                                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary                              |
+| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                     | Not a partition of data; all shards hold the full key space |
+| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                | Not write-through durable storage                           |
+| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                | Not the hot path for reads after first access               |
+| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                        | Not modified in place; only appended                        |
+| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                 | Not deleted until reclaim runs again                        |
+| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                            | Not a tombstone or deletion marker                          |
+| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                   | Not a literal zero integer                                  |
+| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                       | Not a user-visible value; internal to scan                  |
 
 ## Core Mechanism
 
 ### Threading Model
 
 `main.rs` spawns one OS thread per CPU. Each thread:
+
 1. Starts a Monoio async runtime (io-uring on Linux)
 2. Opens its own `ShardStore` (separate data directory under `{data_dir}/shard-{n}/{ns}/data-*.log` + 256 MB L1 cache by default)
 3. Spawns three tasks: RESP listener, HTTP listener, cache sweeper
@@ -184,9 +187,9 @@ CRC-64/NVME via `crc-fast` covers everything after the CRC field. `flags` carrie
 ```rust
 struct IndexEntry {
     record_offset: u64,
-    record_size:   u32,
-    file_id:       u16,
-    flags:         u8,
+    record_size: u32,
+    file_id: u16,
+    flags: u8,
 }
 ```
 
@@ -205,6 +208,7 @@ RESP arrays are parsed into a `Command` enum with zero heap allocation for comma
 ### Expiry
 
 Expiry is stored as an absolute Unix timestamp in milliseconds, in the in-RAM TTL sidecar. On every read, the current time is compared against the sidecar entry. If expired:
+
 - The key is removed from the index and TTL sidecar.
 - A tombstone record is appended to the log (so a crash before the next reclaim still observes the deletion on replay).
 - L1 is evicted.
@@ -220,25 +224,73 @@ Expired keys that are never accessed accumulate as dead bytes in the log files u
 
 Pattern matching uses a stack-based backtracking algorithm that handles `*` (any sequence) and `?` (single character). No heap allocation; runs inline during RocksDB iteration. See `store.rs:glob_match()`.
 
+### Watch / Subscribe
+
+Clients can subscribe to mutations on a key or a key prefix and receive a live stream of events. The mechanism is the same for both transports; only the framing differs.
+
+**Revision** — every log record's `tstamp_ms` field doubles as a revision ID. No separate counter. Revisions are monotonically increasing per-shard and are included in every `WatchEvent`, enabling resumable subscriptions.
+
+**WatchRegistry** (`engine/src/watch.rs`) — one per `ShardStore`, owned behind `RefCell` (no locking needed; single-threaded per shard). Holds two tables:
+
+- `keys: FxHashMap<(ns, key), Vec<UnboundedSender<WatchEvent>>>` — exact-key watchers
+- `prefixes: Vec<((ns, prefix), UnboundedSender<WatchEvent>)>` — prefix watchers scanned linearly on each write
+
+After each successful `set`, `mset`, or `del`, the store calls `WatchRegistry::notify`. Dead senders (disconnected clients) are pruned lazily on the next notify.
+
+**Initial state delivery** (`watch_subscribe`):
+
+- `since == 0` → call `NamespaceLog::current_entries` — reads the live index + fetches values from disk for matching keys. Delivers the current state snapshot immediately.
+- `since > 0` → call `NamespaceLog::scan_since` — scans all log files in `file_id` order to replay mutations with `tstamp_ms > since`. Used by clients that reconnect after a brief disconnection to catch up without missing writes.
+
+**RESP3 transport** — `WATCH key [key ...] [SINCE <revision>]` and `PWATCH prefix [SINCE <revision>]` intercept in `handle_conn` before `dispatch()`. They require RESP3 (`HELLO 3` first). Initial events are sent as Push frames, followed by a `>2 watch ready` frame, then a live select loop:
+
+```
+>5  watch  set  <key>  <value>  <revision>
+>4  watch  del  <key>  ""       <revision>
+>2  watch  ready
+>2  watch  heartbeat              ← emitted every 30s of silence to keep proxies alive
+```
+
+`UNWATCH` breaks the loop. `WATCH` takes over the connection for its lifetime; normal commands cannot be issued while watching.
+
+**HTTP/SSE transport** — `GET /namespaces/{ns}/watch/{key}` (exact) or `GET /namespaces/{ns}/watch?prefix=...` streams `text/event-stream`. The raw TCP stream is split before any codec is created (`stream.into_split()`), keeping the write half for direct SSE writes. A 25-second heartbeat comment (`: heartbeat`) prevents proxy timeouts. Reconnect with `?since=<revision>` for catch-up replay. SSE event JSON:
+
+```json
+{"type":"set","key":"foo","value":"<base64>","ttl":60,"revision":1746312345678}
+{"type":"del","key":"foo","revision":1746312345999}
+{"type":"ready"}
+```
+
+**TypeScript SDK** — `kv.watch(key, opts?)` returns an `AsyncGenerator<KvWatchEvent>`. On reconnect the SDK automatically passes `?since=lastRevision` so no mutations are silently lost. The RESP backend throws `KvError("not_supported", 501)`; use the HTTP client for watch.
+
+**HTTP route table additions:**
+
+```
+GET /namespaces/{ns}/watch/{key}                → exact-key SSE stream
+GET /namespaces/{ns}/watch/{key}?since=<rev>    → resumable exact-key stream
+GET /namespaces/{ns}/watch?prefix=<p>           → prefix SSE stream
+GET /namespaces/{ns}/watch?prefix=<p>&since=<r> → resumable prefix stream
+```
+
 ## State Machines
 
 ### Connection Lifecycle (RESP)
 
 ```
-         accept()
-            │
-            ▼
-        ┌───────┐
-        │ OPEN  │ ◄─── default RESP2, ns="default"
-        └───┬───┘
-            │ HELLO n  ──────────► switch codec (RESP2 ↔ RESP3)
-            │ SELECT n ──────────► switch ns ("default" | "db1"…"db15")
-            │ QUIT     ──────────┐
-            │ EOF/error ─────────┤
-            ▼                    │
-        ┌────────┐               │
-        │ CLOSED │ ◄─────────────┘
-        └────────┘
+ accept()
+    │
+    ▼
+┌───────┐
+│ OPEN  │ ◄─── default RESP2, ns="default"
+└───┬───┘
+    │ HELLO n  ──────────► switch codec (RESP2 ↔ RESP3)
+    │ SELECT n ──────────► switch ns ("default" | "db1"…"db15")
+    │ QUIT     ──────────┐
+    │ EOF/error ─────────┤
+    ▼                    │
+┌────────┐               │
+│ CLOSED │ ◄─────────────┘
+└────────┘
 ```
 
 `ConnState` (`dispatch.rs`) holds `ns`, `resp_version`, and `quit`. The HELLO command is handled before the codec switches so the response uses the old version.
@@ -286,50 +338,51 @@ Redis MSET is documented as atomic. This implementation builds a single buffer c
 
 ## Configuration
 
-| CLI Flag / Env Var | Default | What It Controls at Runtime |
-|--------------------|---------|------------------------------|
-| `--data-dir` / `KV_DATA_DIR` | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`) |
-| `--resp-port` / `KV_RESP_PORT` | `6379` | TCP port each thread's RESP listener binds to |
-| `--http-port` / `KV_HTTP_PORT` | `4869` | TCP port each thread's HTTP listener binds to |
-| `--threads` / `KV_THREADS` | `num_cpus::get()` | Number of OS threads (= number of shards) |
-| `--memory-bytes` / `KV_MEMORY_BYTES` | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads |
-| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD` | `4` | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim |
-| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS` | `300` | Seconds between auto-reclaim scans (ignored when threshold is 0) |
+| CLI Flag / Env Var                                           | Default              | What It Controls at Runtime                                                                       |
+| ------------------------------------------------------------ | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `--data-dir` / `KV_DATA_DIR`                                 | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`)                                      |
+| `--resp-port` / `KV_RESP_PORT`                               | `6379`               | TCP port each thread's RESP listener binds to                                                     |
+| `--http-port` / `KV_HTTP_PORT`                               | `4869`               | TCP port each thread's HTTP listener binds to                                                     |
+| `--threads` / `KV_THREADS`                                   | `num_cpus::get()`    | Number of OS threads (= number of shards)                                                         |
+| `--memory-bytes` / `KV_MEMORY_BYTES`                         | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads                                              |
+| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD` | `4`                  | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim |
+| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS`       | `300`                | Seconds between auto-reclaim scans (ignored when threshold is 0)                                  |
 
 ## Failure Modes
 
-| Failure | What Actually Happens | Recovery |
-|---------|----------------------|----------|
-| Thread panic | `panic = "abort"` — process terminates immediately; no unwinding | External process supervisor restarts the process |
-| Disk write error | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open | Client retries; underlying disk issue must be resolved externally |
-| CRC mismatch on replay | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records | Automatic; the offending tail bytes are dropped |
-| Bad record header | `EngineError::BadRecord`; treated as the truncation point during replay | Affected tail records are lost; older records survive |
-| RESP parse error | Connection closed; no response sent | Client reconnects |
-| HTTP malformed request | JSON error body `{"error": "...", "message": "..."}` with 4xx status | Client fixes request |
-| Expired key read | Tombstone appended, evicted from L1; `None` returned to caller | Transparent; client sees cache miss |
-| Crash during MSET | Single fsynced write — either all records land or the partial tail is truncated by recovery's CRC check | No partial state; client can safely retry |
-| Crash mid-reclaim | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim | Automatic; no data loss (no rename happened) |
-| L1 cache over capacity | Eviction runs inline during insert; oldest Small-queue entries dropped first | Automatic; no data loss (L2 is authoritative) |
+| Failure                | What Actually Happens                                                                                                                           | Recovery                                                          |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Thread panic           | `panic = "abort"` — process terminates immediately; no unwinding                                                                                | External process supervisor restarts the process                  |
+| Disk write error       | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open                                                        | Client retries; underlying disk issue must be resolved externally |
+| CRC mismatch on replay | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records | Automatic; the offending tail bytes are dropped                   |
+| Bad record header      | `EngineError::BadRecord`; treated as the truncation point during replay                                                                         | Affected tail records are lost; older records survive             |
+| RESP parse error       | Connection closed; no response sent                                                                                                             | Client reconnects                                                 |
+| HTTP malformed request | JSON error body `{"error": "...", "message": "..."}` with 4xx status                                                                            | Client fixes request                                              |
+| Expired key read       | Tombstone appended, evicted from L1; `None` returned to caller                                                                                  | Transparent; client sees cache miss                               |
+| Crash during MSET      | Single fsynced write — either all records land or the partial tail is truncated by recovery's CRC check                                         | No partial state; client can safely retry                         |
+| Crash mid-reclaim      | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim                                          | Automatic; no data loss (no rename happened)                      |
+| L1 cache over capacity | Eviction runs inline during insert; oldest Small-queue entries dropped first                                                                    | Automatic; no data loss (L2 is authoritative)                     |
 
 ## File Map
 
-| File | What It Does |
-|------|-------------|
-| `crates/proto/src/command.rs` | Parses RESP arrays into `Command` enum; validates arity and option syntax |
-| `crates/proto/src/response.rs` | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply) |
-| `crates/proto/src/error.rs` | Protocol-level error variants returned to clients |
-| `crates/engine/src/store.rs` | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET |
-| `crates/engine/src/cache.rs` | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting |
-| `crates/engine/src/types.rs` | `Entry`, `SetOptions`, `TtlResult`, `ScanPage` |
-| `crates/engine/src/error.rs` | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON) |
-| `crates/engine/src/log/mod.rs` | `NamespaceLog`: index + active + sealed files; put_full / put_many / tombstone / ttl_update / bulk_read / flush / reclaim |
-| `crates/engine/src/log/file.rs` | `LogFile`: monoio io_uring file wrapper; append, read_at, write_footer, read_footer |
-| `crates/engine/src/log/record.rs` | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits |
-| `crates/engine/src/log/index.rs` | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN |
-| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers, replay active-file tail; orphan TTL-update handling |
-| `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file |
-| `crates/server/src/main.rs` | Thread spawning; per-thread Monoio runtime + ShardStore initialization |
-| `crates/server/src/config.rs` | CLI arg + env var parsing into `Config` |
-| `crates/server/src/dispatch.rs` | Maps `Command` → `ShardStore` calls → RESP response; `ConnState` |
-| `crates/server/src/resp.rs` | TCP accept loop; RESP framing; connection state machine |
-| `crates/server/src/http.rs` | HTTP route handlers; header/query param extraction; JSON error responses |
+| File                               | What It Does                                                                                                              |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `crates/proto/src/command.rs`      | Parses RESP arrays into `Command` enum; validates arity and option syntax                                                 |
+| `crates/proto/src/response.rs`     | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply)                                                 |
+| `crates/proto/src/error.rs`        | Protocol-level error variants returned to clients                                                                         |
+| `crates/engine/src/store.rs`       | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET                                  |
+| `crates/engine/src/cache.rs`       | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting                                               |
+| `crates/engine/src/types.rs`       | `Entry`, `SetOptions`, `TtlResult`, `ScanPage`                                                                            |
+| `crates/engine/src/error.rs`       | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON)                                    |
+| `crates/engine/src/log/mod.rs`     | `NamespaceLog`: index + active + sealed files; put_full / put_many / tombstone / ttl_update / bulk_read / flush / reclaim |
+| `crates/engine/src/log/file.rs`    | `LogFile`: monoio io_uring file wrapper; append, read_at, write_footer, read_footer                                       |
+| `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                           |
+| `crates/engine/src/log/index.rs`   | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN                                                                     |
+| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers, replay active-file tail; orphan TTL-update handling                                   |
+| `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file                                                           |
+| `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                    |
+| `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                   |
+| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`                                                          |
+| `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                    |
+| `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                          |
+| `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint                              |

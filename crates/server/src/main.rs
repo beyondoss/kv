@@ -6,9 +6,9 @@ use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::Arc;
 use std::time::Duration;
 
 use rustc_hash::FxHasher;
@@ -66,7 +66,10 @@ fn accept_one(
             return true;
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            tracing::error!(worker = idx, "worker channel disconnected; stopping accept loop");
+            tracing::error!(
+                worker = idx,
+                "worker channel disconnected; stopping accept loop"
+            );
             return false;
         }
     }
@@ -96,7 +99,15 @@ fn accept_loop(
         }
         match listener.accept() {
             Ok((stream, peer)) => {
-                if !accept_one(stream, peer, peek_key, on_reject, senders, wakeup_writers, rr) {
+                if !accept_one(
+                    stream,
+                    peer,
+                    peek_key,
+                    on_reject,
+                    senders,
+                    wakeup_writers,
+                    rr,
+                ) {
                     break;
                 }
             }
@@ -127,7 +138,11 @@ fn main() -> anyhow::Result<()> {
     }));
 
     let n_threads = cfg.threads.unwrap_or_else(num_cpus::get).max(1);
-    tracing::info!(threads = n_threads, resp_port = cfg.resp_port, "starting beyond-kv");
+    tracing::info!(
+        threads = n_threads,
+        resp_port = cfg.resp_port,
+        "starting beyond-kv"
+    );
 
     let data_dir = cfg.data_dir.clone();
     let resp_port = cfg.resp_port;

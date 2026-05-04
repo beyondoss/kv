@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Exp};
 use tokio::time::sleep_until;
 
@@ -49,13 +49,33 @@ pub struct Plan {
 }
 
 pub struct Driver {
-    pub workload: Arc<Workload>,
+    /// One workload per shard. Single-element when unsharded.
+    /// Worker `w` uses `workloads[w % workloads.len()]`, distributing
+    /// connections round-robin so each shard gets `concurrency / N` workers.
+    workloads: Vec<Arc<Workload>>,
     pub plan: Plan,
 }
 
 impl Driver {
     pub fn new(workload: Workload, plan: Plan) -> Self {
-        Self { workload: Arc::new(workload), plan }
+        Self {
+            workloads: vec![Arc::new(workload)],
+            plan,
+        }
+    }
+
+    /// Build a sharded driver. Each element carries a keyspace pre-filtered to
+    /// one shard's partition. Workers are assigned round-robin so each shard
+    /// gets `concurrency / N` dedicated connections.
+    pub fn new_sharded(shard_workloads: Vec<Workload>, plan: Plan) -> Self {
+        assert!(
+            !shard_workloads.is_empty(),
+            "need at least one shard workload"
+        );
+        Self {
+            workloads: shard_workloads.into_iter().map(Arc::new).collect(),
+            plan,
+        }
     }
 
     /// Reset the target's keyspace and (optionally) repopulate it.
@@ -63,27 +83,33 @@ impl Driver {
     pub async fn prepare(&self, target: Arc<dyn Target>) -> anyhow::Result<()> {
         target.reset().await?;
         if self.plan.populate {
-            tracing::info!(target = target.name(), "populating keyspace");
-            populate(target, self.workload.clone(), self.plan.concurrency).await?;
+            let workers_per_shard = (self.plan.concurrency / self.workloads.len()).max(1);
+            for workload in &self.workloads {
+                tracing::info!(target = target.name(), "populating keyspace");
+                populate(target.clone(), workload.clone(), workers_per_shard).await?;
+            }
         }
         Ok(())
     }
 
     /// Run one warmup + measurement phase at `mode`. The keyspace is left as-is;
     /// this is what makes rate sweeps cheap — populate once, measure many.
-    pub async fn measure(
-        &self,
-        target: Arc<dyn Target>,
-        mode: Mode,
-    ) -> anyhow::Result<Report> {
+    pub async fn measure(&self, target: Arc<dyn Target>, mode: Mode) -> anyhow::Result<Report> {
         if self.plan.warmup > Duration::ZERO {
             tracing::info!(target = target.name(), mode = ?mode, warmup = ?self.plan.warmup, "warmup");
-            let _ = self.run_phase(target.clone(), mode, self.plan.warmup, self.plan.seed).await?;
+            let _ = self
+                .run_phase(target.clone(), mode, self.plan.warmup, self.plan.seed)
+                .await?;
         }
         tracing::info!(target = target.name(), mode = ?mode, duration = ?self.plan.duration, "measuring");
         let elapsed_start = Instant::now();
         let workers = self
-            .run_phase(target.clone(), mode, self.plan.duration, self.plan.seed.wrapping_add(1))
+            .run_phase(
+                target.clone(),
+                mode,
+                self.plan.duration,
+                self.plan.seed.wrapping_add(1),
+            )
             .await?;
         let mut report =
             Report::from_workers(target.name().to_string(), workers, elapsed_start.elapsed());
@@ -121,10 +147,18 @@ impl Driver {
         let mut handles = Vec::with_capacity(self.plan.concurrency);
         for w in 0..self.plan.concurrency {
             let target = target.clone();
-            let workload = self.workload.clone();
+            let workload = self.workloads[w % self.workloads.len()].clone();
             let worker_seed = seed.wrapping_add(w as u64);
             handles.push(tokio::spawn(async move {
-                run_worker(target, workload, rate_per_worker, start_at, deadline, worker_seed).await
+                run_worker(
+                    target,
+                    workload,
+                    rate_per_worker,
+                    start_at,
+                    deadline,
+                    worker_seed,
+                )
+                .await
             }));
         }
 
@@ -204,12 +238,11 @@ async fn execute_one<R: Rng>(
 
 #[inline]
 fn us(d: Duration) -> u64 {
-    // Sub-microsecond ops still need a positive bucket; clamp to 1µs.
     d.as_micros().max(1) as u64
 }
 
-/// Populate phase: deterministic SETs across the entire keyspace, sharded
-/// across workers. Runs to completion regardless of `duration`.
+/// Populate phase: deterministic SETs across the keyspace, distributed across
+/// workers. Runs to completion regardless of `duration`.
 async fn populate(
     target: Arc<dyn Target>,
     workload: Arc<Workload>,
@@ -227,11 +260,18 @@ async fn populate(
             let value = workload.value().clone();
             for idx in start..end {
                 let key = workload.keyspace().nth(idx);
-                client.execute(&Op::Set { key, value: value.clone() }).await?;
+                client
+                    .execute(&Op::Set {
+                        key,
+                        value: value.clone(),
+                    })
+                    .await?;
             }
             anyhow::Ok(())
         }));
     }
-    for h in handles { h.await??; }
+    for h in handles {
+        h.await??;
+    }
     Ok(())
 }

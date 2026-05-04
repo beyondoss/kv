@@ -98,19 +98,19 @@ open_namespace(dir, config)
 
 ## Concepts & Terminology
 
-| Term | What It Controls | NOT |
-|---|---|---|
-| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set | Not a shard — multiple namespaces can live in one shard |
-| `LogFile` | One `data-{id}.log` file; tracks write offset, exposes positioned I/O | Not a WAL segment; the log IS the store |
-| `active` file | The only writable file at any time; receives all new appends | Not memory-mapped; accessed via io_uring |
-| `sealed` files | Immutable; readable only; eligible for reclaim | Not deleted until reclaim completes the rename |
-| Footer | Per-key metadata block at the end of a sealed file; enables fast recovery | Not written to the active file; its absence marks a file as active/crashed |
-| Tombstone | A record with the `TOMBSTONE` flag; marks a key as deleted in the log | Not a physical delete — the old record remains until reclaim |
-| TTL-update | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy | Not authoritative until replayed against the index |
-| `NsIndex` | In-memory `FxHashMap` from key → `IndexEntry`; the read path | Not persisted — rebuilt from log on every open |
-| `IndexEntry` | 16-byte struct: file_id + record_offset + record_size + flags | Does not hold the value or the key |
-| Reclaim | Operator-triggered GC: rewrites live keys into one new file | Never automatic; caller must serialize with writes |
-| `flush()` | Unlinks and recreates all files (CoW snapshot invalidation) | Not fsync — this destroys all data in the namespace |
+| Term           | What It Controls                                                            | NOT                                                                        |
+| -------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set             | Not a shard — multiple namespaces can live in one shard                    |
+| `LogFile`      | One `data-{id}.log` file; tracks write offset, exposes positioned I/O       | Not a WAL segment; the log IS the store                                    |
+| `active` file  | The only writable file at any time; receives all new appends                | Not memory-mapped; accessed via io_uring                                   |
+| `sealed` files | Immutable; readable only; eligible for reclaim                              | Not deleted until reclaim completes the rename                             |
+| Footer         | Per-key metadata block at the end of a sealed file; enables fast recovery   | Not written to the active file; its absence marks a file as active/crashed |
+| Tombstone      | A record with the `TOMBSTONE` flag; marks a key as deleted in the log       | Not a physical delete — the old record remains until reclaim               |
+| TTL-update     | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy | Not authoritative until replayed against the index                         |
+| `NsIndex`      | In-memory `FxHashMap` from key → `IndexEntry`; the read path                | Not persisted — rebuilt from log on every open                             |
+| `IndexEntry`   | 16-byte struct: file_id + record_offset + record_size + flags               | Does not hold the value or the key                                         |
+| Reclaim        | Operator-triggered GC: rewrites live keys into one new file                 | Never automatic; caller must serialize with writes                         |
+| `flush()`      | Unlinks and recreates all files (CoW snapshot invalidation)                 | Not fsync — this destroys all data in the namespace                        |
 
 ## Core Mechanisms
 
@@ -159,26 +159,26 @@ The compaction rename (`data-{id}.log.tmp` → `data-{id}.log`) is the only atom
 ## State Machine
 
 ```
-                   open_namespace()
-                         │
-                         ▼
-                      OPEN ◄───────────────────────────┐
-                    (active)                           │
-                    /      \                           │
-               put/del    reclaim()                    │
-                  │            │                       │
-                  ▼            ▼                       │
-             APPENDED       SEALING ──► COMPACTING ────┘
-             (new offset    (write footer,  (rename .tmp,
-              in index)      sync)           drop old files)
+      open_namespace()
+            │
+            ▼
+         OPEN ◄───────────────────────────┐
+       (active)                           │
+       /      \                           │
+  put/del    reclaim()                    │
+     │            │                       │
+     ▼            ▼                       │
+APPENDED       SEALING ──► COMPACTING ────┘
+(new offset    (write footer,  (rename .tmp,
+ in index)      sync)           drop old files)
 ```
 
-| Phase | Files on disk | Index state | Writable? |
-|---|---|---|---|
-| OPEN | active + 0..N sealed | fully populated | yes |
-| SEALING | active being sealed | unchanged | no — caller must serialize |
-| COMPACTING | sealed + .tmp | unchanged | no — caller must serialize |
-| OPEN (post-reclaim) | 1 new sealed + fresh active | unchanged | yes |
+| Phase               | Files on disk               | Index state     | Writable?                  |
+| ------------------- | --------------------------- | --------------- | -------------------------- |
+| OPEN                | active + 0..N sealed        | fully populated | yes                        |
+| SEALING             | active being sealed         | unchanged       | no — caller must serialize |
+| COMPACTING          | sealed + .tmp               | unchanged       | no — caller must serialize |
+| OPEN (post-reclaim) | 1 new sealed + fresh active | unchanged       | yes                        |
 
 ## Why It Behaves This Way
 
@@ -200,19 +200,19 @@ The engine runs on a single-threaded `monoio` runtime per shard. There is no cro
 
 ## Failure Modes
 
-| Failure | What Actually Happens | Recovery |
-|---|---|---|
-| Crash mid-append (active file) | Partial record at tail of active file | Recovery replays records; stops and truncates at first bad CRC |
-| Crash mid-reclaim before rename | `.tmp` file left on disk | Ignored on next open (no `.log` suffix); old sealed files intact |
-| Crash mid-reclaim after rename | Old sealed files not unlinked | Next reclaim drops them; logged as warnings |
-| Sealed file footer corrupt | Footer CRC check fails | Falls back to full sequential record scan |
-| Read from expired key | Returns `None`; tombstone appended lazily | Tombstone write is best-effort; a crash before it completes means the key re-expires on next read |
-| `flush()` called accidentally | All namespace files unlinked and recreated | Data is gone; no recovery — `flush()` is a destructive reset |
+| Failure                         | What Actually Happens                      | Recovery                                                                                          |
+| ------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Crash mid-append (active file)  | Partial record at tail of active file      | Recovery replays records; stops and truncates at first bad CRC                                    |
+| Crash mid-reclaim before rename | `.tmp` file left on disk                   | Ignored on next open (no `.log` suffix); old sealed files intact                                  |
+| Crash mid-reclaim after rename  | Old sealed files not unlinked              | Next reclaim drops them; logged as warnings                                                       |
+| Sealed file footer corrupt      | Footer CRC check fails                     | Falls back to full sequential record scan                                                         |
+| Read from expired key           | Returns `None`; tombstone appended lazily  | Tombstone write is best-effort; a crash before it completes means the key re-expires on next read |
+| `flush()` called accidentally   | All namespace files unlinked and recreated | Data is gone; no recovery — `flush()` is a destructive reset                                      |
 
 ## Configuration
 
 `LogConfig` (`config.rs`):
 
-| Field | Default | What It Controls |
-|---|---|---|
+| Field           | Default      | What It Controls                                                                        |
+| --------------- | ------------ | --------------------------------------------------------------------------------------- |
 | `max_file_size` | (caller-set) | Byte threshold at which the active file is rotated to sealed and a new active is opened |

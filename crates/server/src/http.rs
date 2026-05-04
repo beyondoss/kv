@@ -4,13 +4,23 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use beyond_kv_engine::log::now_ms;
 use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::SetOptions;
+use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use bytes::Bytes;
-use monoio::io::{sink::Sink, stream::Stream};
+use futures_channel::mpsc::UnboundedReceiver;
+use futures_util::StreamExt as FuturesStreamExt;
+use futures_util::stream::SelectAll;
+use monoio::io::{
+    AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable, sink::Sink, stream::Stream,
+};
 use monoio::net::TcpStream;
 use monoio_http::common::body::{Body, BodyExt, FixedBody, HttpBody};
-use monoio_http::h1::codec::{decoder::FillPayload, ServerCodec};
+use monoio_http::h1::codec::decoder::FillPayload;
+use monoio_http::h1::codec::decoder::RequestDecoder;
+use monoio_http::h1::codec::encoder::GenericEncoder;
 use monoio_http::h1::payload::Payload;
 
 pub async fn serve_routed(
@@ -37,10 +47,12 @@ async fn handle_conn(
     idle_timeout: Duration,
     max_value_bytes: usize,
 ) {
-    let mut codec: ServerCodec<TcpStream> = ServerCodec::new(stream);
+    // Split so we can keep the write half for SSE streaming later.
+    let (r, mut w) = stream.into_split();
+    let mut decoder: RequestDecoder<OwnedReadHalf<TcpStream>> = RequestDecoder::new(r);
 
     loop {
-        let req = match monoio::time::timeout(idle_timeout, Stream::next(&mut codec)).await {
+        let req = match monoio::time::timeout(idle_timeout, Stream::next(&mut decoder)).await {
             Ok(Some(Ok(r))) => r,
             Ok(Some(Err(e))) => {
                 tracing::debug!("HTTP decode error: {e}");
@@ -53,6 +65,17 @@ async fn handle_conn(
             }
         };
 
+        // SSE watch paths take over the connection — intercept before filling payload.
+        if let Some(wp) = parse_watch_params(req.uri().path(), req.uri().query().unwrap_or("")) {
+            if req.method() != http::Method::GET {
+                let mut enc = GenericEncoder::new(&mut w);
+                let _ = Sink::send(&mut enc, method_not_allowed()).await;
+                break;
+            }
+            handle_watch_sse(&mut w, &store, wp).await;
+            return;
+        }
+
         // Reject oversized bodies before reading them.
         let content_len: Option<usize> = req
             .headers()
@@ -60,11 +83,12 @@ async fn handle_conn(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
         if content_len.map_or(false, |n| n > max_value_bytes) {
-            let _ = Sink::send(&mut codec, payload_too_large()).await;
+            let mut enc = GenericEncoder::new(&mut w);
+            let _ = Sink::send(&mut enc, payload_too_large()).await;
             break; // close connection — body not drained
         }
 
-        if codec.fill_payload().await.is_err() {
+        if decoder.fill_payload().await.is_err() {
             break;
         }
 
@@ -73,17 +97,21 @@ async fn handle_conn(
 
         // Secondary check on actual body size (handles chunked transfer).
         if body_bytes.len() > max_value_bytes {
-            let response = payload_too_large();
-            let _ = Sink::send(&mut codec, response).await;
+            let mut enc = GenericEncoder::new(&mut w);
+            let _ = Sink::send(&mut enc, payload_too_large()).await;
             break;
         }
 
         let response = route(&parts, body_bytes, &store).await;
 
-        if Sink::send(&mut codec, response).await.is_err() {
+        let mut enc = GenericEncoder::new(&mut w);
+        if Sink::send(&mut enc, response).await.is_err() {
             break;
         }
-        if Sink::<http::Response<HttpBody>>::flush(&mut codec).await.is_err() {
+        if Sink::<http::Response<HttpBody>>::flush(&mut enc)
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -139,7 +167,8 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
         Ok(None) => not_found_json("not_found", "key does not exist"),
         Ok(Some(entry)) => {
             let ttl_secs = entry.expires_at.map(|t| {
-                t.saturating_duration_since(std::time::Instant::now()).as_secs()
+                t.saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
             });
             let mut builder = http::Response::builder().status(200);
             if let Some(ttl) = ttl_secs {
@@ -234,7 +263,10 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
         .unwrap_or(100)
         .min(1000);
 
-    match store.scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit).await {
+    match store
+        .scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit)
+        .await
+    {
         Err(e) => internal_error(&e.to_string()),
         Ok(page) => {
             let keys: Vec<serde_json::Value> = page
@@ -251,7 +283,9 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
             if !complete {
                 // Emit cursor as decimal u64 — URL-safe, no re-encoding needed by clients.
                 let pos = if page.next_cursor.len() == 8 {
-                    page.next_cursor.as_ref().try_into()
+                    page.next_cursor
+                        .as_ref()
+                        .try_into()
                         .map(u64::from_le_bytes)
                         .unwrap_or(0)
                 } else {
@@ -261,6 +295,155 @@ async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Respons
             }
             json_response(200, &body)
         }
+    }
+}
+
+// ── SSE watch ────────────────────────────────────────────────────────────────
+
+struct WatchParams {
+    ns: String,
+    key: Vec<u8>,
+    is_prefix: bool,
+    since: Option<u64>,
+}
+
+fn parse_watch_params(path: &str, query: &str) -> Option<WatchParams> {
+    let rest = path.strip_prefix("/namespaces/")?;
+    let (ns, rest) = split_once(rest, '/')?;
+
+    if let Some(key_encoded) = rest.strip_prefix("watch/") {
+        return Some(WatchParams {
+            ns: ns.to_string(),
+            key: percent_decode(key_encoded),
+            is_prefix: false,
+            since: query_param(query, "since").and_then(|s| s.parse().ok()),
+        });
+    }
+
+    if rest == "watch" {
+        let prefix_raw = query_param(query, "prefix")?;
+        return Some(WatchParams {
+            ns: ns.to_string(),
+            key: percent_decode(prefix_raw),
+            is_prefix: true,
+            since: query_param(query, "since").and_then(|s| s.parse().ok()),
+        });
+    }
+
+    None
+}
+
+async fn handle_watch_sse(
+    w: &mut OwnedWriteHalf<TcpStream>,
+    store: &ShardStore,
+    params: WatchParams,
+) {
+    let headers = b"HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream\r\n\
+        Cache-Control: no-cache\r\n\
+        X-Accel-Buffering: no\r\n\
+        Connection: keep-alive\r\n\
+        \r\n"
+        .to_vec();
+    let (res, _) = w.write_all(headers).await;
+    if res.is_err() {
+        return;
+    }
+
+    let filter = if params.is_prefix {
+        KeyFilter::Prefix(&params.key)
+    } else {
+        KeyFilter::Exact(&params.key)
+    };
+    let since_rev = params.since.unwrap_or(0);
+
+    let (initial, rx) = match store.watch_subscribe(&params.ns, filter, since_rev).await {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "data: {{\"type\":\"error\",\"message\":{}}}\n\n",
+                serde_json::json!(e.to_string())
+            );
+            let _ = w.write_all(msg.into_bytes()).await;
+            return;
+        }
+    };
+
+    for event in &initial {
+        let data = format!("data: {}\n\n", sse_event_json(event));
+        let (res, _) = w.write_all(data.into_bytes()).await;
+        if res.is_err() {
+            return;
+        }
+    }
+
+    let (res, _) = w
+        .write_all(b"data: {\"type\":\"ready\",\"revision\":0}\n\n".to_vec())
+        .await;
+    if res.is_err() {
+        return;
+    }
+
+    let mut rx_stream: SelectAll<UnboundedReceiver<WatchEvent>> = SelectAll::new();
+    rx_stream.push(rx);
+
+    loop {
+        match monoio::time::timeout(
+            Duration::from_secs(25),
+            FuturesStreamExt::next(&mut rx_stream),
+        )
+        .await
+        {
+            Ok(Some(event)) => {
+                let data = format!("data: {}\n\n", sse_event_json(&event));
+                let (res, _) = w.write_all(data.into_bytes()).await;
+                if res.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(_timeout) => {
+                let (res, _) = w.write_all(b": heartbeat\n\n".to_vec()).await;
+                if res.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn sse_event_json(event: &WatchEvent) -> String {
+    match event {
+        WatchEvent::Set {
+            key,
+            value,
+            metadata,
+            expires_at_ms,
+            revision,
+        } => {
+            let key_str = String::from_utf8_lossy(key);
+            let value_b64 = base64::engine::general_purpose::STANDARD.encode(value);
+            let mut obj = serde_json::json!({
+                "type": "set",
+                "key": key_str,
+                "value": value_b64,
+                "revision": revision,
+            });
+            if let Some(exp_ms) = expires_at_ms {
+                let ttl_secs = exp_ms.saturating_sub(now_ms()) / 1000;
+                obj["ttl"] = serde_json::Value::Number(ttl_secs.into());
+            }
+            if let Some(meta) = metadata {
+                obj["metadata"] = meta.clone();
+            }
+            obj.to_string()
+        }
+        WatchEvent::Del { key, revision } => serde_json::json!({
+            "type": "del",
+            "key": String::from_utf8_lossy(key),
+            "revision": revision,
+        })
+        .to_string(),
     }
 }
 
@@ -340,7 +523,9 @@ fn fallback_500() -> http::Response<HttpBody> {
     http::Response::builder()
         .status(500)
         .header("Content-Type", "text/plain")
-        .body(HttpBody::fixed_body(Some(Bytes::from_static(b"internal error"))))
+        .body(HttpBody::fixed_body(Some(Bytes::from_static(
+            b"internal error",
+        ))))
         .expect("static response must build")
 }
 
@@ -356,7 +541,9 @@ fn json_response(status: u16, body: &serde_json::Value) -> http::Response<HttpBo
 fn ok_text(msg: &'static str) -> http::Response<HttpBody> {
     http::Response::builder()
         .status(200)
-        .body(HttpBody::fixed_body(Some(Bytes::from_static(msg.as_bytes()))))
+        .body(HttpBody::fixed_body(Some(Bytes::from_static(
+            msg.as_bytes(),
+        ))))
         .unwrap_or_else(|_| fallback_500())
 }
 
@@ -382,9 +569,15 @@ fn not_found_json(code: &str, msg: &str) -> http::Response<HttpBody> {
 }
 
 fn internal_error(msg: &str) -> http::Response<HttpBody> {
-    json_response(500, &serde_json::json!({ "error": "internal_error", "message": msg }))
+    json_response(
+        500,
+        &serde_json::json!({ "error": "internal_error", "message": msg }),
+    )
 }
 
 fn method_not_allowed() -> http::Response<HttpBody> {
-    json_response(405, &serde_json::json!({ "error": "method_not_allowed", "message": "method not allowed" }))
+    json_response(
+        405,
+        &serde_json::json!({ "error": "method_not_allowed", "message": "method not allowed" }),
+    )
 }

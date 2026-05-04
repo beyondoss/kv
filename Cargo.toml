@@ -8,12 +8,14 @@ license = "UNLICENSED"
 rust-version = "1.85"
 
 [workspace.dependencies]
-beyond-resp = { path = "../resp", features = ["monoio"] }
 beyond-kv-engine = { path = "crates/engine" }
 beyond-kv-proto = { path = "crates/proto" }
+beyond-resp = { path = "../resp", features = ["monoio"] }
 
+base64 = "0.22"
 bytes = "1.11"
 crc-fast = "1.10"
+futures-channel = "0.3"
 futures-util = "0.3"
 http = "1.0"
 mimalloc = { version = "0.1", features = ["v2"] }
