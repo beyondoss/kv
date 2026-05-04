@@ -283,4 +283,44 @@ mod tests {
         assert!(strs.contains(&b"live".as_ref()));
         assert!(!strs.contains(&b"dead".as_ref()));
     }
+
+    #[test]
+    fn live_count_tracks_insert_overwrite_remove() {
+        let mut idx = NsIndex::new();
+        assert_eq!(idx.live_len(), 0);
+        idx.insert(b("a"), IndexEntry::new(0, 0, 1, 1), None);
+        assert_eq!(idx.live_len(), 1);
+        idx.insert(b("b"), IndexEntry::new(0, 1, 1, 2), None);
+        assert_eq!(idx.live_len(), 2);
+        // Overwrite: count must not increase.
+        idx.insert(b("a"), IndexEntry::new(0, 2, 1, 3), None);
+        assert_eq!(idx.live_len(), 2);
+        idx.remove(b"a");
+        assert_eq!(idx.live_len(), 1);
+        idx.remove(b"b");
+        assert_eq!(idx.live_len(), 0);
+        // Removing a non-existent key must not underflow.
+        idx.remove(b"missing");
+        assert_eq!(idx.live_len(), 0);
+    }
+
+    #[test]
+    fn scan_after_deletion_excludes_removed_key() {
+        let mut idx = NsIndex::new();
+        idx.insert(b("keep"), IndexEntry::new(0, 0, 1, 1), None);
+        idx.insert(b("gone"), IndexEntry::new(0, 1, 1, 2), None);
+        idx.remove(b"gone");
+        let (keys, _) = idx.scan(0, 100, 0, |_| true);
+        assert!(keys.contains(&b("keep")));
+        assert!(!keys.contains(&b("gone")));
+    }
+
+    #[test]
+    fn scan_count_zero_clamped_to_one() {
+        let mut idx = NsIndex::new();
+        idx.insert(b("k"), IndexEntry::new(0, 0, 1, 1), None);
+        // count=0 must be clamped to 1 so scan always makes progress.
+        let (keys, _) = idx.scan(0, 0, 0, |_| true);
+        assert_eq!(keys.len(), 1);
+    }
 }

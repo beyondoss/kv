@@ -1270,6 +1270,7 @@ fn match_bracket(bracket: &[u8], ch: u8) -> (bool, usize) {
 mod tests {
     use super::*;
     use std::future::Future;
+    use std::io::Write as _;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -1953,6 +1954,180 @@ mod tests {
     }
 
     // ── glob_match ────────────────────────────────────────────────────────────
+
+    // --- setrev / delrev ---
+
+    #[test]
+    fn setrev_correct_revision_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"k", b"v1").await;
+            let rev = s.get("default", b"k").await.unwrap().unwrap().revision;
+            let new_rev = s
+                .setrev(
+                    "default",
+                    b"k",
+                    Bytes::from("v2"),
+                    SetOptions::default(),
+                    rev,
+                )
+                .await
+                .unwrap();
+            assert!(new_rev.is_some());
+            assert_eq!(get_value(&s, b"k").await.unwrap().as_ref(), b"v2");
+        });
+    }
+
+    #[test]
+    fn setrev_wrong_revision_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"k", b"v").await;
+            let result = s
+                .setrev(
+                    "default",
+                    b"k",
+                    Bytes::from("new"),
+                    SetOptions::default(),
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(result.is_none(), "wrong rev must return None");
+            assert_eq!(get_value(&s, b"k").await.unwrap().as_ref(), b"v");
+        });
+    }
+
+    #[test]
+    fn setrev_missing_key_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            let result = s
+                .setrev(
+                    "default",
+                    b"missing",
+                    Bytes::from("v"),
+                    SetOptions::default(),
+                    1,
+                )
+                .await
+                .unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn delrev_correct_revision_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"k", b"v").await;
+            let rev = s.get("default", b"k").await.unwrap().unwrap().revision;
+            let result = s.delrev("default", b"k", rev).await.unwrap();
+            assert!(result.is_some());
+            assert!(get_value(&s, b"k").await.is_none());
+        });
+    }
+
+    #[test]
+    fn delrev_wrong_revision_preserves_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"k", b"v").await;
+            let result = s.delrev("default", b"k", 0).await.unwrap();
+            assert!(result.is_none());
+            assert!(get_value(&s, b"k").await.is_some());
+        });
+    }
+
+    // --- namespace cap ---
+
+    #[test]
+    fn namespace_cap_at_1024() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            // "default" is created by open_store; add 1023 more to fill the cap.
+            for i in 0..1023usize {
+                let ns = format!("ns{i}");
+                s.set(&ns, b"k", Bytes::from("v"), SetOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let err = s
+                .set("ns_overflow", b"k", Bytes::from("v"), SetOptions::default())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, EngineError::CapacityExceeded { .. }),
+                "expected CapacityExceeded, got {err:?}"
+            );
+        });
+    }
+
+    // --- FLUSHDB + restart ---
+
+    #[test]
+    fn flushdb_then_restart_yields_empty_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            {
+                let s = open_store(&path).await;
+                set(&s, b"key", b"value").await;
+                s.flush_db("default").await.unwrap();
+            }
+            let s2 = open_store(&path).await;
+            assert!(
+                get_value(&s2, b"key").await.is_none(),
+                "flushed data must not survive restart"
+            );
+        });
+    }
+
+    // --- dirty shutdown / CRC truncation ---
+
+    #[test]
+    fn dirty_shutdown_truncates_at_last_good_crc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let active_path = {
+                let s = open_store(&path).await;
+                set(&s, b"survive", b"yes").await;
+                // Drop without seal — simulates crash (no footer written).
+                let nslog = s.get_ns("default").unwrap();
+                let p = nslog.active.borrow().path.clone();
+                p
+            };
+            // Append garbage shorter than HEADER_LEN so replay breaks cleanly.
+            let garbage = vec![0xdeu8; 20];
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)
+                .unwrap()
+                .write_all(&garbage)
+                .unwrap();
+
+            // Reopen — recover must truncate the garbage and preserve the good record.
+            let s2 = open_store(&path).await;
+            assert_eq!(
+                get_value(&s2, b"survive").await.unwrap().as_ref(),
+                b"yes",
+                "clean record before truncation point must survive recovery"
+            );
+        });
+    }
 
     #[test]
     fn glob_basics() {

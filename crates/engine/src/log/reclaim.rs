@@ -125,3 +125,145 @@ pub async fn reclaim_namespace(
     info!(?report, "reclaim complete");
     Ok((report, new_entries))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::log::file::{LogFile, data_filename};
+    use crate::log::index::IndexEntry;
+    use crate::log::record::{self, flags as rflags};
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("monoio runtime")
+            .block_on(f)
+    }
+
+    /// Write a full record into `file`, returning the `IndexEntry` pointing at it.
+    async fn write_record(
+        file: &LogFile,
+        key: &[u8],
+        value: &[u8],
+        tstamp_ms: u64,
+        ttl: Option<u64>,
+    ) -> IndexEntry {
+        let flags = if ttl.is_some() { 0 } else { rflags::NO_EXPIRY };
+        let expires_at_ms = ttl.unwrap_or(0);
+        let mut buf = Vec::new();
+        record::encode_into(&mut buf, tstamp_ms, flags, expires_at_ms, key, value, &[]).unwrap();
+        let record_size = buf.len() as u32;
+        let (offset, _) = file.append(buf).await.unwrap();
+        IndexEntry::new(file.file_id, offset, record_size, tstamp_ms)
+    }
+
+    #[test]
+    fn reclaim_compacts_sealed_files_into_one() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run(async move {
+            let path0 = dir.join(data_filename(0));
+            let file0 = Rc::new(LogFile::open_rw(path0, 0).await.unwrap());
+
+            let e_a = write_record(&file0, b"alpha", b"1", 100, None).await;
+            let e_b = write_record(&file0, b"beta", b"2", 200, None).await;
+
+            let live: Vec<(Bytes, IndexEntry, Option<u64>)> = vec![
+                (Bytes::from("alpha"), e_a, None),
+                (Bytes::from("beta"), e_b, None),
+            ];
+
+            let (report, new_entries) = reclaim_namespace(dir.clone(), &[file0], 1, &live)
+                .await
+                .unwrap();
+
+            assert_eq!(report.live_keys, 2);
+            assert_eq!(report.dead_files_dropped, 1);
+            assert_eq!(report.new_file_id, 1);
+            assert_eq!(new_entries.len(), 2);
+
+            // New file must exist; old file must be gone.
+            assert!(
+                dir.join(data_filename(1)).exists(),
+                "compacted file must exist"
+            );
+            assert!(
+                !dir.join(data_filename(0)).exists(),
+                "old file must be unlinked"
+            );
+        });
+    }
+
+    #[test]
+    fn reclaim_on_empty_live_set_produces_empty_sealed_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run(async move {
+            let path0 = dir.join(data_filename(0));
+            let file0 = Rc::new(LogFile::open_rw(path0, 0).await.unwrap());
+            // Write a record that is no longer live.
+            write_record(&file0, b"stale", b"v", 1, None).await;
+
+            let live: Vec<(Bytes, IndexEntry, Option<u64>)> = vec![];
+            let (report, new_entries) = reclaim_namespace(dir.clone(), &[file0], 1, &live)
+                .await
+                .unwrap();
+
+            assert_eq!(report.live_keys, 0);
+            assert_eq!(new_entries.len(), 0);
+            assert!(dir.join(data_filename(1)).exists());
+        });
+    }
+
+    #[test]
+    fn reclaim_preserves_ttl_in_new_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run(async move {
+            let path0 = dir.join(data_filename(0));
+            let file0 = Rc::new(LogFile::open_rw(path0, 0).await.unwrap());
+            let expires_at = 9_999_999u64;
+            let entry = write_record(&file0, b"ttlkey", b"v", 1, Some(expires_at)).await;
+            let live = vec![(Bytes::from("ttlkey"), entry, Some(expires_at))];
+
+            let (_report, new_entries) = reclaim_namespace(dir, &[file0], 1, &live).await.unwrap();
+
+            assert_eq!(new_entries.len(), 1);
+            assert_eq!(new_entries[0].2, Some(expires_at), "TTL must be preserved");
+        });
+    }
+
+    #[test]
+    fn stale_tmp_is_cleared_before_reclaim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        run(async move {
+            let path0 = dir.join(data_filename(0));
+            let file0 = Rc::new(LogFile::open_rw(path0, 0).await.unwrap());
+            let entry = write_record(&file0, b"k", b"v", 1, None).await;
+
+            // Plant a stale .tmp from a previous interrupted reclaim.
+            let stale_tmp = dir.join(crate::log::file::reclaim_tmp_filename(1));
+            std::fs::write(&stale_tmp, b"garbage").unwrap();
+            assert!(stale_tmp.exists());
+
+            let live = vec![(Bytes::from("k"), entry, None)];
+            // Must succeed despite the stale .tmp.
+            let (report, _) = reclaim_namespace(dir.clone(), &[file0], 1, &live)
+                .await
+                .unwrap();
+            assert_eq!(report.live_keys, 1);
+            assert!(
+                !stale_tmp.exists(),
+                "stale .tmp must be replaced by the real file"
+            );
+            assert!(dir.join(data_filename(1)).exists());
+        });
+    }
+}

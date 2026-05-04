@@ -597,4 +597,42 @@ mod tests {
         let (_, _, got_meta, _) = cache.get(b"k", 0).unwrap();
         assert_eq!(got_meta.as_deref(), Some(&meta));
     }
+
+    // --- remove_by_prefix ---
+
+    #[test]
+    fn remove_by_prefix_removes_matching() {
+        let cache = MemCache::new(4096);
+        cache.insert(b("user:alice"), b("1"), None, None, 0, 0);
+        cache.insert(b("user:bob"), b("2"), None, None, 0, 0);
+        cache.insert(b("session:x"), b("3"), None, None, 0, 0);
+        cache.remove_by_prefix(b"user:");
+        assert!(cache.get(b"user:alice", 0).is_none());
+        assert!(cache.get(b"user:bob", 0).is_none());
+        assert!(cache.get(b"session:x", 0).is_some());
+    }
+
+    #[test]
+    fn remove_by_prefix_empty_prefix_removes_all() {
+        let cache = MemCache::new(4096);
+        cache.insert(b("a"), b("1"), None, None, 0, 0);
+        cache.insert(b("b"), b("2"), None, None, 0, 0);
+        cache.remove_by_prefix(b"");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn remove_by_prefix_no_match_is_noop() {
+        let cache = MemCache::new(4096);
+        cache.insert(b("foo"), b("bar"), None, None, 0, 0);
+        cache.remove_by_prefix(b"zzz");
+        assert!(cache.get(b"foo", 0).is_some());
+    }
+
+    #[test]
+    fn remove_by_prefix_on_empty_cache_is_noop() {
+        let cache = MemCache::new(4096);
+        cache.remove_by_prefix(b"any:");
+        assert!(cache.is_empty());
+    }
 }

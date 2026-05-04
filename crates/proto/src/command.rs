@@ -1233,4 +1233,216 @@ mod tests {
             Err(ProtoError::Syntax { .. })
         ));
     }
+
+    // --- WATCH / PWATCH / UNWATCH ---
+
+    #[test]
+    fn watch_single_key() {
+        let cmd = Command::parse(arr(&[b"WATCH", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::Watch { keys, since: None } if keys.len() == 1));
+    }
+
+    #[test]
+    fn watch_multi_key() {
+        let cmd = Command::parse(arr(&[b"WATCH", b"a", b"b", b"c"])).unwrap();
+        assert!(matches!(cmd, Command::Watch { keys, since: None } if keys.len() == 3));
+    }
+
+    #[test]
+    fn watch_with_since() {
+        let cmd = Command::parse(arr(&[b"WATCH", b"k", b"SINCE", b"42"])).unwrap();
+        match cmd {
+            Command::Watch { since, .. } => assert_eq!(since, Some(42)),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn watch_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"WATCH"])),
+            Err(ProtoError::WrongArity { cmd: "WATCH" })
+        ));
+    }
+
+    #[test]
+    fn pwatch_basic() {
+        let cmd = Command::parse(arr(&[b"PWATCH", b"user:"])).unwrap();
+        assert!(matches!(cmd, Command::PWatch { since: None, .. }));
+    }
+
+    #[test]
+    fn pwatch_with_since() {
+        let cmd = Command::parse(arr(&[b"PWATCH", b"user:", b"SINCE", b"100"])).unwrap();
+        match cmd {
+            Command::PWatch { since, .. } => assert_eq!(since, Some(100)),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pwatch_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"PWATCH"])),
+            Err(ProtoError::WrongArity { cmd: "PWATCH" })
+        ));
+    }
+
+    #[test]
+    fn unwatch_ok() {
+        let cmd = Command::parse(arr(&[b"UNWATCH"])).unwrap();
+        assert!(matches!(cmd, Command::Unwatch));
+    }
+
+    // --- REVISION ---
+
+    #[test]
+    fn revision_ok() {
+        let cmd = Command::parse(arr(&[b"REVISION", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::Revision { key } if key == "mykey"));
+    }
+
+    #[test]
+    fn revision_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"REVISION"])),
+            Err(ProtoError::WrongArity { cmd: "REVISION" })
+        ));
+    }
+
+    // --- SETREV ---
+
+    #[test]
+    fn setrev_basic() {
+        let cmd = Command::parse(arr(&[b"SETREV", b"k", b"v", b"99"])).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::SetRev {
+                revision: 99,
+                ttl: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn setrev_with_ex() {
+        let cmd = Command::parse(arr(&[b"SETREV", b"k", b"v", b"99", b"EX", b"30"])).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::SetRev {
+                revision: 99,
+                ttl: Some(SetTtl::Seconds(30)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn setrev_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"SETREV", b"k", b"v"])),
+            Err(ProtoError::WrongArity { cmd: "SETREV" })
+        ));
+    }
+
+    #[test]
+    fn setrev_invalid_revision() {
+        assert!(matches!(
+            Command::parse(arr(&[b"SETREV", b"k", b"v", b"notanumber"])),
+            Err(ProtoError::InvalidInteger { .. })
+        ));
+    }
+
+    // --- SET REV condition ---
+
+    #[test]
+    fn set_rev_condition() {
+        let cmd = Command::parse(arr(&[b"SET", b"k", b"v", b"REV", b"7"])).unwrap();
+        match cmd {
+            Command::Set { args, .. } => assert_eq!(args.condition, SetCondition::Rev(7)),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // --- KEYS ---
+
+    #[test]
+    fn keys_no_pattern() {
+        let cmd = Command::parse(arr(&[b"KEYS"])).unwrap();
+        assert!(matches!(cmd, Command::Keys { pattern: None }));
+    }
+
+    #[test]
+    fn keys_with_pattern() {
+        let cmd = Command::parse(arr(&[b"KEYS", b"user:*"])).unwrap();
+        match cmd {
+            Command::Keys { pattern: Some(p) } => assert_eq!(p.as_ref(), b"user:*"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // --- GETSET ---
+
+    #[test]
+    fn getset_ok() {
+        let cmd = Command::parse(arr(&[b"GETSET", b"k", b"v"])).unwrap();
+        assert!(matches!(cmd, Command::GetSet { .. }));
+    }
+
+    #[test]
+    fn getset_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"GETSET", b"k"])),
+            Err(ProtoError::WrongArity { cmd: "GETSET" })
+        ));
+    }
+
+    // --- INCR / INCRBY / DECR / DECRBY ---
+
+    #[test]
+    fn incr_ok() {
+        let cmd = Command::parse(arr(&[b"INCR", b"counter"])).unwrap();
+        assert!(matches!(cmd, Command::Incr { .. }));
+    }
+
+    #[test]
+    fn incrby_ok() {
+        let cmd = Command::parse(arr(&[b"INCRBY", b"counter", b"5"])).unwrap();
+        assert!(matches!(cmd, Command::IncrBy { delta: 5, .. }));
+    }
+
+    #[test]
+    fn incrby_negative() {
+        let cmd = Command::parse(arr(&[b"INCRBY", b"counter", b"-3"])).unwrap();
+        assert!(matches!(cmd, Command::IncrBy { delta: -3, .. }));
+    }
+
+    #[test]
+    fn incrby_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"INCRBY", b"counter"])),
+            Err(ProtoError::WrongArity { cmd: "INCRBY" })
+        ));
+    }
+
+    #[test]
+    fn decr_ok() {
+        let cmd = Command::parse(arr(&[b"DECR", b"counter"])).unwrap();
+        assert!(matches!(cmd, Command::Decr { .. }));
+    }
+
+    #[test]
+    fn decrby_ok() {
+        let cmd = Command::parse(arr(&[b"DECRBY", b"counter", b"10"])).unwrap();
+        assert!(matches!(cmd, Command::DecrBy { delta: 10, .. }));
+    }
+
+    #[test]
+    fn decrby_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"DECRBY", b"counter"])),
+            Err(ProtoError::WrongArity { cmd: "DECRBY" })
+        ));
+    }
 }

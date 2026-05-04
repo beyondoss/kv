@@ -991,3 +991,365 @@ fn incr_overflow_returns_error() {
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("overflow") || msg.contains("err"), "{msg}");
 }
+
+// ── REVISION ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn revision_returns_integer_for_existing_key() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("revkey", "hello").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("revkey")
+        .query(&mut con)
+        .unwrap();
+    assert!(
+        rev > 0,
+        "revision should be a positive timestamp-based integer, got {rev}"
+    );
+}
+
+#[test]
+fn revision_returns_neg2_for_missing_key() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("no-such-key")
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(rev, -2);
+}
+
+// ── SETREV ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn setrev_succeeds_with_correct_revision() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("sr-key", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("sr-key")
+        .query(&mut con)
+        .unwrap();
+    assert!(rev > 0);
+    // SETREV with the correct revision returns the new revision.
+    let new_rev: i64 = redis::cmd("SETREV")
+        .arg("sr-key")
+        .arg("v2")
+        .arg(rev)
+        .query(&mut con)
+        .unwrap();
+    assert!(new_rev > rev, "new revision should be greater than old");
+    let val: String = con.get("sr-key").unwrap();
+    assert_eq!(val, "v2");
+}
+
+#[test]
+fn setrev_conflict_on_wrong_revision() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("sr-conflict", "v1").unwrap();
+    // Provide revision 0 which will never match a real revision.
+    let err = redis::cmd("SETREV")
+        .arg("sr-conflict")
+        .arg("v2")
+        .arg(0u64)
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("conflict") || msg.contains("mismatch") || msg.contains("err"),
+        "expected CONFLICT error, got: {msg}"
+    );
+    // Value unchanged.
+    let val: String = con.get("sr-conflict").unwrap();
+    assert_eq!(val, "v1");
+}
+
+#[test]
+fn setrev_conflict_on_missing_key() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    // Key doesn't exist; any revision will mismatch.
+    let err = redis::cmd("SETREV")
+        .arg("sr-missing")
+        .arg("v1")
+        .arg(999u64)
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("conflict") || msg.contains("err"), "{msg}");
+}
+
+// ── SET with REV condition ─────────────────────────────────────────────────────
+
+#[test]
+fn set_with_rev_condition_succeeds() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("srev-ok", "v1").unwrap();
+    let rev: i64 = redis::cmd("REVISION")
+        .arg("srev-ok")
+        .query(&mut con)
+        .unwrap();
+    // SET key value REV revision → new revision on success.
+    let new_rev: i64 = redis::cmd("SET")
+        .arg("srev-ok")
+        .arg("v2")
+        .arg("REV")
+        .arg(rev)
+        .query(&mut con)
+        .unwrap();
+    assert!(new_rev > rev);
+    let val: String = con.get("srev-ok").unwrap();
+    assert_eq!(val, "v2");
+}
+
+#[test]
+fn set_with_rev_condition_conflict_on_stale_revision() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("srev-conflict", "v1").unwrap();
+    let err = redis::cmd("SET")
+        .arg("srev-conflict")
+        .arg("v2")
+        .arg("REV")
+        .arg(0u64)
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("conflict") || msg.contains("err"), "{msg}");
+}
+
+// ── WATCH ─────────────────────────────────────────────────────────────────────
+
+// Minimal RESP3 client for testing push-based protocols.
+struct MinResp3 {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl MinResp3 {
+    fn connect(port: u16) -> Self {
+        let stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let writer = stream.try_clone().unwrap();
+        Self {
+            reader: std::io::BufReader::new(stream),
+            writer,
+        }
+    }
+
+    fn send(&mut self, args: &[&[u8]]) {
+        use std::io::Write as _;
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            buf.extend_from_slice(arg);
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    fn read_line(&mut self) -> String {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        line.trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string()
+    }
+
+    /// Skip one complete RESP value (any type).
+    fn skip_one(&mut self) {
+        use std::io::Read as _;
+        let line = self.read_line();
+        match line.as_bytes().first().copied() {
+            // Simple types — rest of value is on this line.
+            Some(b'+') | Some(b'-') | Some(b':') | Some(b'_') | Some(b',') | Some(b'(') => {}
+            // Bulk string / blob.
+            Some(b'$') | Some(b'=') => {
+                let n: i64 = line[1..].parse().unwrap_or(-1);
+                if n >= 0 {
+                    let mut body = vec![0u8; n as usize + 2];
+                    self.reader.read_exact(&mut body).unwrap();
+                }
+            }
+            // Array / set / push.
+            Some(b'*') | Some(b'~') | Some(b'>') => {
+                let n: usize = line[1..].parse().unwrap_or(0);
+                for _ in 0..n {
+                    self.skip_one();
+                }
+            }
+            // Map / attribute.
+            Some(b'%') | Some(b'|') => {
+                let n: usize = line[1..].parse().unwrap_or(0);
+                for _ in 0..(2 * n) {
+                    self.skip_one();
+                }
+            }
+            _ => {} // unknown type — skip line
+        }
+    }
+
+    /// Read a bulk string. Returns None for null bulk strings.
+    fn read_bulk(&mut self) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let line = self.read_line();
+        if line.starts_with('$') {
+            let n: i64 = line[1..].parse().ok()?;
+            if n < 0 {
+                return None;
+            }
+            let mut data = vec![0u8; n as usize + 2];
+            self.reader.read_exact(&mut data).unwrap();
+            Some(data[..n as usize].to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Read a push frame. Returns (push_type, push_subtype). Skips remaining elements.
+    fn read_push(&mut self) -> (String, String) {
+        let line = self.read_line();
+        assert!(
+            line.starts_with('>'),
+            "expected push frame '>', got: {line:?}"
+        );
+        let n: usize = line[1..].parse().unwrap_or(0);
+        assert!(n >= 2, "push frame must have at least 2 elements");
+        let first = self.read_bulk().unwrap_or_default();
+        let second = self.read_bulk().unwrap_or_default();
+        for _ in 2..n {
+            self.skip_one();
+        }
+        (
+            String::from_utf8_lossy(&first).into_owned(),
+            String::from_utf8_lossy(&second).into_owned(),
+        )
+    }
+}
+
+#[test]
+fn watch_without_resp3_returns_wrongtype_error() {
+    let srv = TestServer::start();
+    let mut con = srv.resp(); // RESP2 — no HELLO 3
+    let err = redis::cmd("WATCH")
+        .arg("anykey")
+        .query::<()>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WRONGTYPE") || msg.contains("WATCH") || msg.contains("RESP3"),
+        "expected WRONGTYPE or WATCH error, got: {msg}"
+    );
+}
+
+#[test]
+fn watch_with_resp3_sends_ready_push() {
+    let srv = TestServer::start();
+    let mut raw = MinResp3::connect(srv.resp_port);
+
+    // Negotiate RESP3.
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one(); // skip the hello map response
+
+    // WATCH a key that doesn't exist.
+    raw.send(&[b"WATCH", b"watch-ready-test"]);
+
+    // Should receive the "watch ready" push with no prior initial events.
+    let (push_type, push_sub) = raw.read_push();
+    assert_eq!(push_type, "watch");
+    assert_eq!(push_sub, "ready");
+}
+
+#[test]
+fn watch_streams_set_event_after_mutation() {
+    let srv = TestServer::start();
+    let mut raw = MinResp3::connect(srv.resp_port);
+
+    // Negotiate RESP3.
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+
+    // Subscribe to a key.
+    raw.send(&[b"WATCH", b"ws-key"]);
+    let (push_type, push_sub) = raw.read_push();
+    assert_eq!(push_type, "watch");
+    assert_eq!(push_sub, "ready");
+
+    // Mutate the key from another connection.
+    let mut con = srv.resp();
+    let _: () = con.set("ws-key", "ws-value").unwrap();
+
+    // Read the event push.
+    let (push_type, push_sub) = raw.read_push();
+    assert_eq!(push_type, "watch");
+    assert_eq!(push_sub, "set", "expected a set event push");
+}
+
+#[test]
+fn watch_initial_state_sent_for_existing_key() {
+    let srv = TestServer::start();
+
+    // First, set a key before subscribing.
+    let mut setup = srv.resp();
+    let _: () = setup.set("wi-key", "wi-value").unwrap();
+
+    let mut raw = MinResp3::connect(srv.resp_port);
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+
+    // WATCH an existing key — should get initial state push first.
+    raw.send(&[b"WATCH", b"wi-key"]);
+
+    // First push is the initial state (set event for existing key).
+    let (first_type, first_sub) = raw.read_push();
+    assert_eq!(first_type, "watch");
+    assert_eq!(
+        first_sub, "set",
+        "expected initial-state push for existing key"
+    );
+
+    // Then the ready push.
+    let (ready_type, ready_sub) = raw.read_push();
+    assert_eq!(ready_type, "watch");
+    assert_eq!(ready_sub, "ready");
+}
+
+#[test]
+fn pwatch_streams_prefix_events() {
+    let srv = TestServer::start();
+    let mut raw = MinResp3::connect(srv.resp_port);
+
+    raw.send(&[b"HELLO", b"3"]);
+    raw.skip_one();
+
+    // PWATCH with a prefix.
+    raw.send(&[b"PWATCH", b"pw:"]);
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(ps, "ready");
+
+    // Set a key matching the prefix.
+    let mut con = srv.resp();
+    let _: () = con.set("pw:alpha", "1").unwrap();
+
+    let (pt, ps) = raw.read_push();
+    assert_eq!(pt, "watch");
+    assert_eq!(ps, "set");
+
+    // Set a key NOT matching the prefix — should not arrive.
+    let _: () = con.set("other:beta", "2").unwrap();
+
+    // Set another matching key to confirm we get events, not the non-matching one.
+    let _: () = con.set("pw:gamma", "3").unwrap();
+
+    let (pt2, ps2) = raw.read_push();
+    assert_eq!(pt2, "watch");
+    assert_eq!(ps2, "set");
+}

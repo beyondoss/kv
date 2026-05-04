@@ -221,4 +221,39 @@ mod tests {
         );
         assert_eq!(percent_decode_routing(b"plain"), b"plain".to_vec());
     }
+
+    #[test]
+    fn peek_resp_key_count_one_returns_none() {
+        // *1\r\n$4\r\nPING\r\n — single-element array has no key argument.
+        let s = pair_with_payload(b"*1\r\n$4\r\nPING\r\n");
+        assert_eq!(peek_resp_key(&s), None);
+    }
+
+    #[test]
+    fn peek_resp_key_non_array_returns_none() {
+        // Inline command (+PING\r\n) is not an array — must return None.
+        let s = pair_with_payload(b"+PING\r\n");
+        assert_eq!(peek_resp_key(&s), None);
+    }
+
+    #[test]
+    fn peek_resp_key_key_beyond_buffer_returns_none() {
+        // Claim a key_len larger than the peeked buffer so key_end > buf.len().
+        // *2\r\n$3\r\nGET\r\n$9999\r\n<only a few bytes>\r\n
+        let s = pair_with_payload(b"*2\r\n$3\r\nGET\r\n$9999\r\nshort\r\n");
+        assert_eq!(peek_resp_key(&s), None);
+    }
+
+    #[test]
+    fn percent_decode_routing_invalid_hex_passes_through() {
+        // %GG is not valid hex — must be emitted verbatim as three bytes.
+        assert_eq!(percent_decode_routing(b"%GG"), b"%GG".to_vec());
+    }
+
+    #[test]
+    fn percent_decode_routing_incomplete_escape_passes_through() {
+        // Trailing % with fewer than two hex digits left — must not panic.
+        assert_eq!(percent_decode_routing(b"end%"), b"end%".to_vec());
+        assert_eq!(percent_decode_routing(b"end%4"), b"end%4".to_vec());
+    }
 }
