@@ -110,6 +110,7 @@ impl TestServer {
                                 http_wakeup_read,
                                 10_000,
                                 std::time::Duration::from_secs(60),
+                                64 * 1024 * 1024,
                             )
                             .await;
                         });
