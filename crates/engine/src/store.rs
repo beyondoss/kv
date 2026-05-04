@@ -8,17 +8,21 @@ use bytes::Bytes;
 use futures_channel::mpsc::Receiver;
 use futures_util::future::join_all;
 use rustc_hash::FxHashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cache::MemCache;
 use crate::error::{EngineError, Result};
 use crate::log::config::LogConfig;
 use crate::log::index::IndexEntry;
-use crate::log::{NamespaceLog, now_ms};
+use crate::log::{NamespaceLog, WriteCondition, now_ms};
 use crate::types::{Entry, GetExOp, ScanPage, SetOptions, TtlResult};
 use crate::watch::{KeyFilter, WatchEvent, WatchRegistry};
 
 pub const DEFAULT_NS: &str = "default";
+
+/// Maximum number of distinct namespaces a single shard will open. Prevents
+/// unbounded NamespaceLog + file-descriptor growth from adversarial namespace names.
+const MAX_NAMESPACES: usize = 1024;
 
 /// Map database index to a namespace name: 0 → "default", n → "db{n}".
 pub fn ns_name(db: u64) -> String {
@@ -62,26 +66,31 @@ impl ShardStore {
         let mut namespaces: FxHashMap<String, Rc<NamespaceLog>> = FxHashMap::default();
 
         // Collect valid namespace subdirectories, then open them concurrently.
-        if let Ok(entries) = std::fs::read_dir(data_dir) {
-            let dirs: Vec<(String, std::path::PathBuf)> = entries
-                .flatten()
-                .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    if is_valid_ns_name(&name) {
-                        Some((name, e.path()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let futures: Vec<_> = dirs
-                .iter()
-                .map(|(_, path)| NamespaceLog::open(path.clone(), config))
-                .collect();
-            let opened = join_all(futures).await;
-            for ((name, _), nslog) in dirs.into_iter().zip(opened) {
-                namespaces.insert(name, Rc::new(nslog?));
+        match std::fs::read_dir(data_dir) {
+            Ok(entries) => {
+                let dirs: Vec<(String, std::path::PathBuf)> = entries
+                    .flatten()
+                    .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if is_valid_ns_name(&name) {
+                            Some((name, e.path()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let futures: Vec<_> = dirs
+                    .iter()
+                    .map(|(_, path)| NamespaceLog::open(path.clone(), config))
+                    .collect();
+                let opened = join_all(futures).await;
+                for ((name, _), nslog) in dirs.into_iter().zip(opened) {
+                    namespaces.insert(name, Rc::new(nslog?));
+                }
+            }
+            Err(e) => {
+                warn!(path = %data_dir.display(), error = %e, "failed to read data directory; existing namespaces will not be loaded");
             }
         }
 
@@ -107,8 +116,16 @@ impl ShardStore {
                 name: ns.to_owned(),
             });
         }
-        if let Some(existing) = self.namespaces.borrow().get(ns).cloned() {
-            return Ok(existing);
+        {
+            let ns_map = self.namespaces.borrow();
+            if let Some(existing) = ns_map.get(ns).cloned() {
+                return Ok(existing);
+            }
+            if ns_map.len() >= MAX_NAMESPACES {
+                return Err(EngineError::CapacityExceeded {
+                    reason: "namespace limit reached",
+                });
+            }
         }
         let dir = self.data_dir.join(ns);
         let nslog = Rc::new(NamespaceLog::open(dir, self.config).await?);
@@ -162,6 +179,38 @@ impl ShardStore {
         Bytes::from(ck)
     }
 
+    fn upsert_cache(
+        &self,
+        ns: &str,
+        key: &[u8],
+        value: Bytes,
+        expires_at_ms: Option<u64>,
+        metadata: Option<Arc<serde_json::Value>>,
+        meta_len: usize,
+        revision: u64,
+    ) {
+        let updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache.try_update(
+                ck,
+                value.clone(),
+                expires_at_ms,
+                metadata.clone(),
+                meta_len,
+                revision,
+            )
+        });
+        if !updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                value,
+                expires_at_ms,
+                metadata,
+                meta_len,
+                revision,
+            );
+        }
+    }
+
     fn instant_from_ms(
         expires_at_ms: Option<u64>,
         now_ms: u64,
@@ -179,9 +228,12 @@ impl ShardStore {
             .map_err(Into::into)
     }
 
-    fn validate_ttl(d: Duration) -> Result<u64> {
-        u64::try_from(d.as_millis()).map_err(|_| EngineError::CapacityExceeded {
+    fn validate_ttl(d: Duration, now: u64) -> Result<u64> {
+        let ms = u64::try_from(d.as_millis()).map_err(|_| EngineError::CapacityExceeded {
             reason: "ttl exceeds u64::MAX milliseconds",
+        })?;
+        now.checked_add(ms).ok_or(EngineError::CapacityExceeded {
+            reason: "ttl would overflow absolute expiry timestamp",
         })
     }
 
@@ -264,17 +316,12 @@ impl ShardStore {
     ) -> Result<bool> {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
-        let live = {
-            let idx = nslog.index.borrow();
-            idx.get(key).is_some() && !idx.is_expired(key, now)
+        let cond = if require_live {
+            WriteCondition::KeyPresent
+        } else {
+            WriteCondition::KeyAbsent
         };
-        if live != require_live {
-            return Ok(false);
-        }
-        let expires_at_ms = opts
-            .ttl
-            .map(|d| Self::validate_ttl(d).map(|ms| now + ms))
-            .transpose()?;
+        let expires_at_ms = opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?;
         let meta_bytes: Vec<u8> = opts
             .metadata
             .as_ref()
@@ -282,30 +329,29 @@ impl ShardStore {
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog
-            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
-            .await?;
-        let revision = nslog.last_revision();
-        let cache_updated = Self::with_cache_key(ns, key, |ck| {
-            self.cache.try_update(
-                ck,
-                value.clone(),
+        if !nslog
+            .put_full_cond(
+                key_bytes.clone(),
+                &value,
+                &meta_bytes,
                 expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
+                cond,
+                now,
             )
-        });
-        if !cache_updated {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                value.clone(),
-                expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
-            );
+            .await?
+        {
+            return Ok(false);
         }
+        let revision = nslog.last_revision();
+        self.upsert_cache(
+            ns,
+            key,
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+            meta_bytes.len(),
+            revision,
+        );
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -346,6 +392,7 @@ impl ShardStore {
         if expires_at_ms.map_or(false, |ms| ms <= now) {
             // Lazy delete on read.
             nslog.tombstone(key).await?;
+            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             return Ok(None);
         }
 
@@ -444,10 +491,8 @@ impl ShardStore {
 
     pub async fn set(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        let expires_at_ms = opts
-            .ttl
-            .map(|d| Self::validate_ttl(d).map(|ms| now_ms() + ms))
-            .transpose()?;
+        let now = now_ms();
+        let expires_at_ms = opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?;
         let meta_bytes: Vec<u8> = opts
             .metadata
             .as_ref()
@@ -459,26 +504,15 @@ impl ShardStore {
             .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
             .await?;
         let revision = nslog.last_revision();
-        let cache_updated = Self::with_cache_key(ns, key, |ck| {
-            self.cache.try_update(
-                ck,
-                value.clone(),
-                expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
-            )
-        });
-        if !cache_updated {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                value.clone(),
-                expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
-            );
-        }
+        self.upsert_cache(
+            ns,
+            key,
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+            meta_bytes.len(),
+            revision,
+        );
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -500,20 +534,7 @@ impl ShardStore {
         nslog.put_many(pairs).await?;
         let revision = nslog.last_revision();
         for (key, value) in pairs {
-            let cache_updated = Self::with_cache_key(ns, key, |ck| {
-                self.cache
-                    .try_update(ck, value.clone(), None, None, 0, revision)
-            });
-            if !cache_updated {
-                self.cache.insert(
-                    Self::cache_key(ns, key),
-                    value.clone(),
-                    None,
-                    None,
-                    0,
-                    revision,
-                );
-            }
+            self.upsert_cache(ns, key, value.clone(), None, None, 0, revision);
         }
         let mut w = self.watchers.borrow_mut();
         for (key, value) in pairs {
@@ -585,6 +606,7 @@ impl ShardStore {
     pub async fn expire(&self, ns: &str, key: &[u8], ttl: Duration) -> Result<bool> {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
+        let now_instant = Instant::now();
         let present_and_live = {
             let idx = nslog.index.borrow();
             idx.get(key).is_some() && !idx.is_expired(key, now)
@@ -594,16 +616,33 @@ impl ShardStore {
             Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             return Ok(false);
         }
-        let new_ms = now + Self::validate_ttl(ttl)?;
+        let new_ms = Self::validate_ttl(ttl, now)?;
+        // Read value before evicting cache — needed for watch notification.
+        let entry = self.get_inline(&nslog, ns, key, now, now_instant).await?;
         nslog.ttl_update(key, Some(new_ms)).await?;
         // L1 carries its own copy of expires_at_ms; refresh on next get.
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+        if let Some(e) = entry {
+            let revision = nslog.last_revision();
+            self.watchers.borrow_mut().notify(
+                ns,
+                key,
+                WatchEvent::Set {
+                    key: Bytes::copy_from_slice(key),
+                    value: e.value,
+                    metadata: e.metadata,
+                    expires_at_ms: Some(new_ms),
+                    revision,
+                },
+            );
+        }
         Ok(true)
     }
 
     pub async fn persist(&self, ns: &str, key: &[u8]) -> Result<bool> {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
+        let now_instant = Instant::now();
         let (present, has_ttl, expired) = {
             let idx = nslog.index.borrow();
             (
@@ -615,8 +654,24 @@ impl ShardStore {
         if !present || !has_ttl || expired {
             return Ok(false);
         }
+        // Read value before evicting cache — needed for watch notification.
+        let entry = self.get_inline(&nslog, ns, key, now, now_instant).await?;
         nslog.ttl_update(key, None).await?;
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+        if let Some(e) = entry {
+            let revision = nslog.last_revision();
+            self.watchers.borrow_mut().notify(
+                ns,
+                key,
+                WatchEvent::Set {
+                    key: Bytes::copy_from_slice(key),
+                    value: e.value,
+                    metadata: e.metadata,
+                    expires_at_ms: None,
+                    revision,
+                },
+            );
+        }
         Ok(true)
     }
 
@@ -678,7 +733,7 @@ impl ShardStore {
         // op.is_some() is guaranteed by the early return at the top of this function.
         match op.expect("op is Some; checked at function entry") {
             GetExOp::SetTtl(ttl) => {
-                let new_ms = now + Self::validate_ttl(ttl)?;
+                let new_ms = Self::validate_ttl(ttl, now)?;
                 nslog.ttl_update(key, Some(new_ms)).await?;
                 Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             }
@@ -711,20 +766,7 @@ impl ShardStore {
         let key_bytes = Bytes::copy_from_slice(key);
         nslog.put_full(key_bytes.clone(), &value, &[], None).await?;
         let revision = nslog.last_revision();
-        let cache_updated = Self::with_cache_key(ns, key, |ck| {
-            self.cache
-                .try_update(ck, value.clone(), None, None, 0, revision)
-        });
-        if !cache_updated {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                value.clone(),
-                None,
-                None,
-                0,
-                revision,
-            );
-        }
+        self.upsert_cache(ns, key, value.clone(), None, None, 0, revision);
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -792,21 +834,7 @@ impl ShardStore {
     ) -> Result<Option<u64>> {
         let nslog = self.ensure_ns(ns).await?;
         let now = now_ms();
-        let current_rev = {
-            let idx = nslog.index.borrow();
-            if idx.is_expired(key, now) {
-                None
-            } else {
-                idx.get(key).map(|e| e.tstamp_ms)
-            }
-        };
-        if current_rev != Some(expected_rev) {
-            return Ok(None);
-        }
-        let expires_at_ms = opts
-            .ttl
-            .map(|d| Self::validate_ttl(d).map(|ms| now + ms))
-            .transpose()?;
+        let expires_at_ms = opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?;
         let meta_bytes: Vec<u8> = opts
             .metadata
             .as_ref()
@@ -814,30 +842,29 @@ impl ShardStore {
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog
-            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
-            .await?;
-        let revision = nslog.last_revision();
-        let cache_updated = Self::with_cache_key(ns, key, |ck| {
-            self.cache.try_update(
-                ck,
-                value.clone(),
+        if !nslog
+            .put_full_cond(
+                key_bytes.clone(),
+                &value,
+                &meta_bytes,
                 expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
+                WriteCondition::Revision(expected_rev),
+                now,
             )
-        });
-        if !cache_updated {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                value.clone(),
-                expires_at_ms,
-                opts.metadata.clone(),
-                meta_bytes.len(),
-                revision,
-            );
+            .await?
+        {
+            return Ok(None);
         }
+        let revision = nslog.last_revision();
+        self.upsert_cache(
+            ns,
+            key,
+            value.clone(),
+            expires_at_ms,
+            opts.metadata.clone(),
+            meta_bytes.len(),
+            revision,
+        );
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -860,92 +887,97 @@ impl ShardStore {
     /// The key's existing TTL is preserved.
     pub async fn incr(&self, ns: &str, key: &[u8], delta: i64) -> Result<i64> {
         let nslog = self.ensure_ns(ns).await?;
-        let now = now_ms();
 
-        // Read current value + TTL. Cache returns expires_at_ms directly; index does too.
-        let (current, expires_at_ms) = if let Some((value, ttl_ms, _meta, _rev)) =
-            Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
-        {
-            (Some(value), ttl_ms)
-        } else {
-            let (idx_entry, ttl_ms) = {
-                let idx = nslog.index.borrow();
-                match idx.get(key) {
-                    None => (None, None),
-                    Some(e) => (Some(*e), idx.ttl(key)),
-                }
-            };
-            match idx_entry {
-                None => (None, None),
-                Some(e) => {
-                    if ttl_ms.map_or(false, |ms| ms <= now) {
-                        nslog.tombstone(key).await?;
-                        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
-                        (None, None)
-                    } else {
-                        let (value, _meta_bytes) = nslog.read_value(e).await?;
-                        (Some(value), ttl_ms)
+        // CAS retry loop: in cooperative single-threaded async the loop body fires at most
+        // twice in practice (the only yield is the disk write inside put_full_cond).
+        for _ in 0..8u8 {
+            let now = now_ms();
+
+            // Read current value + TTL + revision for the CAS condition.
+            let (current, expires_at_ms, cond) = if let Some((value, ttl_ms, _meta, rev)) =
+                Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
+            {
+                (Some(value), ttl_ms, WriteCondition::Revision(rev))
+            } else {
+                let (idx_entry, ttl_ms) = {
+                    let idx = nslog.index.borrow();
+                    match idx.get(key) {
+                        None => (None, None),
+                        Some(e) => {
+                            let entry = *e;
+                            (Some((entry, entry.tstamp_ms)), idx.ttl(key))
+                        }
+                    }
+                };
+                match idx_entry {
+                    None => (None, None, WriteCondition::KeyAbsent),
+                    Some((e, rev)) => {
+                        if ttl_ms.map_or(false, |ms| ms <= now) {
+                            nslog.tombstone(key).await?;
+                            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+                            (None, None, WriteCondition::KeyAbsent)
+                        } else {
+                            let (value, _) = nslog.read_value(e).await?;
+                            (Some(value), ttl_ms, WriteCondition::Revision(rev))
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        let current_int = match current {
-            None => 0i64,
-            Some(v) => std::str::from_utf8(&v)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
+            let current_int = match current {
+                None => 0i64,
+                Some(ref v) => std::str::from_utf8(v)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or(EngineError::InvalidInput {
+                        reason: "value is not an integer or out of range",
+                    })?,
+            };
+
+            let new_val = current_int
+                .checked_add(delta)
                 .ok_or(EngineError::InvalidInput {
-                    reason: "value is not an integer or out of range",
-                })?,
-        };
+                    reason: "increment or decrement would overflow",
+                })?;
 
-        let new_val = current_int
-            .checked_add(delta)
-            .ok_or(EngineError::InvalidInput {
-                reason: "increment or decrement would overflow",
-            })?;
+            let new_bytes = Bytes::from(new_val.to_string());
+            let key_bytes = Bytes::copy_from_slice(key);
 
-        let new_bytes = Bytes::from(new_val.to_string());
-        let key_bytes = Bytes::copy_from_slice(key);
-        nslog
-            .put_full(key_bytes.clone(), &new_bytes, &[], expires_at_ms)
-            .await?;
-        let revision = nslog.last_revision();
+            if !nslog
+                .put_full_cond(key_bytes.clone(), &new_bytes, &[], expires_at_ms, cond, now)
+                .await?
+            {
+                // CAS lost to a concurrent write on this key; re-read and retry.
+                continue;
+            }
 
-        let cache_updated = Self::with_cache_key(ns, key, |ck| {
-            self.cache
-                .try_update(ck, new_bytes.clone(), expires_at_ms, None, 0, revision)
-        });
-        if !cache_updated {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                new_bytes.clone(),
-                expires_at_ms,
-                None,
-                0,
-                revision,
+            let revision = nslog.last_revision();
+            self.upsert_cache(ns, key, new_bytes.clone(), expires_at_ms, None, 0, revision);
+            self.watchers.borrow_mut().notify(
+                ns,
+                key,
+                WatchEvent::Set {
+                    key: key_bytes,
+                    value: new_bytes,
+                    metadata: None,
+                    expires_at_ms,
+                    revision,
+                },
             );
+            return Ok(new_val);
         }
 
-        self.watchers.borrow_mut().notify(
-            ns,
-            key,
-            WatchEvent::Set {
-                key: key_bytes,
-                value: new_bytes,
-                metadata: None,
-                expires_at_ms,
-                revision,
-            },
-        );
-
-        Ok(new_val)
+        Err(EngineError::Conflict {
+            reason: "incr: too many concurrent modifications on the same key",
+        })
     }
 
     /// Subscribe to key or prefix mutations. Returns initial events (current state for
     /// since=0, catch-up log scan for since>0) plus a live receiver. Subscribe BEFORE
     /// scanning to avoid missing live events produced between scan and subscribe.
+    ///
+    /// Note: a write that arrives between the subscribe and the initial scan will appear
+    /// in both `initial` and the live receiver. Callers should deduplicate by revision.
     pub async fn watch_subscribe(
         &self,
         ns: &str,
@@ -1036,7 +1068,10 @@ impl ShardStore {
         let cursor_pos: u64 = if cursor == b"0" {
             0
         } else if cursor.len() == 8 {
-            cursor.try_into().map(u64::from_le_bytes).unwrap_or(0)
+            cursor
+                .try_into()
+                .map(u64::from_le_bytes)
+                .expect("cursor is 8 bytes; checked above")
         } else {
             return Err(EngineError::InvalidInput {
                 reason: "invalid scan cursor",
@@ -1077,12 +1112,44 @@ impl ShardStore {
         prefix.extend_from_slice(ns.as_bytes());
         prefix.push(b'\x00');
         self.cache.remove_by_prefix(&prefix);
+
+        // Snapshot live keys before flush clears the index, so watch subscribers
+        // receive a Del event for every key that just disappeared.
+        let now = now_ms();
+        let revision = nslog.last_revision();
+        let live_keys: Vec<Bytes> = {
+            let idx = nslog.index.borrow();
+            idx.iter()
+                .filter_map(|(k, _)| {
+                    if !idx.is_expired(k, now) {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
         nslog.flush().await?;
+
+        let mut w = self.watchers.borrow_mut();
+        for key in live_keys {
+            w.notify(
+                ns,
+                &key,
+                WatchEvent::Del {
+                    key: key.clone(),
+                    revision,
+                },
+            );
+        }
         Ok(())
     }
 }
 
-/// Minimal glob matching for KEYS/SCAN patterns: `*` (any sequence), `?` (any single char).
+/// Glob matching for KEYS/SCAN patterns: `*` (any sequence), `?` (any single char),
+/// `[abc]` (character class), `[^abc]`/`[!abc]` (negated class), `[a-z]` (range).
+/// A `[` with no closing `]` is treated as a literal byte.
 pub(crate) fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
     let mut pi = 0usize;
     let mut si = 0usize;
@@ -1090,7 +1157,19 @@ pub(crate) fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
     let mut star_si = 0usize;
 
     while si < s.len() {
-        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == s[si]) {
+        if pi < pattern.len() && pattern[pi] == b'[' {
+            let (ok, consumed) = match_bracket(&pattern[pi..], s[si]);
+            if ok {
+                pi += consumed;
+                si += 1;
+            } else if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_si += 1;
+                si = star_si;
+            } else {
+                return false;
+            }
+        } else if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == s[si]) {
             pi += 1;
             si += 1;
         } else if pi < pattern.len() && pattern[pi] == b'*' {
@@ -1109,6 +1188,47 @@ pub(crate) fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+/// Match one character against a `[...]` bracket expression at `bracket[0] == b'['`.
+/// Returns `(matched, bytes_consumed_from_pattern)`.
+/// If there is no closing `]`, treats `[` as a literal byte and returns `(ch == b'[', 1)`.
+fn match_bracket(bracket: &[u8], ch: u8) -> (bool, usize) {
+    debug_assert_eq!(bracket[0], b'[');
+    let mut i = 1;
+    let negate = i < bracket.len() && (bracket[i] == b'^' || bracket[i] == b'!');
+    if negate {
+        i += 1;
+    }
+    let class_start = i;
+    let mut matched = false;
+
+    loop {
+        if i >= bracket.len() {
+            // No closing ']' — treat '[' as a literal byte.
+            return (ch == b'[', 1);
+        }
+        // ']' closes the class unless it's the very first character (allows `[]abc]`
+        // to include a literal `]` in the class).
+        if bracket[i] == b']' && i > class_start {
+            i += 1;
+            break;
+        }
+        // Range: e.g. `a-z`. The `-` must not be followed immediately by `]`.
+        if i + 2 < bracket.len() && bracket[i + 1] == b'-' && bracket[i + 2] != b']' {
+            if ch >= bracket[i] && ch <= bracket[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if ch == bracket[i] {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+
+    (if negate { !matched } else { matched }, i)
 }
 
 #[cfg(test)]
@@ -1808,5 +1928,30 @@ mod tests {
         assert!(glob_match(b"a*b", b"axxb"));
         assert!(glob_match(b"a?c", b"abc"));
         assert!(!glob_match(b"a?c", b"ac"));
+    }
+
+    #[test]
+    fn glob_bracket_class() {
+        assert!(glob_match(b"[abc]", b"a"));
+        assert!(glob_match(b"[abc]", b"b"));
+        assert!(glob_match(b"[abc]", b"c"));
+        assert!(!glob_match(b"[abc]", b"d"));
+        // negated class
+        assert!(!glob_match(b"[^abc]", b"a"));
+        assert!(glob_match(b"[^abc]", b"d"));
+        assert!(!glob_match(b"[!abc]", b"b"));
+        assert!(glob_match(b"[!abc]", b"z"));
+        // range
+        assert!(glob_match(b"[a-z]", b"m"));
+        assert!(!glob_match(b"[a-z]", b"A"));
+        assert!(glob_match(b"[0-9]", b"5"));
+        assert!(!glob_match(b"[0-9]", b"x"));
+        // combined with wildcards — Redis-style pattern
+        assert!(glob_match(b"user:[12]*", b"user:1abc"));
+        assert!(glob_match(b"user:[12]*", b"user:2abc"));
+        assert!(!glob_match(b"user:[12]*", b"user:3abc"));
+        // unclosed '[' treated as literal
+        assert!(glob_match(b"[abc", b"[abc"));
+        assert!(!glob_match(b"[abc", b"a"));
     }
 }

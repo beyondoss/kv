@@ -179,15 +179,15 @@ Beyond sustains **~30% more throughput** than Redis at saturation. Below saturat
 80% MGET / 20% MSET · 500k distinct keys · 256-byte values · 64 connections · 512 MiB memory\
 Multi-key commands spanning shards are handled transparently by the server; the client sends standard MGET/MSET.
 
-| Target rate        |   Beyond calls/s |  Beyond keys/s | Beyond svc p99 |    Redis calls/s |     Redis keys/s | Redis svc p99 |
-| ------------------ | ---------------: | -------------: | -------------: | ---------------: | ---------------: | ------------: |
-| 3k calls/s         |           ~3,006 |          ~300k |       5,563 µs |           ~3,006 |            ~300k |      2,363 µs |
-| 6k calls/s         |           ~6,011 |          ~600k |      11,007 µs |           ~6,011 |            ~600k |      7,627 µs |
-| 10k calls/s        |           ~9,989 |          ~999k |      26,351 µs |           ~9,979 |            ~999k |      9,303 µs |
-| 15k calls/s        |          ~14,974 |          ~1.5M |      14,711 µs |          ~11,326 |            ~1.1M |     saturated |
-| **peak sustained** | **>20k calls/s** | **>2M keys/s** |       7,011 µs | **~11k calls/s** | **~1.1M keys/s** |     10,071 µs |
+| Target rate        |      Beyond calls/s |     Beyond keys/s | Beyond svc p99 |       Redis calls/s |      Redis keys/s | Redis svc p99 |
+| ------------------ | ------------------: | ----------------: | -------------: | ------------------: | ----------------: | ------------: |
+| 3k calls/s         |              ~2,962 |             ~296k |       3,201 µs |              ~2,962 |             ~296k |      2,041 µs |
+| 6k calls/s         |              ~5,927 |             ~593k |       3,255 µs |              ~5,927 |             ~593k |      2,801 µs |
+| 10k calls/s        |              ~9,911 |             ~991k |       2,361 µs |              ~9,910 |             ~991k |      3,229 µs |
+| 15k calls/s        |             ~14,913 |             ~1.5M |       2,157 µs |             ~14,870 |             ~1.5M |      4,219 µs |
+| **peak sustained** | **~19,680 calls/s** | **~1.97M keys/s** |       2,031 µs | **~18,143 calls/s** | **~1.81M keys/s** |      3,961 µs |
 
-With 4 shards Beyond sustains **nearly 2× the throughput** of single-threaded Redis. Cross-shard fan-out adds ~3–10ms p99 overhead at light load (inter-thread IPC per call); this overhead disappears when batch keys are co-located on one shard (e.g. user-partitioned keyspaces).
+Beyond's p99 service latency **stays flat at ~2ms** from 3k to 20k calls/s while Redis climbs from 2ms to 4ms. At peak, Beyond delivers 19,680 calls/s vs Redis's 18,143 — and response p99 (what applications observe) is **263ms vs 1,153ms**, a 4× difference driven by Redis's write tail under load.
 
 ---
 

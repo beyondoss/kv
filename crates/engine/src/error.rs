@@ -24,6 +24,8 @@ pub enum EngineError {
     CapacityExceeded { reason: &'static str },
     #[error("invalid input: {reason}")]
     InvalidInput { reason: &'static str },
+    #[error("conflict: {reason}")]
+    Conflict { reason: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

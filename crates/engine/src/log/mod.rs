@@ -50,6 +50,26 @@ pub fn now_ms() -> u64 {
     }
 }
 
+/// Condition for a conditional write. Used by [`NamespaceLog::put_full_cond`].
+pub enum WriteCondition {
+    /// Write only if the key is absent or expired (SETNX semantics).
+    KeyAbsent,
+    /// Write only if the key is present and live (SETXX semantics).
+    KeyPresent,
+    /// Write only if the key's current revision matches exactly (CAS semantics).
+    Revision(u64),
+}
+
+impl WriteCondition {
+    fn check(&self, current_rev: Option<u64>) -> bool {
+        match self {
+            WriteCondition::KeyAbsent => current_rev.is_none(),
+            WriteCondition::KeyPresent => current_rev.is_some(),
+            WriteCondition::Revision(rev) => current_rev == Some(*rev),
+        }
+    }
+}
+
 pub struct NamespaceLog {
     pub dir: PathBuf,
     pub index: RefCell<NsIndex>,
@@ -152,6 +172,67 @@ impl NamespaceLog {
             self.rotate_active().await?;
         }
         Ok(())
+    }
+
+    /// Conditional write: write only if the current live state of `key` satisfies `cond`.
+    ///
+    /// Returns `Ok(true)` if written and indexed, `Ok(false)` if the condition was not
+    /// met. A concurrent write that lands during the disk-I/O await is detected by a
+    /// post-write re-check before the index is updated; if the race is lost the
+    /// on-disk record becomes an unreferenced orphan reclaimed during next compaction.
+    pub async fn put_full_cond(
+        &self,
+        key: Bytes,
+        value: &[u8],
+        metadata: &[u8],
+        expires_at_ms: Option<u64>,
+        cond: WriteCondition,
+        now: u64,
+    ) -> Result<bool> {
+        if self.reclaim_in_progress.get() {
+            return Err(EngineError::ReclamationBusy);
+        }
+        // Pre-check: verify condition before incurring disk I/O.
+        if !cond.check(Self::live_rev(&self.index.borrow(), &key, now)) {
+            return Ok(false);
+        }
+        let tstamp = self.next_tstamp();
+        let mut flags = 0u8;
+        let exp = match expires_at_ms {
+            Some(ms) => ms,
+            None => {
+                flags |= rflags::NO_EXPIRY;
+                0
+            }
+        };
+        let mut buf = pool_acquire_write(HEADER_LEN + key.len() + value.len() + metadata.len());
+        record::encode_into(&mut buf, tstamp, flags, exp, &key, value, metadata)?;
+        let record_size = buf.len() as u32;
+        let active = self.active();
+        let (offset, buf) = active.append(buf).await?;
+        pool_release_write(buf);
+        self.unsynced_bytes
+            .set(self.unsynced_bytes.get() + record_size as u64);
+        // Post-check: re-verify before committing to the index. Another task that
+        // modified the same key during the disk-I/O await will have already updated
+        // the index; if that breaks our condition, abort without touching the index.
+        if !cond.check(Self::live_rev(&self.index.borrow(), &key, now)) {
+            return Ok(false);
+        }
+        let entry = IndexEntry::new(active.file_id, offset, record_size, tstamp);
+        self.index.borrow_mut().insert(key, entry, expires_at_ms);
+        if active.write_offset() >= self.config.rotate_threshold {
+            self.rotate_active().await?;
+        }
+        Ok(true)
+    }
+
+    fn live_rev(idx: &NsIndex, key: &[u8], now: u64) -> Option<u64> {
+        if idx.is_expired(key, now) {
+            None
+        } else {
+            idx.get(key).map(|e| e.tstamp_ms)
+        }
     }
 
     /// Coalesce many puts into a single `write_at` + single `fsync`.
