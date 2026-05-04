@@ -89,3 +89,26 @@ export interface KvWatchOptions {
   /** Cancellation signal. */
   signal?: AbortSignal;
 }
+
+export interface KvDeleteOptions {
+  /**
+   * Compare-and-delete: only delete if the stored revision matches this value.
+   * Throws `KvError` (409) on mismatch. HTTP backend only.
+   */
+  ifMatch?: number;
+}
+
+export type KvBatchOp =
+  | { op: "get"; key: string }
+  | { op: "set"; key: string; value: string | Uint8Array; opts?: KvSetOptions }
+  | { op: "delete"; key: string; opts?: KvDeleteOptions }
+  | { op: "incr"; key: string; delta?: number };
+
+type KvBatchOpResult<T extends KvBatchOp> = T extends { op: "get" }
+  ? KvEntry | null
+  : T extends { op: "incr" } ? number
+  : void;
+
+export type KvBatchResults<T extends readonly KvBatchOp[]> = {
+  [K in keyof T]: T[K] extends KvBatchOp ? KvBatchOpResult<T[K]> : never;
+};

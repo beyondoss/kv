@@ -152,7 +152,7 @@ async fn route(
                 return match *method {
                     http::Method::GET => handle_get(ns, &key, store).await,
                     http::Method::PUT => handle_put(ns, &key, body, parts, store).await,
-                    http::Method::DELETE => handle_delete(ns, &key, store).await,
+                    http::Method::DELETE => handle_delete(ns, &key, parts, store).await,
                     _ => method_not_allowed(),
                 };
             }
@@ -270,7 +270,29 @@ async fn handle_put(
     }
 }
 
-async fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+async fn handle_delete(
+    ns: &str,
+    key: &[u8],
+    parts: &http::request::Parts,
+    store: &ShardStore,
+) -> http::Response<HttpBody> {
+    let if_match: Option<u64> = parts
+        .headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    if let Some(expected_rev) = if_match {
+        return match store.delrev(ns, key, expected_rev).await {
+            Ok(Some(())) => no_content(),
+            Ok(None) => json_response(
+                409,
+                &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
+            ),
+            Err(e) => internal_error(&e.to_string()),
+        };
+    }
+
     match store.del(ns, &[key]).await {
         Ok(_) => no_content(),
         Err(e) => internal_error(&e.to_string()),

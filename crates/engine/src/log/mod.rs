@@ -300,6 +300,31 @@ impl NamespaceLog {
         Ok(true)
     }
 
+    /// Conditional tombstone: delete only if the current revision matches `expected_rev`.
+    /// Returns `Ok(true)` if tombstoned, `Ok(false)` if revision did not match.
+    /// Atomic: the index removal is synchronous (no yield between check and removal).
+    pub async fn tombstone_cond(&self, key: &[u8], expected_rev: u64, now: u64) -> Result<bool> {
+        if self.reclaim_in_progress.get() {
+            return Err(EngineError::ReclamationBusy);
+        }
+        // Both check and removal happen without yielding — no interleaving possible.
+        let current_rev = Self::live_rev(&self.index.borrow(), key, now);
+        if current_rev != Some(expected_rev) {
+            return Ok(false);
+        }
+        self.index.borrow_mut().remove(key);
+        // Disk write (yields, but index already updated)
+        let tstamp = self.next_tstamp();
+        let mut buf = pool_acquire_write(HEADER_LEN + key.len());
+        record::encode_into(&mut buf, tstamp, rflags::TOMBSTONE, 0, key, &[], &[])?;
+        let active = self.active();
+        let buf_len = buf.len() as u64;
+        let (_, buf) = active.append(buf).await?;
+        pool_release_write(buf);
+        self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
+        Ok(true)
+    }
+
     /// Append a TTL-update record; modify only the sidecar.
     pub async fn ttl_update(&self, key: &[u8], expires_at_ms: Option<u64>) -> Result<()> {
         if self.reclaim_in_progress.get() {

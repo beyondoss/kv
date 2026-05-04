@@ -879,6 +879,27 @@ impl ShardStore {
         Ok(Some(revision))
     }
 
+    /// Compare-and-delete: delete only if the current revision matches `expected_rev`.
+    /// Returns `Some(())` if deleted, `None` if revision mismatch, `Err` on I/O failure.
+    pub async fn delrev(&self, ns: &str, key: &[u8], expected_rev: u64) -> Result<Option<()>> {
+        let now = now_ms();
+        let nslog = self.ensure_ns(ns).await?;
+        if !nslog.tombstone_cond(key, expected_rev, now).await? {
+            return Ok(None);
+        }
+        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+        let revision = nslog.last_revision();
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Del {
+                key: Bytes::copy_from_slice(key),
+                revision,
+            },
+        );
+        Ok(Some(()))
+    }
+
     /// Atomically increment or decrement an integer counter stored at `key` by `delta`.
     ///
     /// Missing keys are treated as 0. Returns the new value.

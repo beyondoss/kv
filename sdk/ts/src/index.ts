@@ -7,6 +7,9 @@ export {
 } from "./client.js";
 export { KvError, KvNotFoundError } from "./errors.js";
 export type {
+  KvBatchOp,
+  KvBatchResults,
+  KvDeleteOptions,
   KvEntry,
   KvListKey,
   KvListOptions,

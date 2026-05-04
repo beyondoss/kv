@@ -1,6 +1,9 @@
 import type { KvClient, KvClientOptions } from "./client.js";
 import { KvError, KvNotFoundError } from "./errors.js";
 import type {
+  KvBatchOp,
+  KvBatchResults,
+  KvDeleteOptions,
   KvEntry,
   KvListOptions,
   KvListResult,
@@ -132,6 +135,26 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
     if (!res.ok) throw await parseError(res);
   }
 
+  async function incr(key: string, delta: number = 1): Promise<number> {
+    const url = delta === 1
+      ? `${valueUrl(key)}/incr`
+      : `${valueUrl(key)}/incr?delta=${delta}`;
+    const res = await request("INCR", 1, url, { method: "POST" });
+    if (!res.ok) throw await parseError(res);
+    const body = (await res.json()) as { value: number };
+    return body.value;
+  }
+
+  async function deleteOp(key: string, opts?: KvDeleteOptions): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (opts?.ifMatch != null) headers["if-match"] = String(opts.ifMatch);
+    const res = await request("DEL", 1, valueUrl(key), {
+      method: "DELETE",
+      headers,
+    });
+    if (!res.ok) throw await parseError(res);
+  }
+
   return {
     get,
 
@@ -142,21 +165,9 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
     },
 
     set,
+    incr,
 
-    async incr(key: string, delta: number = 1): Promise<number> {
-      const url = delta === 1
-        ? `${valueUrl(key)}/incr`
-        : `${valueUrl(key)}/incr?delta=${delta}`;
-      const res = await request("INCR", 1, url, { method: "POST" });
-      if (!res.ok) throw await parseError(res);
-      const body = (await res.json()) as { value: number };
-      return body.value;
-    },
-
-    async delete(key: string): Promise<void> {
-      const res = await request("DEL", 1, valueUrl(key), { method: "DELETE" });
-      if (!res.ok) throw await parseError(res);
-    },
+    delete: deleteOp,
 
     async list(listOpts?: KvListOptions): Promise<KvListResult> {
       const res = await request("SCAN", 1, keysUrl(listOpts), {});
@@ -174,6 +185,21 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
       await Promise.all(
         entries.map(({ key, value, opts }) => set(key, value, opts)),
       );
+    },
+
+    async batch<T extends readonly KvBatchOp[]>(
+      ops: T,
+    ): Promise<KvBatchResults<T>> {
+      if (ops.length === 0) return [] as unknown as KvBatchResults<T>;
+      const results = await Promise.all(
+        ops.map((op) => {
+          if (op.op === "get") return get(op.key);
+          if (op.op === "set") return set(op.key, op.value, op.opts);
+          if (op.op === "delete") return deleteOp(op.key, op.opts);
+          return incr(op.key, op.delta ?? 1);
+        }),
+      );
+      return results as unknown as KvBatchResults<T>;
     },
 
     close(): Promise<void> {

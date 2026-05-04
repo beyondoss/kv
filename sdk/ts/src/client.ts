@@ -1,6 +1,9 @@
 import { createHttpKvClient } from "./http.js";
 import { createRespKvClient } from "./resp.js";
 import type {
+  KvBatchOp,
+  KvBatchResults,
+  KvDeleteOptions,
   KvEntry,
   KvListOptions,
   KvListResult,
@@ -31,7 +34,7 @@ export interface KvClient {
     value: string | Uint8Array,
     opts?: KvSetOptions,
   ): Promise<void>;
-  delete(key: string): Promise<void>;
+  delete(key: string, opts?: KvDeleteOptions): Promise<void>;
   list(opts?: KvListOptions): Promise<KvListResult>;
   /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: parallel requests. */
   mget(keys: string[]): Promise<(KvEntry | null)[]>;
@@ -44,13 +47,19 @@ export interface KvClient {
    */
   incr(key: string, delta?: number): Promise<number>;
   /**
+   * Execute multiple operations in one round-trip.
+   * RESP backend: commands are pipelined. HTTP backend: requests run in parallel.
+   * Results are returned in the same order as `ops`.
+   */
+  batch<T extends readonly KvBatchOp[]>(ops: T): Promise<KvBatchResults<T>>;
+  /**
    * Subscribe to changes on a key or prefix.
    *
    * Yields `"ready"` once the initial state has been delivered, then streams
    * `"set"` / `"del"` events as mutations arrive. Pass `since` to resume a
    * previous stream from a known revision (catches up on any missed mutations).
    *
-   * HTTP backend only — RESP backend throws immediately.
+   * Supported on both RESP and HTTP backends.
    */
   watch(key: string, opts?: KvWatchOptions): AsyncGenerator<KvWatchEvent>;
   /** Release underlying connections. Call when the client is no longer needed. */

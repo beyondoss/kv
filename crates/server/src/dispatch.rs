@@ -82,7 +82,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
                 SetCondition::Rev(expected) => {
                     match store.setrev(&state.ns, &key, value, opts, expected).await {
                         Ok(Some(new_rev)) => r::integer(new_rev as i64),
-                        Ok(None) => r::nil(),
+                        Ok(None) => r::error("CONFLICT", "revision mismatch"),
                         Err(e) => r::error("ERR", &e.to_string()),
                     }
                 }
@@ -314,7 +314,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             let opts = set_opts_from_args(&ttl);
             match store.setrev(&state.ns, &key, value, opts, revision).await {
                 Ok(Some(new_rev)) => r::integer(new_rev as i64),
-                Ok(None) => r::nil(),
+                Ok(None) => r::error("CONFLICT", "revision mismatch"),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }

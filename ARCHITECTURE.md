@@ -233,7 +233,7 @@ A connection is pinned to one shard, but multi-key commands (MGET, MSET, DEL, EX
 - The dispatcher (`crates/server/src/dispatch.rs`) buckets keys by `shard_for_key`. The local subset runs against the pinned shard's `ShardStore`; foreign subsets are sent over the channel. Results are reassembled by original key index for MGET (which must preserve order); DEL/EXISTS reduce to a count on the receiving shard so only the count crosses the channel.
 - Fast path: when `n_shards == 1` or every key already hashes to the connection's shard, dispatch skips bucketing and calls the local store directly.
 
-**MSET is not atomic across shards.** A single-shard MSET still uses one fsynced write (atomic), but a cross-shard MSET applies each shard's subset independently — a crash between sub-replies leaves some keys written and others not. This matches Redis Cluster's MSET semantics. If you need cross-shard atomicity, partition writes by key prefix so all keys in one MSET hash to the same shard.
+**MSET is not atomic across shards.** A single-shard MSET still uses one fsynced write (atomic), but a cross-shard MSET applies each shard's subset independently — a crash between sub-replies leaves some keys written and others not. This matches Redis Cluster's MSET semantics.
 
 ### SCAN Glob Matching
 
@@ -381,7 +381,7 @@ Redis protocol defines SCAN to return "0" when iteration is complete. Reusing "0
 
 Redis MSET is documented as atomic. Within a single shard this implementation builds one buffer containing every record, calls `write_at(buf, base_offset)` and `fsync()` once, then bulk-updates the index — all keys land or none do. The L1 cache is populated after the disk fsync; in the narrow window between the two, a cache miss correctly falls back to disk and sees all keys.
 
-Across shards (when MSET keys span shard boundaries), atomicity is **not** preserved: each shard's subset commits independently, matching Redis Cluster's semantics. If you need cross-shard atomicity, key your batch so all entries hash to the same shard.
+Across shards (when MSET keys span shard boundaries), atomicity is **not** preserved: each shard's subset commits independently, matching Redis Cluster's semantics.
 
 ## Configuration
 

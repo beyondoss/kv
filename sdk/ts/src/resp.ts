@@ -4,6 +4,9 @@ import * as net from "node:net";
 import type { KvClient, KvClientOptions } from "./client.js";
 import { KvError, KvNotFoundError } from "./errors.js";
 import type {
+  KvBatchOp,
+  KvBatchResults,
+  KvDeleteOptions,
   KvEntry,
   KvListOptions,
   KvListResult,
@@ -88,9 +91,13 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         if (ttl != null) {
           args.push("EX", String(ttl));
         }
-        const result = await (redis as any).setrev(...args);
-        if (result === null) {
-          throw new KvError("conflict", "revision mismatch", 409);
+        try {
+          await (redis as any).setrev(...args);
+        } catch (e: unknown) {
+          if (isConflictError(e)) {
+            throw new KvError("conflict", "revision mismatch", 409);
+          }
+          throw e;
         }
         return;
       }
@@ -132,7 +139,7 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
       return track("INCR", 1, () => redis.incrby(key, delta));
     },
 
-    async delete(key: string): Promise<void> {
+    async delete(key: string, _opts?: KvDeleteOptions): Promise<void> {
       return track("DEL", 1, () => redis.del(key).then(() => undefined));
     },
 
@@ -226,6 +233,96 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
       });
     },
 
+    async batch<T extends readonly KvBatchOp[]>(
+      ops: T,
+    ): Promise<KvBatchResults<T>> {
+      if (ops.length === 0) return [] as unknown as KvBatchResults<T>;
+      return track("BATCH", ops.length, async () => {
+        const pipeline = redis.pipeline();
+        // Track how many pipeline slots each op occupies (get = 3, others = 1).
+        const offsets: number[] = [];
+        let offset = 0;
+        for (const op of ops) {
+          offsets.push(offset);
+          if (op.op === "get") {
+            pipeline.getBuffer(op.key);
+            (pipeline as any).revision(op.key);
+            pipeline.ttl(op.key);
+            offset += 3;
+          } else if (op.op === "set") {
+            const buf = op.value instanceof Uint8Array
+              ? Buffer.from(op.value)
+              : Buffer.from(op.value);
+            if (op.opts?.ifMatch != null) {
+              const args: (string | Buffer)[] = [
+                op.key,
+                buf,
+                String(op.opts.ifMatch),
+              ];
+              if (op.opts.ttl != null) args.push("EX", String(op.opts.ttl));
+              (pipeline as any).setrev(...args);
+            } else if (op.opts?.ttl != null && op.opts.nx) {
+              pipeline.set(op.key, buf, "EX", op.opts.ttl, "NX");
+            } else if (op.opts?.ttl != null && op.opts.xx) {
+              pipeline.set(op.key, buf, "EX", op.opts.ttl, "XX");
+            } else if (op.opts?.ttl != null) {
+              pipeline.set(op.key, buf, "EX", op.opts.ttl);
+            } else if (op.opts?.nx) {
+              pipeline.set(op.key, buf, "NX");
+            } else if (op.opts?.xx) {
+              pipeline.set(op.key, buf, "XX");
+            } else {
+              pipeline.set(op.key, buf);
+            }
+            offset += 1;
+          } else if (op.op === "delete") {
+            pipeline.del(op.key);
+            offset += 1;
+          } else {
+            pipeline.incrby(op.key, (op as any).delta ?? 1);
+            offset += 1;
+          }
+        }
+
+        const results = await pipeline.exec() as Array<[Error | null, unknown]>;
+
+        return ops.map((op, i) => {
+          const off = offsets[i]!;
+          if (op.op === "get") {
+            const valueBuf = results[off]![1] as Buffer | null;
+            if (valueBuf === null) return null;
+            const revision = results[off + 1]![1] as number;
+            const ttlSecs = results[off + 2]![1] as number;
+            const entry: KvEntry = {
+              value: new Uint8Array(valueBuf),
+              revision: revision > 0 ? revision : 0,
+            };
+            if (ttlSecs >= 0) entry.ttl = ttlSecs;
+            return entry;
+          } else if (op.op === "set") {
+            const [err] = results[off]!;
+            if (err) {
+              if (isConflictError(err)) {
+                throw new KvError("conflict", "revision mismatch", 409);
+              }
+              if (op.opts?.nx) {
+                throw new KvError("conflict", "key already exists", 409);
+              }
+              if (op.opts?.xx) {
+                throw new KvError("conflict", "key does not exist", 409);
+              }
+              throw err;
+            }
+          } else if (op.op === "incr") {
+            const [err, n] = results[off]!;
+            if (err) throw err;
+            return n as number;
+          }
+          return undefined; // delete / set with no return value
+        }) as unknown as KvBatchResults<T>;
+      });
+    },
+
     async *watch(
       key: string,
       watchOpts?: KvWatchOptions,
@@ -284,6 +381,10 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
       return redis.quit().then(() => undefined);
     },
   };
+}
+
+function isConflictError(e: unknown): boolean {
+  return e instanceof Error && e.message.startsWith("CONFLICT");
 }
 
 // ── RESP3 watch internals ───────────────────────────────────────────────────
