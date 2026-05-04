@@ -22,7 +22,9 @@ pub fn error(kind: &str, msg: &str) -> Value {
 }
 
 pub fn err_wrong_type() -> Value {
-    error("WRONGTYPE", "Operation against a key holding the wrong kind of value")
+    Value::SimpleError(Bytes::from_static(
+        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+    ))
 }
 
 pub fn array(items: Vec<Value>) -> Value {

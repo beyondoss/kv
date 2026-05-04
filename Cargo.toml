@@ -13,14 +13,14 @@ beyond-kv-engine = { path = "crates/engine" }
 beyond-kv-proto = { path = "crates/proto" }
 
 bytes = "1.11"
+crc-fast = "1.10"
+futures-util = "0.3"
 http = "1.0"
-dashmap = "6.1"
 mimalloc = { version = "0.1", features = ["v2"] }
 monoio = { version = "0.2", features = ["io-uring"] }
 monoio-codec = "0.3"
 monoio-http = "0.3"
-postcard = { version = "1.1", features = ["alloc"] }
-rocksdb = "0.24"
+rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"

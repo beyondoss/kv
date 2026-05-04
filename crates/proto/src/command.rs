@@ -64,6 +64,7 @@ pub enum Command {
     Select { db: u64 },
     DbSize,
     FlushDb,
+    BgRewriteAof,
     Quit,
     Reset,
 }
@@ -248,8 +249,10 @@ impl Command {
             b"GETEX" => parse_getex(&args),
             b"HELLO" => {
                 let version = if args.len() >= 2 {
-                    let v = parse_u64(&args[1])?;
                     let raw = bulk(&args[1])?;
+                    let v: u64 = std::str::from_utf8(&raw).ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                     let ver = u8::try_from(v)
                         .map_err(|_| ProtoError::InvalidInteger { raw })?;
                     Some(ver)
@@ -267,12 +270,10 @@ impl Command {
                     return Err(ProtoError::WrongArity { cmd: "SELECT" });
                 }
                 let db = parse_u64(&args[1])?;
-                if db > 15 {
-                    return Err(ProtoError::DbIndexOutOfRange);
-                }
                 Ok(Command::Select { db })
             }
             b"DBSIZE" => Ok(Command::DbSize),
+            b"BGREWRITEAOF" => Ok(Command::BgRewriteAof),
             b"FLUSHDB" => {
                 if args.len() != 1 {
                     return Err(ProtoError::WrongArity { cmd: "FLUSHDB" });
@@ -312,15 +313,19 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             b"EX" => {
                 i += 1;
                 if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
-                let v = parse_u64(&args[i])?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw: bulk(&args[i])? }); }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
                 ttl = Some(SetTtl::Seconds(v));
             }
             b"PX" => {
                 i += 1;
                 if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "SET" }); }
-                let v = parse_u64(&args[i])?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw: bulk(&args[i])? }); }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
                 ttl = Some(SetTtl::Millis(v));
             }
             b"EXAT" => {
@@ -365,15 +370,19 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             b"EX" => {
                 i += 1;
                 if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
-                let v = parse_u64(&args[i])?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw: bulk(&args[i])? }); }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
                 ttl = Some(GetExTtl::Set(SetTtl::Seconds(v)));
             }
             b"PX" => {
                 i += 1;
                 if i >= args.len() { return Err(ProtoError::WrongArity { cmd: "GETEX" }); }
-                let v = parse_u64(&args[i])?;
-                if v == 0 { return Err(ProtoError::InvalidExpiry { raw: bulk(&args[i])? }); }
+                let raw = bulk(&args[i])?;
+                let v: u64 = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
+                if v == 0 { return Err(ProtoError::InvalidExpiry { raw }); }
                 ttl = Some(GetExTtl::Set(SetTtl::Millis(v)));
             }
             b"EXAT" => {
@@ -715,11 +724,11 @@ mod tests {
     }
 
     #[test]
-    fn select_out_of_range() {
-        assert!(matches!(
-            Command::parse(arr(&[b"SELECT", b"16"])),
-            Err(ProtoError::DbIndexOutOfRange)
-        ));
+    fn select_large_db_ok() {
+        let cmd = Command::parse(arr(&[b"SELECT", b"16"])).unwrap();
+        assert!(matches!(cmd, Command::Select { db: 16 }));
+        let cmd = Command::parse(arr(&[b"SELECT", b"999"])).unwrap();
+        assert!(matches!(cmd, Command::Select { db: 999 }));
     }
 
     #[test]

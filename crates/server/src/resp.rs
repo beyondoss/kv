@@ -13,14 +13,14 @@ use monoio_codec::Framed;
 use crate::dispatch::dispatch;
 
 pub struct ConnState {
-    pub ns: &'static str,
+    pub ns: String,
     pub resp_version: u8,
     pub quit: bool,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self { ns: DEFAULT_NS, resp_version: 2, quit: false }
+        Self { ns: DEFAULT_NS.to_string(), resp_version: 2, quit: false }
     }
 }
 

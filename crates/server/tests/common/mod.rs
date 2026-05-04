@@ -6,20 +6,26 @@ use tempfile::TempDir;
 
 fn wait_for_port(port: u16) {
     let addr = format!("127.0.0.1:{port}");
-    for _ in 0..500 {
+    for _ in 0..2000 {
         if std::net::TcpStream::connect(&addr).is_ok() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    panic!("port {port} never became ready (server thread may have crashed)");
+    panic!("port {port} never became ready after 10 s (server thread may have crashed)");
 }
+
+// Serialise all TestServer instances so the HTTP integration tests don't
+// exhaust macOS's ephemeral port range when running concurrently.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A single-shard KV server running on two ephemeral ports.
 ///
 /// Both the HTTP and RESP listeners are live by the time `start()` returns.
 /// RocksDB data lives in a [`TempDir`] that is removed on drop.
 pub struct TestServer {
+    // Holds the serial lock for the duration of the test; released on drop.
+    _serial: std::sync::MutexGuard<'static, ()>,
     _tmp: TempDir,
     pub http_port: u16,
     pub resp_port: u16,
@@ -27,6 +33,8 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn start() -> Self {
+        // Acquire before binding ports so only one server is live at a time.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_owned();
 
@@ -84,14 +92,16 @@ impl TestServer {
         std::thread::Builder::new()
             .name(format!("kv-test-{http_port}"))
             .spawn(move || {
-                let store = Rc::new(
-                    ShardStore::open(&data_dir, 32 << 20).expect("ShardStore::open"),
-                );
                 monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                     .enable_timer()
                     .build()
                     .expect("monoio runtime")
                     .block_on(async move {
+                        let store = Rc::new(
+                            ShardStore::open(&data_dir, 32 << 20)
+                                .await
+                                .expect("ShardStore::open"),
+                        );
                         let http_store = store.clone();
                         monoio::spawn(async move {
                             beyond_kv::http::serve_routed(
@@ -109,7 +119,7 @@ impl TestServer {
         wait_for_port(http_port);
         wait_for_port(resp_port);
 
-        Self { _tmp: tmp, http_port, resp_port }
+        Self { _serial, _tmp: tmp, http_port, resp_port }
     }
 
     // ── URL construction ──────────────────────────────────────────────────────

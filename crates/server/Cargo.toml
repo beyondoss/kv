@@ -20,6 +20,7 @@ beyond-kv-proto.workspace = true
 
 bytes.workspace = true
 http.workspace = true
+rustc-hash.workspace = true
 mimalloc.workspace = true
 monoio.workspace = true
 monoio-codec.workspace = true

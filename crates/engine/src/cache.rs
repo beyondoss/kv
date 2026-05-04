@@ -93,20 +93,17 @@ impl MemCache {
 
         // Update in-place if already present
         {
-            let entries = self.entries.borrow();
-            if let Some(existing) = entries.get(key.as_ref()) {
-                let old_size = existing.size;
-                existing.freq.set(1);
-                drop(entries);
-                let mut entries = self.entries.borrow_mut();
-                let e = entries.get_mut(key.as_ref())
-                    .expect("entry confirmed present above; single-threaded, no concurrent removal");
+            let mut entries = self.entries.borrow_mut();
+            if let Some(e) = entries.get_mut(key.as_ref()) {
+                let old_size = e.size;
+                e.freq.set(1);
                 e.value = value;
                 e.expires_at_ms = expires_at_ms;
                 e.metadata = meta_bytes;
                 e.size = size;
                 let cur = self.current_bytes.get();
                 self.current_bytes.set(cur.saturating_sub(old_size) + size);
+                drop(entries);
                 self.evict_to_limit();
                 return;
             }

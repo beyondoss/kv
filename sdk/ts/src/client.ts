@@ -1,108 +1,85 @@
-import { KvError, KvNotFoundError } from "./errors.js";
-import type {
-  KvEntry,
-  KvListOptions,
-  KvListResult,
-  KvSetOptions,
-} from "./types.js";
+import type { KvEntry, KvListOptions, KvListResult, KvMSetEntry, KvSetOptions } from "./types.js";
+import { createHttpKvClient } from "./http.js";
+import { createRespKvClient } from "./resp.js";
+
+export interface KvCommandEvent {
+  /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
+  command: string;
+  keyCount: number;
+}
+
+export interface KvResponseEvent {
+  command: string;
+  keyCount: number;
+  durationMs: number;
+}
+
+/** The KvClient interface — satisfied by both the RESP and HTTP backends. */
+export interface KvClient {
+  get(key: string): Promise<KvEntry | null>;
+  getOrThrow(key: string): Promise<KvEntry>;
+  set(key: string, value: string | Uint8Array, opts?: KvSetOptions): Promise<void>;
+  delete(key: string): Promise<void>;
+  list(opts?: KvListOptions): Promise<KvListResult>;
+  /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: parallel requests. */
+  mget(keys: string[]): Promise<(KvEntry | null)[]>;
+  /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: parallel requests. */
+  mset(entries: KvMSetEntry[]): Promise<void>;
+  /** Release underlying connections. Call when the client is no longer needed. */
+  close(): Promise<void>;
+}
 
 export interface KvClientOptions {
-  baseUrl: string;
+  /**
+   * Server URL. Scheme determines the backend:
+   * - `redis://` or `rediss://` → RESP (recommended)
+   * - `http://` or `https://` → HTTP
+   */
+  url: string;
+
+  // ── RESP options ────────────────────────────────────────────────────────────
+  /**
+   * Database number (0–15) mapping to a beyond-kv namespace.
+   * 0 → `default`, 1 → `db1`, …, 15 → `db15`. Default: 0.
+   * RESP backend only.
+   */
+  db?: number;
+
+  // ── HTTP options ────────────────────────────────────────────────────────────
+  /**
+   * Namespace name. Default: `"default"`. HTTP backend only.
+   */
   namespace?: string;
+  /**
+   * Custom `fetch` implementation for connection pooling or test mocking.
+   * HTTP backend only.
+   */
+  fetch?: typeof globalThis.fetch;
+  /**
+   * Called when an `x-kv-metadata` response header cannot be parsed as JSON.
+   * HTTP backend only.
+   */
+  onMetadataParseError?: (key: string, raw: string, err: unknown) => void;
+
+  // ── Shared options ──────────────────────────────────────────────────────────
+  /** Per-command timeout in milliseconds. */
+  timeout?: number;
+  /**
+   * Max retry attempts on transient failures. Default: 2.
+   * RESP: maps to `maxRetriesPerRequest`. HTTP: exponential backoff.
+   */
+  retries?: number;
+  /** Called before each command. */
+  onCommand?: (event: KvCommandEvent) => void;
+  /** Called after each command response. */
+  onResponse?: (event: KvResponseEvent) => void;
 }
 
-async function parseError(res: Response): Promise<KvError> {
-  let code = "internal_error";
-  let message = res.statusText;
-  try {
-    const body = (await res.json()) as { error?: string; message?: string };
-    if (body.error) code = body.error;
-    if (body.message) message = body.message;
-  } catch {
-    // ignore parse failure
+/** Creates a KV client. Backend is selected automatically from the URL scheme. */
+export function createKvClient(opts: KvClientOptions): KvClient {
+  const { protocol } = new URL(opts.url);
+  if (protocol === "redis:" || protocol === "rediss:") {
+    return createRespKvClient(opts);
   }
-  return new KvError(code, message, res.status);
+  return createHttpKvClient(opts);
 }
-
-export function createKvClient(opts: KvClientOptions) {
-  const base = opts.baseUrl.replace(/\/+$/, "");
-  const ns = opts.namespace ?? "default";
-
-  function valueUrl(key: string): string {
-    return `${base}/namespaces/${ns}/values/${encodeURIComponent(key)}`;
-  }
-
-  function keysUrl(params?: KvListOptions): string {
-    const url = new URL(`${base}/namespaces/${ns}/keys`);
-    if (params?.prefix) url.searchParams.set("prefix", params.prefix);
-    if (params?.cursor) url.searchParams.set("cursor", params.cursor);
-    if (params?.limit != null)
-      url.searchParams.set("limit", String(params.limit));
-    return url.toString();
-  }
-
-  return {
-    async get(key: string): Promise<KvEntry | null> {
-      const res = await fetch(valueUrl(key));
-      if (res.status === 404) return null;
-      if (!res.ok) throw await parseError(res);
-
-      const value = new Uint8Array(await res.arrayBuffer());
-      const ttlHeader = res.headers.get("x-kv-ttl");
-      const metaHeader = res.headers.get("x-kv-metadata");
-
-      const entry: KvEntry = { value };
-      if (ttlHeader != null) entry.ttl = Number(ttlHeader);
-      if (metaHeader != null) {
-        try {
-          entry.metadata = JSON.parse(metaHeader) as unknown;
-        } catch {
-          // ignore malformed metadata
-        }
-      }
-      return entry;
-    },
-
-    async getOrThrow(key: string): Promise<KvEntry> {
-      const entry = await this.get(key);
-      if (entry == null) throw new KvNotFoundError(key);
-      return entry;
-    },
-
-    async set(
-      key: string,
-      value: string | Uint8Array,
-      opts?: KvSetOptions,
-    ): Promise<void> {
-      const headers: Record<string, string> = {};
-      if (opts?.ttl != null) headers["x-kv-ttl"] = String(opts.ttl);
-      if (opts?.metadata != null)
-        headers["x-kv-metadata"] = JSON.stringify(opts.metadata);
-
-      const url = opts?.nx
-        ? `${valueUrl(key)}?nx=1`
-        : valueUrl(key);
-
-      const body: BodyInit =
-        typeof value === "string"
-          ? value
-          : new Blob([new Uint8Array(value)]);
-
-      const res = await fetch(url, { method: "PUT", headers, body });
-      if (!res.ok) throw await parseError(res);
-    },
-
-    async delete(key: string): Promise<void> {
-      const res = await fetch(valueUrl(key), { method: "DELETE" });
-      if (!res.ok) throw await parseError(res);
-    },
-
-    async list(opts?: KvListOptions): Promise<KvListResult> {
-      const res = await fetch(keysUrl(opts));
-      if (!res.ok) throw await parseError(res);
-      return (await res.json()) as KvListResult;
-    },
-  };
-}
-
-export type KvClient = ReturnType<typeof createKvClient>;

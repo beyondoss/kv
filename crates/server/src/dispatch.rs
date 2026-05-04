@@ -22,8 +22,17 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Select { db } => {
-            state.ns = beyond_kv_engine::store::ns_for_db(db);
+            state.ns = beyond_kv_engine::store::ns_name(db);
             r::ok()
+        }
+
+        Command::BgRewriteAof => {
+            match store.reclaim(&state.ns).await {
+                Ok(()) => Value::SimpleString(bytes::Bytes::from_static(
+                    b"Background append only file rewriting started",
+                )),
+                Err(e) => r::error("ERR", &e.to_string()),
+            }
         }
 
         Command::Quit | Command::Reset => {
@@ -32,7 +41,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Get { key } => {
-            match store.get(state.ns, &key) {
+            match store.get(&state.ns, &key).await {
                 Ok(Some(entry)) => r::bulk(entry.value),
                 Ok(None) => r::nil(),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -45,31 +54,28 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             // Handle NX / XX conditions
             match args.condition {
                 SetCondition::Nx => {
-                    match store.setnx(state.ns, &key, value, opts) {
+                    match store.setnx(&state.ns, &key, value, opts).await {
                         Ok(true) => r::ok(),
                         Ok(false) => r::nil(),
                         Err(e) => r::error("ERR", &e.to_string()),
                     }
                 }
                 SetCondition::Xx => {
-                    match store.get(state.ns, &key) {
-                        Ok(None) => r::nil(),
-                        Ok(Some(_)) => match store.set(state.ns, &key, value, opts) {
-                            Ok(()) => r::ok(),
-                            Err(e) => r::error("ERR", &e.to_string()),
-                        },
+                    match store.setxx(&state.ns, &key, value, opts).await {
+                        Ok(true) => r::ok(),
+                        Ok(false) => r::nil(),
                         Err(e) => r::error("ERR", &e.to_string()),
                     }
                 }
                 SetCondition::Always => {
                     if args.get {
-                        match store.getset(state.ns, &key, value) {
+                        match store.getset(&state.ns, &key, value).await {
                             Ok(Some(old)) => r::bulk(old.value),
                             Ok(None) => r::nil(),
                             Err(e) => r::error("ERR", &e.to_string()),
                         }
                     } else {
-                        match store.set(state.ns, &key, value, opts) {
+                        match store.set(&state.ns, &key, value, opts).await {
                             Ok(()) => r::ok(),
                             Err(e) => r::error("ERR", &e.to_string()),
                         }
@@ -80,7 +86,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
 
         Command::Del { keys } => {
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
-            match store.del(state.ns, &refs) {
+            match store.del(&state.ns, &refs).await {
                 Ok(n) => r::integer(n as i64),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
@@ -88,14 +94,14 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
 
         Command::Exists { keys } => {
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
-            match store.exists(state.ns, &refs) {
+            match store.exists(&state.ns, &refs).await {
                 Ok(n) => r::integer(n as i64),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
         Command::Expire { key, secs } => {
-            match store.expire(state.ns, &key, Duration::from_secs(secs)) {
+            match store.expire(&state.ns, &key, Duration::from_secs(secs)).await {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -103,7 +109,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::PExpire { key, millis } => {
-            match store.expire(state.ns, &key, Duration::from_millis(millis)) {
+            match store.expire(&state.ns, &key, Duration::from_millis(millis)).await {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -116,13 +122,13 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
                 .unwrap_or_default()
                 .as_secs();
             if unix_secs <= now_secs {
-                match store.del(state.ns, &[key.as_ref()]) {
+                match store.del(&state.ns, &[key.as_ref()]).await {
                     Ok(_) => r::integer(1),
                     Err(e) => r::error("ERR", &e.to_string()),
                 }
             } else {
                 let ttl = Duration::from_secs(unix_secs - now_secs);
-                match store.expire(state.ns, &key, ttl) {
+                match store.expire(&state.ns, &key, ttl).await {
                     Ok(true) => r::integer(1),
                     Ok(false) => r::integer(0),
                     Err(e) => r::error("ERR", &e.to_string()),
@@ -136,13 +142,13 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
                 .unwrap_or_default()
                 .as_millis() as u64;
             if unix_millis <= now_ms {
-                match store.del(state.ns, &[key.as_ref()]) {
+                match store.del(&state.ns, &[key.as_ref()]).await {
                     Ok(_) => r::integer(1),
                     Err(e) => r::error("ERR", &e.to_string()),
                 }
             } else {
                 let ttl = Duration::from_millis(unix_millis - now_ms);
-                match store.expire(state.ns, &key, ttl) {
+                match store.expire(&state.ns, &key, ttl).await {
                     Ok(true) => r::integer(1),
                     Ok(false) => r::integer(0),
                     Err(e) => r::error("ERR", &e.to_string()),
@@ -151,7 +157,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Ttl { key } => {
-            match store.ttl(state.ns, &key) {
+            match store.ttl(&state.ns, &key).await {
                 Ok(beyond_kv_engine::types::TtlResult::Remaining(s)) => r::integer(s as i64),
                 Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
                 Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
@@ -160,7 +166,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::PTtl { key } => {
-            match store.pttl(state.ns, &key) {
+            match store.pttl(&state.ns, &key).await {
                 Ok(beyond_kv_engine::types::TtlResult::Remaining(ms)) => r::integer(ms as i64),
                 Ok(beyond_kv_engine::types::TtlResult::NoExpiry) => r::integer(-1),
                 Ok(beyond_kv_engine::types::TtlResult::NotFound) => r::integer(-2),
@@ -169,7 +175,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Persist { key } => {
-            match store.persist(state.ns, &key) {
+            match store.persist(&state.ns, &key).await {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -177,25 +183,34 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::MGet { keys } => {
-            let values: Vec<Value> = keys.iter().map(|key| {
-                match store.get(state.ns, key) {
-                    Ok(Some(entry)) => r::bulk(entry.value),
-                    Ok(None) => r::nil(),
-                    Err(e) => r::error("ERR", &e.to_string()),
+            // Bulk lookup: store.mget batches L1 misses through io_uring via
+            // join_all, so a 100-key MGET dispatches all the cold reads
+            // concurrently rather than serially awaiting each one.
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+            match store.mget(&state.ns, &refs).await {
+                Err(e) => r::error("ERR", &e.to_string()),
+                Ok(entries) => {
+                    let values: Vec<Value> = entries
+                        .into_iter()
+                        .map(|opt| match opt {
+                            Some(entry) => r::bulk(entry.value),
+                            None => r::nil(),
+                        })
+                        .collect();
+                    r::array(values)
                 }
-            }).collect();
-            r::array(values)
+            }
         }
 
         Command::MSet { pairs } => {
-            match store.mset(state.ns, &pairs) {
+            match store.mset(&state.ns, &pairs).await {
                 Ok(()) => r::ok(),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
         Command::GetSet { key, value } => {
-            match store.getset(state.ns, &key, value) {
+            match store.getset(&state.ns, &key, value).await {
                 Ok(Some(old)) => r::bulk(old.value),
                 Ok(None) => r::nil(),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -203,7 +218,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::SetNx { key, value } => {
-            match store.setnx(state.ns, &key, value, SetOptions::default()) {
+            match store.setnx(&state.ns, &key, value, SetOptions::default()).await {
                 Ok(true) => r::integer(1),
                 Ok(false) => r::integer(0),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -211,7 +226,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::GetDel { key } => {
-            match store.getdel(state.ns, &key) {
+            match store.getdel(&state.ns, &key).await {
                 Ok(Some(entry)) => r::bulk(entry.value),
                 Ok(None) => r::nil(),
                 Err(e) => r::error("ERR", &e.to_string()),
@@ -219,17 +234,21 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::GetEx { key, ttl } => {
-            match store.get(state.ns, &key) {
+            match store.get(&state.ns, &key).await {
                 Ok(None) => r::nil(),
                 Ok(Some(entry)) => {
                     let value = entry.value.clone();
                     match ttl {
                         Some(GetExTtl::Set(ttl_spec)) => {
-                            let opts = set_opts_from_args(&Some(ttl_spec));
-                            let _ = store.set(state.ns, &key, value.clone(), opts);
+                            let dur = ttl_duration_from_spec(&ttl_spec);
+                            if let Err(e) = store.expire(&state.ns, &key, dur).await {
+                                return r::error("ERR", &e.to_string());
+                            }
                         }
                         Some(GetExTtl::Persist) => {
-                            let _ = store.persist(state.ns, &key);
+                            if let Err(e) = store.persist(&state.ns, &key).await {
+                                return r::error("ERR", &e.to_string());
+                            }
                         }
                         None => {}
                     }
@@ -244,7 +263,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             let mut all_keys: Vec<Value> = Vec::new();
             let mut cursor = bytes::Bytes::from_static(b"0");
             loop {
-                match store.scan(state.ns, &cursor, pattern.as_deref(), CHUNK) {
+                match store.scan(&state.ns, &cursor, pattern.as_deref(), CHUNK).await {
                     Err(e) => return r::error("ERR", &e.to_string()),
                     Ok(page) => {
                         let done = page.next_cursor == b"0".as_ref();
@@ -259,21 +278,21 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Scan { cursor, args } => {
-            match store.scan(state.ns, &cursor, args.pattern.as_deref(), args.count) {
+            match store.scan(&state.ns, &cursor, args.pattern.as_deref(), args.count).await {
                 Ok(page) => r::scan_reply(page.next_cursor, page.keys),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
         Command::DbSize => {
-            match store.db_size(state.ns) {
+            match store.db_size(&state.ns).await {
                 Ok(n) => r::integer(n as i64),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
 
         Command::FlushDb => {
-            match store.flush_db(state.ns) {
+            match store.flush_db(&state.ns).await {
                 Ok(()) => r::ok(),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
@@ -295,8 +314,8 @@ async fn yield_now() {
     .await;
 }
 
-fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
-    let ttl = ttl.as_ref().map(|t| match t {
+fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
+    match ttl {
         SetTtl::Seconds(s) => Duration::from_secs(*s),
         SetTtl::Millis(ms) => Duration::from_millis(*ms),
         SetTtl::UnixSecs(ts) => {
@@ -313,8 +332,11 @@ fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
                 .as_millis() as u64;
             Duration::from_millis(ts.saturating_sub(now))
         }
-    });
-    SetOptions { ttl, metadata: None }
+    }
+}
+
+fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
+    SetOptions { ttl: ttl.as_ref().map(ttl_duration_from_spec), metadata: None }
 }
 
 #[cfg(test)]
@@ -326,9 +348,17 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
+    fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .build()
+            .expect("monoio runtime")
+            .block_on(f)
+    }
+
     fn store() -> (ShardStore, TempDir) {
         let tmp = TempDir::new().unwrap();
-        (ShardStore::open(tmp.path(), 1 << 20).unwrap(), tmp)
+        let s = rt_block_on(ShardStore::open(tmp.path(), 1 << 20)).unwrap();
+        (s, tmp)
     }
 
     fn state() -> ConnState {
@@ -336,28 +366,22 @@ mod tests {
     }
 
     /// Drive `dispatch` to completion on a fresh monoio runtime.
-    ///
-    /// `dispatch` is `async fn` because the KEYS command yields between scan
-    /// chunks to avoid monopolising the event loop. We need an actual executor
-    /// to run it even when no real I/O is involved.
     fn run(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
-        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-            .build()
-            .expect("monoio runtime")
-            .block_on(dispatch(cmd, store, state))
+        rt_block_on(dispatch(cmd, store, state))
     }
 
     fn set_key(s: &ShardStore, key: &[u8], value: &[u8]) {
-        s.set("default", key, Bytes::copy_from_slice(value), EngineSetOptions::default()).unwrap();
+        rt_block_on(s.set("default", key, Bytes::copy_from_slice(value), EngineSetOptions::default()))
+            .unwrap();
     }
 
     fn set_with_ttl(s: &ShardStore, key: &[u8], value: &[u8], ttl: Duration) {
-        s.set(
+        rt_block_on(s.set(
             "default",
             key,
             Bytes::copy_from_slice(value),
             EngineSetOptions { ttl: Some(ttl), metadata: None },
-        )
+        ))
         .unwrap();
     }
 

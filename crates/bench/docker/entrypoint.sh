@@ -49,11 +49,18 @@ print_header() {
 
 # ── Start Beyond ───────────────────────────────────────────────────────────────
 start_beyond() {
+    # Single thread so the full memory budget goes to one shard's L1 cache.
+    # The bench sends random keys from the full keyspace to every connection —
+    # it does not key-partition across shards. With N threads, each shard gets
+    # memory_bytes/N cache for a working set that is still memory_bytes large,
+    # giving ~1/N hit rate. Redis is single-threaded and uses all of maxmemory,
+    # so single-thread Beyond is the apples-to-apples comparison.
     beyond-kv \
         --data-dir "$DATA_BEYOND" \
         --resp-port "$BEYOND_PORT" \
         --http-port 4870 \
         --memory-bytes "$MEMORY_BYTES" \
+        --threads 1 \
         > "$LOG_DIR/beyond.log" 2>&1 &
     BEYOND_PID=$!
 }

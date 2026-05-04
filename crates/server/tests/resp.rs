@@ -636,26 +636,26 @@ fn hello_2_is_accepted() {
 // ── SELECT edge cases ─────────────────────────────────────────────────────────
 
 #[test]
-fn select_out_of_range_returns_error() {
+fn select_large_db_succeeds() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    let err = redis::cmd("SELECT").arg(16u32).query::<redis::Value>(&mut con).unwrap_err();
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("err") || msg.contains("range") || msg.contains("invalid"),
-        "SELECT 16 must return an error, got: {msg}"
-    );
+    // SELECT accepts any non-negative integer, not just 0-15.
+    let res: redis::Value = redis::cmd("SELECT").arg(16u32).query(&mut con).unwrap();
+    assert!(matches!(res, redis::Value::Okay), "SELECT 16 must return OK");
 }
 
 #[test]
-fn select_out_of_range_does_not_change_namespace() {
+fn select_large_db_isolates_namespace() {
     let srv = TestServer::start();
     let mut con = srv.resp();
-    // Write a key in db 0
+    // Write in db 0.
     let _: () = con.set("ns-check", "default-value").unwrap();
-    // Attempt SELECT 16 — should fail
-    let _ = redis::cmd("SELECT").arg(16u32).query::<redis::Value>(&mut con);
-    // Connection must still be on db 0
+    // Switch to db 16 — key must not be visible.
+    let _: () = redis::cmd("SELECT").arg(16u32).query(&mut con).unwrap();
+    let got: Option<String> = con.get("ns-check").unwrap();
+    assert!(got.is_none(), "key from db 0 must be invisible in db 16");
+    // Switch back to db 0 — key must reappear.
+    let _: () = redis::cmd("SELECT").arg(0u32).query(&mut con).unwrap();
     let val: String = con.get("ns-check").unwrap();
     assert_eq!(val, "default-value");
 }

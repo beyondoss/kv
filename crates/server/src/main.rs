@@ -1,7 +1,6 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,10 +9,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
-use std::time::Duration;
+
+use rustc_hash::FxHasher;
 
 fn shard_for_key(key: &[u8], n: usize) -> usize {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     h.write(key);
     (h.finish() as usize) % n
 }
@@ -25,13 +25,41 @@ fn route(key: Option<Vec<u8>>, n: usize, rr: &AtomicUsize) -> usize {
     }
 }
 
+fn peek_routing_key_bytes(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_routing(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) =
+                (peek_routing_key_bytes(bytes[i + 1]), peek_routing_key_bytes(bytes[i + 2]))
+            {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Peek the leading bytes of an incoming RESP connection, returning the key
 /// (the second bulk-string argument of an array command) when one is present.
 fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-    let mut buf = [0u8; 512];
-    let n = stream.peek(&mut buf).ok()?;
-    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_nonblocking(true);
+    let mut buf = [0u8; 4096];
+    let n = stream.peek(&mut buf).unwrap_or(0);
+    let _ = stream.set_nonblocking(false);
     if n == 0 {
         return None;
     }
@@ -80,10 +108,10 @@ fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
 /// Peek the leading bytes of an incoming HTTP connection, returning the key
 /// extracted from `/values/{key}` segments when one is present.
 fn peek_http_key(stream: &TcpStream) -> Option<Vec<u8>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-    let mut buf = [0u8; 512];
-    let n = stream.peek(&mut buf).ok()?;
-    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_nonblocking(true);
+    let mut buf = [0u8; 4096];
+    let n = stream.peek(&mut buf).unwrap_or(0);
+    let _ = stream.set_nonblocking(false);
     if n == 0 {
         return None;
     }
@@ -99,14 +127,16 @@ fn peek_http_key(stream: &TcpStream) -> Option<Vec<u8>> {
     let needle = b"/values/";
     let pos = path.windows(needle.len()).position(|w| w == needle)?;
     let after = &path[pos + needle.len()..];
+    // Stop at query string or end of request line; slashes are part of the key.
     let key_end = after
         .iter()
-        .position(|&b| b == b'?' || b == b'/' || b == b' ')
+        .position(|&b| b == b'?' || b == b' ')
         .unwrap_or(after.len());
     if key_end == 0 {
         return None;
     }
-    Some(after[..key_end].to_vec())
+    // Percent-decode so the routing key matches the stored key.
+    Some(percent_decode_routing(&after[..key_end]))
 }
 
 fn accept_one(
@@ -121,7 +151,10 @@ fn accept_one(
     if senders[idx].send((stream, peer)).is_err() {
         return false;
     }
-    let _ = wakeup_writers[idx].write_all(&[1u8]);
+    if let Err(e) = wakeup_writers[idx].write_all(&[1u8]) {
+        tracing::error!(worker = idx, error = %e, "wakeup pipe write failed; worker likely dead");
+        return false;
+    }
     true
 }
 
@@ -135,13 +168,15 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let n_threads = cfg.threads.unwrap_or_else(num_cpus::get);
+    let n_threads = cfg.threads.unwrap_or_else(num_cpus::get).max(1);
     tracing::info!(threads = n_threads, resp_port = cfg.resp_port, "starting beyond-kv");
 
     let data_dir = cfg.data_dir.clone();
     let resp_port = cfg.resp_port;
     let http_port = cfg.http_port;
     let memory_per_shard = cfg.memory_bytes / n_threads;
+    let reclaim_sealed_threshold = cfg.reclaim_sealed_threshold;
+    let reclaim_interval_secs = cfg.reclaim_interval_secs;
     tracing::info!(http_port, "HTTP server enabled");
 
     // Per-worker, per-protocol channel + wakeup pipe.
@@ -176,16 +211,18 @@ fn main() -> anyhow::Result<()> {
                 .name(format!("kv-worker-{i}"))
                 .spawn(move || {
                     let shard_dir = data_dir.join(format!("shard-{i}"));
-                    let store =
-                        beyond_kv_engine::store::ShardStore::open(&shard_dir, memory_per_shard)
-                            .expect("failed to open store");
-                    let store = Rc::new(store);
-
                     monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                         .enable_timer()
                         .build()
                         .expect("failed to build monoio runtime")
                         .block_on(async {
+                            let store = beyond_kv_engine::store::ShardStore::open(
+                                &shard_dir,
+                                memory_per_shard,
+                            )
+                            .await
+                            .expect("failed to open store");
+                            let store = Rc::new(store);
                             let sweep_store = store.clone();
                             monoio::spawn(async move {
                                 loop {
@@ -193,6 +230,32 @@ fn main() -> anyhow::Result<()> {
                                     sweep_store.sweep_cache();
                                 }
                             });
+                            let sync_store = store.clone();
+                            monoio::spawn(async move {
+                                loop {
+                                    monoio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    if let Err(e) = sync_store.sync_logs().await {
+                                        tracing::warn!(error = %e, "periodic log sync failed");
+                                    }
+                                }
+                            });
+                            if reclaim_sealed_threshold > 0 {
+                                let reclaim_store = store.clone();
+                                monoio::spawn(async move {
+                                    loop {
+                                        monoio::time::sleep(std::time::Duration::from_secs(
+                                            reclaim_interval_secs,
+                                        ))
+                                        .await;
+                                        if let Err(e) = reclaim_store
+                                            .reclaim_if_needed(reclaim_sealed_threshold)
+                                            .await
+                                        {
+                                            tracing::warn!(error = %e, "auto-reclaim failed");
+                                        }
+                                    }
+                                });
+                            }
                             let http_store = store.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(http_store, http_rx, http_wake_read)

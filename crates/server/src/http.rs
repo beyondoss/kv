@@ -107,16 +107,16 @@ async fn route(
             if let Some(key_encoded) = rest.strip_prefix("values/") {
                 let key = percent_decode(key_encoded);
                 return match *method {
-                    http::Method::GET => handle_get(ns, &key, store),
-                    http::Method::PUT => handle_put(ns, &key, body, parts, store),
-                    http::Method::DELETE => handle_delete(ns, &key, store),
+                    http::Method::GET => handle_get(ns, &key, store).await,
+                    http::Method::PUT => handle_put(ns, &key, body, parts, store).await,
+                    http::Method::DELETE => handle_delete(ns, &key, store).await,
                     _ => method_not_allowed(),
                 };
             }
             if rest == "keys" || rest.starts_with("keys?") {
                 if *method == http::Method::GET {
                     let query = parts.uri.query().unwrap_or("");
-                    return handle_list(ns, query, store);
+                    return handle_list(ns, query, store).await;
                 }
                 return method_not_allowed();
             }
@@ -130,8 +130,8 @@ async fn route(
     not_found_json("not_found", "endpoint not found")
 }
 
-fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
-    match store.get(ns, key) {
+async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+    match store.get(ns, key).await {
         Err(e) => internal_error(&e.to_string()),
         Ok(None) => not_found_json("not_found", "key does not exist"),
         Ok(Some(entry)) => {
@@ -144,18 +144,20 @@ fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBo
             }
             if let Some(meta) = &entry.metadata {
                 if let Ok(json) = serde_json::to_string(meta) {
-                    builder = builder.header("X-KV-Metadata", json);
+                    if let Ok(hv) = http::HeaderValue::from_str(&json) {
+                        builder = builder.header("X-KV-Metadata", hv);
+                    }
                 }
             }
             builder
                 .header("Content-Type", "application/octet-stream")
                 .body(HttpBody::fixed_body(Some(entry.value)))
-                .unwrap()
+                .unwrap_or_else(|_| internal_error("response build failed"))
         }
     }
 }
 
-fn handle_put(
+async fn handle_put(
     ns: &str,
     key: &[u8],
     body: Bytes,
@@ -167,14 +169,17 @@ fn handle_put(
         .headers
         .get("x-kv-metadata")
         .and_then(|v| v.to_str().ok())
+        .filter(|s| s.len() <= 64 * 1024)
         .and_then(|s| serde_json::from_str(s).ok());
 
-    let nx = parts.uri.query().unwrap_or("").contains("nx=1");
+    let query = parts.uri.query().unwrap_or("");
+    let nx = query.contains("nx=1");
+    let xx = query.contains("xx=1");
 
     let opts = SetOptions { ttl, metadata };
 
     if nx {
-        match store.setnx(ns, key, body, opts) {
+        match store.setnx(ns, key, body, opts).await {
             Ok(true) => http::Response::builder()
                 .status(204)
                 .body(HttpBody::fixed_body(None))
@@ -185,8 +190,20 @@ fn handle_put(
             ),
             Err(e) => internal_error(&e.to_string()),
         }
+    } else if xx {
+        match store.setxx(ns, key, body, opts).await {
+            Ok(true) => http::Response::builder()
+                .status(204)
+                .body(HttpBody::fixed_body(None))
+                .unwrap(),
+            Ok(false) => json_response(
+                409,
+                &serde_json::json!({ "error": "conflict", "message": "key does not exist" }),
+            ),
+            Err(e) => internal_error(&e.to_string()),
+        }
     } else {
-        match store.set(ns, key, body, opts) {
+        match store.set(ns, key, body, opts).await {
             Ok(()) => http::Response::builder()
                 .status(204)
                 .body(HttpBody::fixed_body(None))
@@ -196,8 +213,8 @@ fn handle_put(
     }
 }
 
-fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
-    match store.del(ns, &[key]) {
+async fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+    match store.del(ns, &[key]).await {
         Ok(_) => http::Response::builder()
             .status(204)
             .body(HttpBody::fixed_body(None))
@@ -206,32 +223,50 @@ fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<Htt
     }
 }
 
-fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Response<HttpBody> {
+async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Response<HttpBody> {
     let prefix_pattern = query_param(query, "prefix").map(|raw| {
         let mut p = percent_decode(raw);
         p.push(b'*');
         p
     });
-    let cursor_bytes = percent_decode(query_param(query, "cursor").unwrap_or("0"));
+    // Cursor is a decimal u64 string (URL-safe). "0" or absent = start of scan.
+    let cursor_bytes: Vec<u8> = match query_param(query, "cursor") {
+        None | Some("0") => b"0".to_vec(),
+        Some(s) => match s.parse::<u64>() {
+            Ok(0) => b"0".to_vec(),
+            Ok(pos) => pos.to_le_bytes().to_vec(),
+            Err(_) => b"0".to_vec(), // invalid cursor: restart
+        },
+    };
     let limit: u64 = query_param(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100)
         .min(1000);
 
-    match store.scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit) {
+    match store.scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit).await {
         Err(e) => internal_error(&e.to_string()),
         Ok(page) => {
             let keys: Vec<serde_json::Value> = page
                 .keys
                 .iter()
-                .map(|k| serde_json::json!({ "name": String::from_utf8_lossy(k) }))
+                .map(|k| {
+                    let name = String::from_utf8(k.to_vec())
+                        .unwrap_or_else(|e| percent_encode_bytes(e.as_bytes()));
+                    serde_json::json!({ "name": name })
+                })
                 .collect();
             let complete = page.next_cursor == b"0".as_ref();
             let mut body = serde_json::json!({ "keys": keys, "complete": complete });
             if !complete {
-                body["cursor"] = serde_json::Value::String(
-                    String::from_utf8_lossy(&page.next_cursor).into_owned()
-                );
+                // Emit cursor as decimal u64 — URL-safe, no re-encoding needed by clients.
+                let pos = if page.next_cursor.len() == 8 {
+                    page.next_cursor.as_ref().try_into()
+                        .map(u64::from_le_bytes)
+                        .unwrap_or(0)
+                } else {
+                    0u64
+                };
+                body["cursor"] = serde_json::Value::String(pos.to_string());
             }
             json_response(200, &body)
         }
@@ -260,6 +295,22 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
         let (k, v) = pair.split_once('=')?;
         if k == name { Some(v) } else { None }
     })
+}
+
+fn percent_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b);
+        } else {
+            out.push(b'%');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0xf) as usize]);
+        }
+    }
+    // Output contains only ASCII so this is always valid UTF-8.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn percent_decode(s: &str) -> Vec<u8> {
