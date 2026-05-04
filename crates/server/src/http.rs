@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -205,7 +205,8 @@ async fn handle_put(
         .get("x-kv-metadata")
         .and_then(|v| v.to_str().ok())
         .filter(|s| s.len() <= 64 * 1024)
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .map(Arc::new);
 
     let query = parts.uri.query().unwrap_or("");
     let nx = query.contains("nx=1");
@@ -455,7 +456,7 @@ fn sse_event_json(event: &WatchEvent) -> String {
                 obj["ttl"] = serde_json::Value::Number(ttl_secs.into());
             }
             if let Some(meta) = metadata {
-                obj["metadata"] = meta.clone();
+                obj["metadata"] = meta.as_ref().clone();
             }
             obj.to_string()
         }

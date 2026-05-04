@@ -24,6 +24,7 @@ pub mod recover;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -33,9 +34,11 @@ use tracing::warn;
 
 use crate::error::{EngineError, Result};
 use crate::log::config::LogConfig;
-use crate::log::file::{FooterEntry, LogFile, data_filename};
+use crate::log::file::{
+    BufGuard, FooterEntry, LogFile, data_filename, pool_acquire_write, pool_release_write,
+};
 use crate::log::index::{IndexEntry, NsIndex};
-use crate::log::record::{HEADER_LEN, flags as rflags, parse_header};
+use crate::log::record::{HEADER_LEN, flags as rflags, parse_header, verify_crc};
 
 pub fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -135,12 +138,12 @@ impl NamespaceLog {
                 0
             }
         };
-        let buf = record::encode(tstamp, flags, exp, &key, value, metadata)?;
-        // SAFETY: record::encode validates the record fits in u32::MAX before returning Ok.
+        let mut buf = pool_acquire_write(HEADER_LEN + key.len() + value.len() + metadata.len());
+        record::encode_into(&mut buf, tstamp, flags, exp, &key, value, metadata)?;
         let record_size = buf.len() as u32;
-
         let active = self.active();
-        let offset = active.append(buf).await?;
+        let (offset, buf) = active.append(buf).await?;
+        pool_release_write(buf);
         self.unsynced_bytes
             .set(self.unsynced_bytes.get() + record_size as u64);
         let entry = IndexEntry::new(active.file_id, offset, record_size, tstamp);
@@ -159,7 +162,11 @@ impl NamespaceLog {
         if pairs.is_empty() {
             return Ok(());
         }
-        let mut buf: Vec<u8> = Vec::new();
+        let estimated: usize = pairs
+            .iter()
+            .map(|(k, v)| HEADER_LEN + k.len() + v.len())
+            .sum();
+        let mut buf = pool_acquire_write(estimated);
         let mut layout: Vec<(usize, u32, u64)> = Vec::with_capacity(pairs.len());
         for (k, v) in pairs {
             let tstamp = self.next_tstamp();
@@ -170,7 +177,8 @@ impl NamespaceLog {
         }
         let active = self.active();
         let buf_len = buf.len() as u64;
-        let base_offset = active.append(buf).await?;
+        let (base_offset, buf) = active.append(buf).await?;
+        pool_release_write(buf);
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
         {
             let mut index = self.index.borrow_mut();
@@ -201,10 +209,12 @@ impl NamespaceLog {
             return Ok(false);
         }
         let tstamp = self.next_tstamp();
-        let buf = record::encode(tstamp, rflags::TOMBSTONE, 0, key, &[], &[])?;
+        let mut buf = pool_acquire_write(HEADER_LEN + key.len());
+        record::encode_into(&mut buf, tstamp, rflags::TOMBSTONE, 0, key, &[], &[])?;
         let active = self.active();
         let buf_len = buf.len() as u64;
-        let _ = active.append(buf).await?;
+        let (_, buf) = active.append(buf).await?;
+        pool_release_write(buf);
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
         Ok(true)
     }
@@ -223,10 +233,12 @@ impl NamespaceLog {
                 0
             }
         };
-        let buf = record::encode(tstamp, flags, exp, key, &[], &[])?;
+        let mut buf = pool_acquire_write(HEADER_LEN + key.len());
+        record::encode_into(&mut buf, tstamp, flags, exp, key, &[], &[])?;
         let active = self.active();
         let buf_len = buf.len() as u64;
-        let _ = active.append(buf).await?;
+        let (_, buf) = active.append(buf).await?;
+        pool_release_write(buf);
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
         let key_bytes = Bytes::copy_from_slice(key);
         self.index.borrow_mut().set_ttl(&key_bytes, expires_at_ms);
@@ -252,7 +264,7 @@ impl NamespaceLog {
         Ok(())
     }
 
-    async fn read_record(&self, entry: IndexEntry) -> Result<Vec<u8>> {
+    async fn read_record(&self, entry: IndexEntry) -> Result<BufGuard> {
         let file = self
             .locate_file(entry.file_id)
             .ok_or(EngineError::BadRecord {
@@ -274,6 +286,7 @@ impl NamespaceLog {
                 reason: "record bytes shorter than declared sizes",
             });
         }
+        verify_crc(&hdr, &bytes[..HEADER_LEN], &bytes[HEADER_LEN..meta_end], 0)?;
         let value = Bytes::copy_from_slice(&bytes[key_end..val_end]);
         let metadata = Bytes::copy_from_slice(&bytes[val_end..meta_end]);
         Ok((value, metadata))
@@ -299,7 +312,7 @@ impl NamespaceLog {
             return Ok(Vec::new());
         }
         let futures: Vec<_> = misses.iter().map(|(_, e)| self.read_record(*e)).collect();
-        let results: Vec<Result<Vec<u8>>> = join_all(futures).await;
+        let results: Vec<Result<BufGuard>> = join_all(futures).await;
         let mut out: Vec<(usize, Bytes, Bytes)> = Vec::with_capacity(misses.len());
         for ((slot, _entry), bytes_res) in misses.into_iter().zip(results.into_iter()) {
             let bytes = bytes_res?;
@@ -344,8 +357,8 @@ impl NamespaceLog {
             let metadata = if meta_bytes.is_empty() {
                 None
             } else {
-                match serde_json::from_slice(&meta_bytes) {
-                    Ok(v) => Some(v),
+                match serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
+                    Ok(v) => Some(Arc::new(v)),
                     Err(e) => {
                         warn!(key = ?key, error = %e, "corrupt metadata during current_entries; dropping field");
                         None
@@ -656,8 +669,8 @@ async fn scan_file_records(
                     let metadata = if meta_bytes.is_empty() {
                         None
                     } else {
-                        match serde_json::from_slice(meta_bytes) {
-                            Ok(v) => Some(v),
+                        match serde_json::from_slice::<serde_json::Value>(meta_bytes) {
+                            Ok(v) => Some(Arc::new(v)),
                             Err(e) => {
                                 warn!(offset, error = %e, "corrupt metadata in scan_file_records; dropping field");
                                 None

@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::error::{EngineError, Result};
 use crate::log::file::{
-    FooterEntry, LogFile, data_filename, footer_entry_from_index, reclaim_tmp_filename,
+    BufGuard, FooterEntry, LogFile, data_filename, footer_entry_from_index, reclaim_tmp_filename,
 };
 use crate::log::index::IndexEntry;
 
@@ -69,7 +69,7 @@ pub async fn reclaim_namespace(
             }
         })
         .collect();
-    let read_results: Vec<Result<Vec<u8>>> = join_all(read_futures).await;
+    let read_results: Vec<Result<BufGuard>> = join_all(read_futures).await;
 
     // Write sequentially (preserves deterministic record order in the new file).
     let mut footer: Vec<FooterEntry> = Vec::with_capacity(live.len());
@@ -77,8 +77,8 @@ pub async fn reclaim_namespace(
     let mut live_bytes: u64 = 0;
 
     for ((key, old_entry, ttl), bytes_res) in live.iter().zip(read_results) {
-        let bytes = bytes_res?;
-        let new_offset = new_file.append(bytes).await?;
+        let bytes = bytes_res?.into_inner();
+        let (new_offset, _) = new_file.append(bytes).await?;
         live_bytes += old_entry.record_size as u64;
         let new_entry = IndexEntry::new(
             next_file_id,

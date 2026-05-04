@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures_channel::mpsc::{Receiver, Sender, channel};
 use rustc_hash::FxHashMap;
@@ -12,7 +14,7 @@ pub enum WatchEvent {
     Set {
         key: Bytes,
         value: Bytes,
-        metadata: Option<serde_json::Value>,
+        metadata: Option<Arc<serde_json::Value>>,
         expires_at_ms: Option<u64>,
         revision: u64,
     },

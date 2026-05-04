@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -7,9 +8,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 struct CacheEntry {
     value: Bytes,
     expires_at_ms: Option<u64>,
-    metadata: Option<serde_json::Value>,
+    metadata: Option<Arc<serde_json::Value>>,
     freq: Cell<u8>, // capped at 1
     size: usize,
+    revision: u64,
 }
 
 struct Slot {
@@ -58,13 +60,13 @@ impl MemCache {
         }
     }
 
-    /// Returns `(value, expires_at_ms, metadata)` if the key exists and is not expired.
+    /// Returns `(value, expires_at_ms, metadata, revision)` if the key exists and is not expired.
     #[must_use]
     pub fn get(
         &self,
         key: &[u8],
         now_ms: u64,
-    ) -> Option<(Bytes, Option<u64>, Option<serde_json::Value>)> {
+    ) -> Option<(Bytes, Option<u64>, Option<Arc<serde_json::Value>>, u64)> {
         let entries = self.entries.borrow();
         let entry = entries.get(key)?;
 
@@ -80,8 +82,9 @@ impl MemCache {
         entry.freq.set(1);
         let value = entry.value.clone();
         let expires_at_ms = entry.expires_at_ms;
-        let metadata = entry.metadata.clone();
-        Some((value, expires_at_ms, metadata))
+        let metadata = entry.metadata.clone(); // Arc clone: two atomic increments
+        let revision = entry.revision;
+        Some((value, expires_at_ms, metadata, revision))
     }
 
     pub fn insert(
@@ -89,13 +92,10 @@ impl MemCache {
         key: Bytes,
         value: Bytes,
         expires_at_ms: Option<u64>,
-        metadata: Option<serde_json::Value>,
+        metadata: Option<Arc<serde_json::Value>>,
+        meta_size: usize,
+        revision: u64,
     ) {
-        // Serialize once to get the byte size for memory accounting, then store the parsed value.
-        let meta_size = metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_vec(m).ok())
-            .map_or(0, |b| b.len());
         let size = (key.len() + value.len() + meta_size).max(1);
 
         // Update in-place if already present
@@ -108,6 +108,7 @@ impl MemCache {
                 e.expires_at_ms = expires_at_ms;
                 e.metadata = metadata;
                 e.size = size;
+                e.revision = revision;
                 let cur = self.current_bytes.get();
                 self.current_bytes.set(cur.saturating_sub(old_size) + size);
                 drop(entries);
@@ -124,6 +125,7 @@ impl MemCache {
             metadata,
             freq: Cell::new(0),
             size,
+            revision,
         };
 
         self.entries.borrow_mut().insert(key.clone(), entry);
@@ -205,24 +207,17 @@ impl MemCache {
 
     /// Remove all keys expiring at or before `now_ms`. Called by background sweeper.
     pub fn sweep_expired(&self, now_ms: u64) {
-        let mut to_remove: Vec<Bytes> = Vec::new();
-        {
-            let entries = self.entries.borrow();
-            for (k, v) in entries.iter() {
-                if v.expires_at_ms.map_or(false, |ms| ms <= now_ms) {
-                    to_remove.push(k.clone());
-                }
-            }
-        }
-        let mut entries = self.entries.borrow_mut();
         let mut freed = 0usize;
         let mut freed_count = 0usize;
-        for k in to_remove {
-            if let Some(e) = entries.remove(&k) {
-                freed += e.size;
+        self.entries.borrow_mut().retain(|_, v| {
+            if v.expires_at_ms.map_or(false, |ms| ms <= now_ms) {
+                freed += v.size;
                 freed_count += 1;
+                false
+            } else {
+                true
             }
-        }
+        });
         if freed > 0 {
             self.current_bytes
                 .set(self.current_bytes.get().saturating_sub(freed));
@@ -357,8 +352,8 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let cache = MemCache::new(1024);
-        cache.insert(b("k"), b("v"), None, None);
-        let (val, exp, meta) = cache.get(b"k", 0).unwrap();
+        cache.insert(b("k"), b("v"), None, None, 0, 0);
+        let (val, exp, meta, _rev) = cache.get(b"k", 0).unwrap();
         assert_eq!(val, b("v"));
         assert_eq!(exp, None);
         assert_eq!(meta, None);
@@ -373,7 +368,7 @@ mod tests {
     #[test]
     fn remove() {
         let cache = MemCache::new(1024);
-        cache.insert(b("k"), b("v"), None, None);
+        cache.insert(b("k"), b("v"), None, None, 0, 0);
         cache.remove(b"k");
         assert!(cache.get(b"k", 0).is_none());
         assert!(cache.is_empty());
@@ -382,7 +377,7 @@ mod tests {
     #[test]
     fn expiry_lazy_on_get() {
         let cache = MemCache::new(1024);
-        cache.insert(b("k"), b("v"), Some(100), None);
+        cache.insert(b("k"), b("v"), Some(100), None, 0, 0);
         assert!(cache.get(b"k", 50).is_some()); // not yet expired
         assert!(cache.get(b"k", 100).is_none()); // expired (ms <= now)
         assert!(cache.is_empty());
@@ -391,9 +386,9 @@ mod tests {
     #[test]
     fn sweep_expired() {
         let cache = MemCache::new(4096);
-        cache.insert(b("a"), b("1"), Some(100), None);
-        cache.insert(b("b"), b("2"), Some(200), None);
-        cache.insert(b("c"), b("3"), None, None);
+        cache.insert(b("a"), b("1"), Some(100), None, 0, 0);
+        cache.insert(b("b"), b("2"), Some(200), None, 0, 0);
+        cache.insert(b("c"), b("3"), None, None, 0, 0);
         cache.sweep_expired(150);
         assert!(cache.get(b"a", 0).is_none());
         assert!(cache.get(b"b", 0).is_some());
@@ -404,12 +399,13 @@ mod tests {
     #[test]
     fn in_place_update() {
         let cache = MemCache::new(1024);
-        cache.insert(b("key"), b("v1"), None, None);
+        cache.insert(b("key"), b("v1"), None, None, 0, 1);
         assert_eq!(cache.len(), 1);
-        cache.insert(b("key"), b("v_new"), Some(999), None);
-        let (val, exp, _) = cache.get(b"key", 0).unwrap();
+        cache.insert(b("key"), b("v_new"), Some(999), None, 0, 2);
+        let (val, exp, _, rev) = cache.get(b"key", 0).unwrap();
         assert_eq!(val, b("v_new"));
         assert_eq!(exp, Some(999));
+        assert_eq!(rev, 2);
         assert_eq!(cache.len(), 1);
         // key(3) + value(5) = 8
         assert_eq!(cache.bytes_used(), 8);
@@ -420,7 +416,7 @@ mod tests {
         let cache = MemCache::new(1_000_000);
         let key = Bytes::from(vec![b'k'; 100]);
         let val = Bytes::from(vec![b'v'; 50]);
-        cache.insert(key, val, None, None);
+        cache.insert(key, val, None, None, 0, 0);
         assert_eq!(cache.bytes_used(), 150);
     }
 
@@ -429,7 +425,14 @@ mod tests {
         let cache = MemCache::new(1_000_000);
         let meta = serde_json::json!({"x": 1});
         let meta_bytes = serde_json::to_vec(&meta).unwrap();
-        cache.insert(b("k"), b("v"), None, Some(meta));
+        cache.insert(
+            b("k"),
+            b("v"),
+            None,
+            Some(Arc::new(meta)),
+            meta_bytes.len(),
+            0,
+        );
         // key(1) + value(1) + serialized_meta
         assert_eq!(cache.bytes_used(), 1 + 1 + meta_bytes.len());
     }
@@ -440,7 +443,7 @@ mod tests {
         for i in 0u8..20 {
             let k = Bytes::from(vec![i; 5]);
             let v = Bytes::from(vec![i; 5]);
-            cache.insert(k, v, None, None);
+            cache.insert(k, v, None, None, 0, 0);
         }
         assert!(
             cache.bytes_used() <= 100,
@@ -460,6 +463,8 @@ mod tests {
                 Bytes::from(vec![i; 10]),
                 None,
                 None,
+                0,
+                0,
             );
         }
         let _ = cache.get(&[0u8; 10], 0); // set freq=1
@@ -470,6 +475,8 @@ mod tests {
                 Bytes::from(vec![i; 10]),
                 None,
                 None,
+                0,
+                0,
             );
         }
         assert!(
@@ -490,6 +497,8 @@ mod tests {
                 Bytes::from(vec![i; 10]),
                 None,
                 None,
+                0,
+                0,
             );
         }
         // Insert 5 more — key[0] is evicted cold and lands in ghost
@@ -499,6 +508,8 @@ mod tests {
                 Bytes::from(vec![i; 10]),
                 None,
                 None,
+                0,
+                0,
             );
         }
         assert!(
@@ -507,8 +518,15 @@ mod tests {
         );
         // Re-insert key[0] — ghost hit means it targets Main, surviving where Small entry would not
         let new_val = Bytes::from(vec![99u8; 10]);
-        cache.insert(Bytes::from(vec![0u8; 10]), new_val.clone(), None, None);
-        let (val, _, _) = cache.get(&[0u8; 10], 0).unwrap();
+        cache.insert(
+            Bytes::from(vec![0u8; 10]),
+            new_val.clone(),
+            None,
+            None,
+            0,
+            0,
+        );
+        let (val, _, _, _) = cache.get(&[0u8; 10], 0).unwrap();
         assert_eq!(val, new_val);
     }
 
@@ -518,7 +536,7 @@ mod tests {
         let cache = MemCache::new(50);
         for i in 0u16..500 {
             let k = i.to_le_bytes().to_vec();
-            cache.insert(Bytes::from(k), Bytes::from(vec![1u8]), None, None);
+            cache.insert(Bytes::from(k), Bytes::from(vec![1u8]), None, None, 0, 0);
         }
         let ghost_len = cache.ghost.borrow().len();
         assert!(
@@ -533,7 +551,7 @@ mod tests {
     fn is_empty() {
         let cache = MemCache::new(1024);
         assert!(cache.is_empty());
-        cache.insert(b("k"), b("v"), None, None);
+        cache.insert(b("k"), b("v"), None, None, 0, 0);
         assert!(!cache.is_empty());
         cache.remove(b"k");
         assert!(cache.is_empty());
@@ -543,8 +561,8 @@ mod tests {
     fn metadata_round_trip() {
         let cache = MemCache::new(4096);
         let meta = serde_json::json!({"score": 42, "tags": ["a", "b"]});
-        cache.insert(b("k"), b("v"), None, Some(meta.clone()));
-        let (_, _, got_meta) = cache.get(b"k", 0).unwrap();
-        assert_eq!(got_meta, Some(meta));
+        cache.insert(b("k"), b("v"), None, Some(Arc::new(meta.clone())), 0, 0);
+        let (_, _, got_meta, _) = cache.get(b"k", 0).unwrap();
+        assert_eq!(got_meta.as_deref(), Some(&meta));
     }
 }

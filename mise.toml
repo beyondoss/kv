@@ -19,3 +19,43 @@ run = "cargo test --test integration_test"
 
 [tasks."test:unit"]
 run = "cargo test --lib"
+
+[tasks."bench"]
+run = "cargo bench -p beyond-kv-engine --bench engine"
+
+[tasks."bench:quick"]
+run = "cargo bench -p beyond-kv-engine --bench engine -- --sample-count 20"
+
+# Full honest comparison: Beyond (1 shard) vs Redis, same container, matched
+# durability. batch=100 MGET/MSET sweep gives the latency-throughput curve.
+# Append --shards=N to run Beyond with N worker threads instead.
+[tasks."bench:e2e"]
+run = """
+TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+bash crates/bench/docker/run.sh \
+  --keys 500000 \
+  --value-size 256 \
+  --concurrency 64 \
+  --duration 30s \
+  --warmup 5s \
+  --populate \
+  --batch 100 \
+  --sweep 1k,3k,6k,10k,15k,20k \
+  --out "/results/${TS}-e2e-batch100.json" \
+  "$@"
+"""
+
+# Faster iteration: shorter duration, fewer sweep points, smaller keyspace.
+[tasks."bench:e2e:quick"]
+run = """
+bash crates/bench/docker/run.sh \
+  --keys 100000 \
+  --value-size 256 \
+  --concurrency 32 \
+  --duration 10s \
+  --warmup 2s \
+  --populate \
+  --batch 100 \
+  --sweep 3k,6k,10k,15k,20k \
+  "$@"
+"""

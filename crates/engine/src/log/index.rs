@@ -84,9 +84,7 @@ impl NsIndex {
                 self.ttl.remove(&key);
             }
         }
-        let is_new = !self.map.contains_key(key.as_ref());
-        self.map.insert(key, entry);
-        if is_new {
+        if self.map.insert(key, entry).is_none() {
             self.live_count += 1;
         }
     }

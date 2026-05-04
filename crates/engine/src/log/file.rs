@@ -1,4 +1,6 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +10,100 @@ use tracing::warn;
 
 use crate::error::{EngineError, Result};
 use crate::log::index::IndexEntry;
+
+const MAX_POOL_BUFS: usize = 32;
+const MAX_POOLED_BUF_CAPACITY: usize = 64 * 1024;
+
+thread_local! {
+    // Read-buffer pool: exact-capacity matching prevents monoio over-reads.
+    // monoio passes bytes_total() = capacity to io_uring; if capacity > len the
+    // kernel fills extra bytes and set_init() advances len past the requested
+    // size, corrupting CRC checks and causing UnexpectedEof near EOF.
+    static BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(MAX_POOL_BUFS));
+    // Write-buffer pool: kept separate so variable-sized record buffers never
+    // contaminate the read pool.
+    static WRITE_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(MAX_POOL_BUFS));
+}
+
+fn pool_acquire(size: usize) -> Vec<u8> {
+    BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        // Exact-capacity match only: a buf with cap > size would let monoio
+        // read cap bytes instead of size bytes via bytes_total().
+        if let Some(pos) = pool.iter().position(|b| b.capacity() == size) {
+            let mut buf = pool.swap_remove(pos);
+            buf.resize(size, 0);
+            return buf;
+        }
+        vec![0u8; size]
+    })
+}
+
+/// Acquire a cleared (len=0) write buffer with at least `capacity` bytes reserved.
+pub(crate) fn pool_acquire_write(capacity: usize) -> Vec<u8> {
+    WRITE_BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if let Some(pos) = pool.iter().position(|b| b.capacity() >= capacity) {
+            let mut buf = pool.swap_remove(pos);
+            buf.clear();
+            return buf;
+        }
+        Vec::with_capacity(capacity)
+    })
+}
+
+fn pool_release(buf: Vec<u8>) {
+    if buf.capacity() > MAX_POOLED_BUF_CAPACITY {
+        return;
+    }
+    BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOL_BUFS {
+            let mut buf = buf;
+            buf.clear();
+            pool.push(buf);
+        }
+    });
+}
+
+/// Return a write buffer to the pool after use.
+pub(crate) fn pool_release_write(buf: Vec<u8>) {
+    if buf.capacity() > MAX_POOLED_BUF_CAPACITY {
+        return;
+    }
+    WRITE_BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOL_BUFS {
+            let mut buf = buf;
+            buf.clear();
+            pool.push(buf);
+        }
+    });
+}
+
+pub(crate) struct BufGuard(ManuallyDrop<Vec<u8>>);
+
+impl Deref for BufGuard {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl BufGuard {
+    pub(crate) fn into_inner(mut self) -> Vec<u8> {
+        let buf = unsafe { ManuallyDrop::take(&mut self.0) };
+        std::mem::forget(self);
+        buf
+    }
+}
+
+impl Drop for BufGuard {
+    fn drop(&mut self) {
+        let buf = unsafe { ManuallyDrop::take(&mut self.0) };
+        pool_release(buf);
+    }
+}
 
 /// Magic at the very end of every sealed file. Lets recovery distinguish
 /// "sealed cleanly" from "active or crashed mid-seal" without scanning.
@@ -164,21 +260,22 @@ impl LogFile {
         let Ok(magic_bytes) = self.read_exact(total - 8, 8).await else {
             return total;
         };
-        let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap_or([0u8; 8]));
+        let magic = u64::from_le_bytes(<[u8; 8]>::try_from(&magic_bytes[..]).unwrap_or([0u8; 8]));
         if magic != FOOTER_MAGIC {
             return total;
         }
         let Ok(blen_bytes) = self.read_exact(total - FOOTER_TRAILER_LEN, 8).await else {
             return total;
         };
-        let body_len = u64::from_le_bytes(blen_bytes.try_into().unwrap_or([0u8; 8]));
+        let body_len = u64::from_le_bytes(<[u8; 8]>::try_from(&blen_bytes[..]).unwrap_or([0u8; 8]));
         total.saturating_sub(FOOTER_TRAILER_LEN + body_len)
     }
 
     /// Append a buffer at an offset reserved atomically *before* awaiting the
     /// kernel write. Concurrent appenders see distinct offsets; their writes
-    /// run as parallel io_uring SQEs.
-    pub async fn append(&self, buf: Vec<u8>) -> Result<u64> {
+    /// run as parallel io_uring SQEs. Returns the write offset and the buffer
+    /// so callers can return it to the write buffer pool.
+    pub async fn append(&self, buf: Vec<u8>) -> Result<(u64, Vec<u8>)> {
         if self.poisoned.get() {
             return Err(EngineError::Io {
                 source: std::io::Error::new(
@@ -190,12 +287,12 @@ impl LogFile {
         let len = buf.len() as u64;
         let offset = self.write_offset.get();
         self.write_offset.set(offset + len);
-        let (res, _buf) = self.file.write_all_at(buf, offset).await;
+        let (res, buf) = self.file.write_all_at(buf, offset).await;
         if let Err(e) = res {
             self.poisoned.set(true);
             return Err(EngineError::Io { source: e });
         }
-        Ok(offset)
+        Ok((offset, buf))
     }
 
     pub async fn sync(&self) -> Result<()> {
@@ -203,19 +300,24 @@ impl LogFile {
         Ok(())
     }
 
-    pub async fn read_exact(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let buf = vec![0u8; size];
-        let (res, buf) = self.file.read_exact_at(buf, offset).await;
+    pub(crate) async fn read_exact(&self, offset: u64, size: usize) -> Result<BufGuard> {
+        let buf = pool_acquire(size);
+        let (res, mut buf) = self.file.read_exact_at(buf, offset).await;
         res?;
-        Ok(buf)
+        // Pool buffers can have capacity > size; monoio passes capacity to io_uring,
+        // so the kernel may set_init() to capacity. Cap to the requested size.
+        buf.truncate(size);
+        Ok(BufGuard(ManuallyDrop::new(buf)))
     }
 
-    pub async fn read_at(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let buf = vec![0u8; size];
+    pub(crate) async fn read_at(&self, offset: u64, size: usize) -> Result<BufGuard> {
+        let buf = pool_acquire(size);
         let (res, mut buf) = self.file.read_at(buf, offset).await;
         let n = res?;
-        buf.truncate(n);
-        Ok(buf)
+        // Cap to size: pool buffers can have capacity > size, causing io_uring to
+        // read more bytes than requested via bytes_total() = capacity.
+        buf.truncate(n.min(size));
+        Ok(BufGuard(ManuallyDrop::new(buf)))
     }
 
     /// Write the sealed-file footer at the current offset and fsync.
@@ -231,8 +333,8 @@ impl LogFile {
         trailer.extend_from_slice(&crc.to_le_bytes());
         trailer.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
 
-        let _body_offset = self.append(body).await?;
-        let _trailer_offset = self.append(trailer).await?;
+        let (_, _) = self.append(body).await?;
+        let (_, _) = self.append(trailer).await?;
         self.sync().await?;
         Ok(())
     }
