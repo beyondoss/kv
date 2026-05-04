@@ -286,14 +286,26 @@ impl ShardStore {
             .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
             .await?;
         let revision = nslog.last_revision();
-        self.cache.insert(
-            Self::cache_key(ns, key),
-            value.clone(),
-            expires_at_ms,
-            opts.metadata.clone(),
-            meta_bytes.len(),
-            revision,
-        );
+        let cache_updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache.try_update(
+                ck,
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            )
+        });
+        if !cache_updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            );
+        }
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -365,7 +377,8 @@ impl ShardStore {
 
         let mut results: Vec<Option<Entry>> = vec![None; keys.len()];
         let mut misses: Vec<(usize, IndexEntry)> = Vec::new();
-        let mut miss_ttls: Vec<Option<u64>> = Vec::new();
+        // (ttl, revision) paired so bulk_read can consume `misses` without a separate pass.
+        let mut miss_meta: Vec<(Option<u64>, u64)> = Vec::new();
         let mut expired_keys: Vec<&[u8]> = Vec::new();
 
         for (i, key) in keys.iter().enumerate() {
@@ -393,8 +406,8 @@ impl ShardStore {
                 expired_keys.push(key);
                 continue;
             }
+            miss_meta.push((ttl, entry.tstamp_ms));
             misses.push((i, entry));
-            miss_ttls.push(ttl);
         }
 
         // Batch-tombstone expired keys concurrently so their individual disk writes
@@ -407,13 +420,8 @@ impl ShardStore {
         }
 
         if !misses.is_empty() {
-            let miss_revisions: Vec<u64> = misses.iter().map(|(_, e)| e.tstamp_ms).collect();
             let read = nslog.bulk_read(misses).await?;
-            for (((slot, value, meta_bytes), ttl), revision) in read
-                .into_iter()
-                .zip(miss_ttls.into_iter())
-                .zip(miss_revisions.into_iter())
-            {
+            for ((slot, value, meta_bytes), (ttl, revision)) in read.into_iter().zip(miss_meta) {
                 let metadata = Self::metadata_from_bytes(&meta_bytes)?;
                 self.cache.insert(
                     Self::cache_key(ns, keys[slot]),
@@ -451,14 +459,26 @@ impl ShardStore {
             .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
             .await?;
         let revision = nslog.last_revision();
-        self.cache.insert(
-            Self::cache_key(ns, key),
-            value.clone(),
-            expires_at_ms,
-            opts.metadata.clone(),
-            meta_bytes.len(),
-            revision,
-        );
+        let cache_updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache.try_update(
+                ck,
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            )
+        });
+        if !cache_updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            );
+        }
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -480,17 +500,21 @@ impl ShardStore {
         nslog.put_many(pairs).await?;
         let revision = nslog.last_revision();
         for (key, value) in pairs {
-            self.cache.insert(
-                Self::cache_key(ns, key),
-                value.clone(),
-                None,
-                None,
-                0,
-                revision,
-            );
+            let cache_updated = Self::with_cache_key(ns, key, |ck| {
+                self.cache
+                    .try_update(ck, value.clone(), None, None, 0, revision)
+            });
+            if !cache_updated {
+                self.cache.insert(
+                    Self::cache_key(ns, key),
+                    value.clone(),
+                    None,
+                    None,
+                    0,
+                    revision,
+                );
+            }
         }
-        // Notify after all writes — revision is last_tstamp from the batch.
-        let revision = nslog.last_revision();
         let mut w = self.watchers.borrow_mut();
         for (key, value) in pairs {
             w.notify(
@@ -687,14 +711,20 @@ impl ShardStore {
         let key_bytes = Bytes::copy_from_slice(key);
         nslog.put_full(key_bytes.clone(), &value, &[], None).await?;
         let revision = nslog.last_revision();
-        self.cache.insert(
-            Self::cache_key(ns, key),
-            value.clone(),
-            None,
-            None,
-            0,
-            revision,
-        );
+        let cache_updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache
+                .try_update(ck, value.clone(), None, None, 0, revision)
+        });
+        if !cache_updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                value.clone(),
+                None,
+                None,
+                0,
+                revision,
+            );
+        }
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -788,14 +818,26 @@ impl ShardStore {
             .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
             .await?;
         let revision = nslog.last_revision();
-        self.cache.insert(
-            Self::cache_key(ns, key),
-            value.clone(),
-            expires_at_ms,
-            opts.metadata.clone(),
-            meta_bytes.len(),
-            revision,
-        );
+        let cache_updated = Self::with_cache_key(ns, key, |ck| {
+            self.cache.try_update(
+                ck,
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            )
+        });
+        if !cache_updated {
+            self.cache.insert(
+                Self::cache_key(ns, key),
+                value.clone(),
+                expires_at_ms,
+                opts.metadata.clone(),
+                meta_bytes.len(),
+                revision,
+            );
+        }
         self.watchers.borrow_mut().notify(
             ns,
             key,

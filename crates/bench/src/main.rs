@@ -94,13 +94,6 @@ struct Cli {
     /// (`rocksdb-baseline`, `lsm-rewrite-v1`, …) that survives in JSON greps.
     #[arg(long)]
     label: Option<String>,
-
-    /// Total number of Beyond shards (= `--threads` passed to beyond-kv).
-    /// When > 1, the bench pre-filters N keyspace partitions (one per shard)
-    /// and assigns connections round-robin so each shard's L1 cache covers
-    /// exactly its 1/N slice of the dataset.
-    #[arg(long, default_value_t = 1)]
-    shards: usize,
 }
 
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
@@ -149,26 +142,11 @@ async fn main() -> anyhow::Result<()> {
         seed: cli.seed,
     };
 
-    let driver = if cli.shards <= 1 {
-        let keyspace = Keyspace::new_sharded(cli.keys, cli.keydist, 0, 1)?;
-        Driver::new(
-            Workload::new(keyspace, cli.workload, cli.value_size, cli.batch),
-            plan,
-        )
-    } else {
-        eprintln!(
-            "shards={} — pre-filtering {} keyspace partitions (this may take a moment)",
-            cli.shards, cli.shards,
-        );
-        let shard_workloads = (0..cli.shards)
-            .map(|s| {
-                let ks = Keyspace::new_sharded(cli.keys, cli.keydist, s, cli.shards)?;
-                Ok(Workload::new(ks, cli.workload, cli.value_size, cli.batch))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        eprintln!("shards={} — partitions ready", cli.shards);
-        Driver::new_sharded(shard_workloads, plan)
-    };
+    let keyspace = Keyspace::new(cli.keys, cli.keydist)?;
+    let driver = Driver::new(
+        Workload::new(keyspace, cli.workload, cli.value_size, cli.batch),
+        plan,
+    );
 
     print_plan(&cli, &driver.plan);
 
@@ -291,17 +269,11 @@ fn mode_summary(m: &Mode) -> ModeSummary {
 }
 
 fn print_plan(cli: &Cli, plan: &Plan) {
-    let shard_info = if cli.shards > 1 {
-        format!(" shards={}", cli.shards)
-    } else {
-        String::new()
-    };
     eprintln!(
-        "plan: workload={:?} keys={}{} keydist={:?} value_size={}B \
+        "plan: workload={:?} keys={} keydist={:?} value_size={}B \
          concurrency={} duration={:?} warmup={:?} mode={:?} populate={} seed={:#x}",
         cli.workload,
         cli.keys,
-        shard_info,
         cli.keydist,
         cli.value_size,
         plan.concurrency,

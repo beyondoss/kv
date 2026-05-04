@@ -101,12 +101,9 @@ wait_for_port() {
 
 # ── Run bench ─────────────────────────────────────────────────────────────────
 run_bench() {
-    local shard_args=()
-    [[ "$BEYOND_SHARDS" -gt 1 ]] && shard_args=("--shards" "$BEYOND_SHARDS")
     kv-bench \
         --target "beyond=redis://127.0.0.1:$BEYOND_PORT" \
         --target "redis=redis://127.0.0.1:$REDIS_PORT" \
-        "${shard_args[@]}" \
         "$@"
 }
 

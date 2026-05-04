@@ -87,6 +87,38 @@ impl MemCache {
         Some((value, expires_at_ms, metadata, revision))
     }
 
+    /// Update an existing entry in-place using a borrowed composite key.
+    /// Returns `true` if the key was found and updated; `false` if absent.
+    /// Call `insert` with an owned key when this returns `false`.
+    /// Avoids allocating the composite cache key on the common overwrite path.
+    pub fn try_update(
+        &self,
+        key: &[u8],
+        value: Bytes,
+        expires_at_ms: Option<u64>,
+        metadata: Option<Arc<serde_json::Value>>,
+        meta_size: usize,
+        revision: u64,
+    ) -> bool {
+        let size = (key.len() + value.len() + meta_size).max(1);
+        let mut entries = self.entries.borrow_mut();
+        let Some(e) = entries.get_mut(key) else {
+            return false;
+        };
+        let old_size = e.size;
+        e.freq.set(1);
+        e.value = value;
+        e.expires_at_ms = expires_at_ms;
+        e.metadata = metadata;
+        e.size = size;
+        e.revision = revision;
+        let cur = self.current_bytes.get();
+        self.current_bytes.set(cur.saturating_sub(old_size) + size);
+        drop(entries);
+        self.evict_to_limit();
+        true
+    }
+
     pub fn insert(
         &self,
         key: Bytes,
