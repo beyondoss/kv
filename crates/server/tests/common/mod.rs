@@ -118,6 +118,8 @@ impl TestServer {
                             resp_wakeup_read,
                             10_000,
                             std::time::Duration::from_secs(60),
+                            0,
+                            1,
                         )
                         .await;
                     });

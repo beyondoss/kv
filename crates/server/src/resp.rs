@@ -21,6 +21,8 @@ pub struct ConnState {
     pub ns: String,
     pub resp_version: u8,
     pub quit: bool,
+    pub shard_idx: usize,
+    pub n_shards: usize,
 }
 
 impl Default for ConnState {
@@ -29,6 +31,8 @@ impl Default for ConnState {
             ns: DEFAULT_NS.to_string(),
             resp_version: 2,
             quit: false,
+            shard_idx: 0,
+            n_shards: 1,
         }
     }
 }
@@ -39,20 +43,32 @@ pub async fn serve(
     wakeup_read: StdUnixStream,
     max_conns: usize,
     idle_timeout: Duration,
+    shard_idx: usize,
+    n_shards: usize,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
         let store = store.clone();
         monoio::spawn(async move {
             let _guard = guard;
-            handle_conn(s, store, idle_timeout).await;
+            handle_conn(s, store, idle_timeout, shard_idx, n_shards).await;
         });
     })
     .await;
 }
 
-async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>, idle_timeout: Duration) {
+async fn handle_conn(
+    stream: TcpStream,
+    store: Rc<ShardStore>,
+    idle_timeout: Duration,
+    shard_idx: usize,
+    n_shards: usize,
+) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
-    let mut state = ConnState::default();
+    let mut state = ConnState {
+        shard_idx,
+        n_shards,
+        ..ConnState::default()
+    };
 
     loop {
         use monoio::io::sink::Sink;

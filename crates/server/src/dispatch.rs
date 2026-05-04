@@ -8,6 +8,15 @@ use beyond_kv_proto::response::{self as r};
 use beyond_resp::Value;
 
 use crate::resp::ConnState;
+use crate::routing::shard_for_key;
+
+/// Returns true if any key in `keys` hashes to a shard other than `shard_idx`.
+fn has_crossslot(keys: &[impl AsRef<[u8]>], shard_idx: usize, n_shards: usize) -> bool {
+    n_shards > 1
+        && keys
+            .iter()
+            .any(|k| shard_for_key(k.as_ref(), n_shards) != shard_idx)
+}
 
 const KEYS_SCAN_LIMIT: usize = 1_000_000;
 
@@ -94,6 +103,9 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Del { keys } => {
+            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
+                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
+            }
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
             match store.del(&state.ns, &refs).await {
                 Ok(n) => r::integer(n as i64),
@@ -102,6 +114,9 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Exists { keys } => {
+            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
+                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
+            }
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
             match store.exists(&state.ns, &refs).await {
                 Ok(n) => r::integer(n as i64),
@@ -186,6 +201,9 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         },
 
         Command::MGet { keys } => {
+            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
+                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
+            }
             // Bulk lookup: store.mget batches L1 misses through io_uring via
             // join_all, so a 100-key MGET dispatches all the cold reads
             // concurrently rather than serially awaiting each one.
@@ -205,10 +223,19 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::MSet { pairs } => match store.mset(&state.ns, &pairs).await {
-            Ok(()) => r::ok(),
-            Err(e) => r::error("ERR", &e.to_string()),
-        },
+        Command::MSet { pairs } => {
+            if state.n_shards > 1
+                && pairs
+                    .iter()
+                    .any(|(k, _)| shard_for_key(k.as_ref(), state.n_shards) != state.shard_idx)
+            {
+                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
+            }
+            match store.mset(&state.ns, &pairs).await {
+                Ok(()) => r::ok(),
+                Err(e) => r::error("ERR", &e.to_string()),
+            }
+        }
 
         Command::GetSet { key, value } => match store.getset(&state.ns, &key, value).await {
             Ok(Some(old)) => r::bulk(old.value),

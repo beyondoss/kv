@@ -1,7 +1,6 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::hash::Hasher;
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -11,17 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::Duration;
 
-use rustc_hash::FxHasher;
-
-fn shard_for_key(key: &[u8], n: usize) -> usize {
-    let mut h = FxHasher::default();
-    h.write(key);
-    (h.finish() as usize) % n
-}
-
 fn route(key: Option<Vec<u8>>, n: usize, rr: &AtomicUsize) -> usize {
     match key {
-        Some(k) => shard_for_key(&k, n),
+        Some(k) => beyond_kv::routing::shard_for_key(&k, n),
         None => rr.fetch_add(1, Ordering::Relaxed) % n,
     }
 }
@@ -272,6 +263,8 @@ fn main() -> anyhow::Result<()> {
                                 resp_wake_read,
                                 max_conns,
                                 idle_timeout,
+                                i,
+                                n_threads,
                             )
                             .await;
 

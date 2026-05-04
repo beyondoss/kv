@@ -319,7 +319,7 @@ CAS enables optimistic concurrency control: a write succeeds only if the current
 └────────┘
 ```
 
-`ConnState` (`dispatch.rs`) holds `ns`, `resp_version`, and `quit`. The HELLO command is handled before the codec switches so the response uses the old version.
+`ConnState` (`resp.rs`) holds `ns`, `resp_version`, `quit`, `shard_idx`, and `n_shards`. The HELLO command is handled before the codec switches so the response uses the old version.
 
 ### Key Lifecycle
 
@@ -339,7 +339,9 @@ absent ──CAS──────────────────► absent
 
 ### Why each thread has its own engine instance
 
-Sharing storage across threads would require locking on the index and the active-file write offset. Per-thread instances eliminate that coordination entirely and keep the hot path lock-free. The tradeoff is that a routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
+Sharing storage across threads would require locking on the index and the active-file write offset. Per-thread instances eliminate that coordination entirely and keep the hot path lock-free. The tradeoff is that the routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
+
+Connection routing is built into the server: `peek_resp_key` peeks the first bytes of a new TCP connection (without consuming them), extracts the key from the first command, and runs `FxHash(key) % n_shards` to pick a worker thread. The connection is then pinned to that thread for its lifetime. Multi-key commands (MGET, MSET, DEL, EXISTS) whose keys don't all hash to the pinned shard receive a `-CROSSSLOT` error — same semantics as Redis Cluster — so callers receive an explicit error rather than a silent wrong answer.
 
 ### Why expiry is lazy rather than proactive
 

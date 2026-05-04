@@ -5,7 +5,17 @@
 //! cannot be extracted (slow client, unrecognized prefix), the caller falls
 //! back to round-robin assignment.
 
+use std::hash::Hasher as _;
 use std::net::TcpStream;
+
+use rustc_hash::FxHasher;
+
+/// Hash `key` to a shard index in `[0, n)`.
+pub fn shard_for_key(key: &[u8], n: usize) -> usize {
+    let mut h = FxHasher::default();
+    h.write(key);
+    (h.finish() as usize) % n
+}
 
 fn hex_val(b: u8) -> Option<u8> {
     match b {
