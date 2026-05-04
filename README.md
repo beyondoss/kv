@@ -40,21 +40,37 @@ await kv.close();
 
 ## Operations
 
-| Operation | RESP command                        | HTTP                                           |
-| --------- | ----------------------------------- | ---------------------------------------------- |
-| Get       | `GET key`                           | `GET /namespaces/{ns}/values/{key}`            |
-| Set       | `SET key value [EX n] [NX\|XX]`     | `PUT /namespaces/{ns}/values/{key}`            |
-| Delete    | `DEL key`                           | `DELETE /namespaces/{ns}/values/{key}`         |
-| Bulk get  | `MGET k1 k2 ...`                    | parallel requests                              |
-| Bulk set  | `MSET k1 v1 k2 v2 ...`              | parallel requests                              |
-| Scan      | `SCAN cursor [MATCH pat] [COUNT n]` | `GET /namespaces/{ns}/keys?cursor=0&pattern=*` |
-| TTL (get) | `TTL key` / `PTTL key`              | `X-KV-TTL` response header                     |
-| TTL (set) | `EXPIRE key n` / `PERSIST key`      | `X-KV-TTL` request header                      |
-| Namespace | `SELECT 0–15`                       | path: `/namespaces/{name}/...`                 |
-| Count     | `DBSIZE`                            | —                                              |
-| Flush     | `FLUSHDB`                           | —                                              |
+| Operation     | RESP command                                                                               | HTTP                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Get           | `GET key`                                                                                  | `GET /namespaces/{ns}/values/{key}`                                                    |
+| Set           | `SET key value [EX n] [NX\|XX]`                                                            | `PUT /namespaces/{ns}/values/{key}`                                                    |
+| Set if absent | `SETNX key value`                                                                          | `PUT /namespaces/{ns}/values/{key}?nx=1`                                               |
+| Compare+set   | _(none — use `SET XX` after `GET`)_                                                        | `PUT /namespaces/{ns}/values/{key}` + `if-match: <revision>`                           |
+| Delete        | `DEL key`                                                                                  | `DELETE /namespaces/{ns}/values/{key}`                                                 |
+| Exists        | `EXISTS key`                                                                               | —                                                                                      |
+| Get+set       | `GETSET key value`                                                                         | —                                                                                      |
+| Get+delete    | `GETDEL key`                                                                               | —                                                                                      |
+| Get+expire    | `GETEX key [EX n \| PERSIST]`                                                              | —                                                                                      |
+| Increment     | `INCR key` / `INCRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=n`                                      |
+| Decrement     | `DECR key` / `DECRBY key n`                                                                | `POST /namespaces/{ns}/values/{key}/incr?delta=-n`                                     |
+| Bulk get      | `MGET k1 k2 ...`                                                                           | parallel requests                                                                      |
+| Bulk set      | `MSET k1 v1 k2 v2 ...`                                                                     | parallel requests                                                                      |
+| Scan          | `SCAN cursor [MATCH pat] [COUNT n]`                                                        | `GET /namespaces/{ns}/keys?cursor=0&prefix=p`                                          |
+| Keys          | `KEYS pattern`                                                                             | —                                                                                      |
+| TTL (get)     | `TTL key` / `PTTL key`                                                                     | `X-KV-TTL` response header                                                             |
+| TTL (set)     | `EXPIRE key n` / `PEXPIRE key ms` / `EXPIREAT key ts` / `PEXPIREAT key ts` / `PERSIST key` | `X-KV-TTL` request header                                                              |
+| Watch         | `WATCH key ...` / `PWATCH prefix ...` / `UNWATCH`                                          | `GET /namespaces/{ns}/watch/{key}` (SSE) / `GET /namespaces/{ns}/watch?prefix=p` (SSE) |
+| Namespace     | `SELECT 0–15`                                                                              | path: `/namespaces/{name}/...`                                                         |
+| Count         | `DBSIZE`                                                                                   | —                                                                                      |
+| Flush         | `FLUSHDB`                                                                                  | —                                                                                      |
 
 TTL is stored as an absolute millisecond timestamp. `EXPIRE`/`PERSIST` update a sidecar map without rewriting the value. Expiry is lazy on access; a background sweep handles L1 eviction.
+
+`INCR`/`INCRBY`/`DECR`/`DECRBY` interpret the stored value as a UTF-8 decimal integer and return the new value as an integer reply. The operation is atomic per shard. Over HTTP, pass a negative `delta` to decrement.
+
+Compare-and-swap over HTTP: `GET` a key to read its `X-KV-Revision` header, then `PUT` with `if-match: <revision>`. The server atomically rejects the write if the revision has changed.
+
+`WATCH` / `PWATCH` over RESP3 deliver push messages on key writes — send `HELLO 3` first; `UNWATCH` cancels all subscriptions. Over HTTP, the SSE endpoints stream the same events; closing the connection is equivalent to `UNWATCH`.
 
 ## TypeScript SDK
 
@@ -145,17 +161,17 @@ The benchmark uses an **open-loop load generator** with coordinated-omission cor
 
 ### Single-key GET / SET — 1 shard
 
-80% GET / 20% SET · 500k distinct keys · 256-byte values · uniform distribution · 64 connections · 512 MiB memory
+80% GET / 20% SET · 500k distinct keys · 256-byte values · uniform distribution · 64 connections · 512 MiB memory · service latency (median of 3 runs)
 
-| Target rate | Beyond p50 | Beyond p99 | Beyond p99.9 | Redis p50 | Redis p99 | Redis p99.9 |
-| ----------- | ---------: | ---------: | -----------: | --------: | --------: | ----------: |
-| 10k ops/s   |     216 µs |     791 µs |     2,799 µs |    257 µs |  2,157 µs |    8,767 µs |
-| 25k ops/s   |     267 µs |     979 µs |     2,913 µs |    254 µs |  1,360 µs |    5,275 µs |
-| 50k ops/s   |     251 µs |     680 µs |     2,669 µs |    216 µs |  1,210 µs |    7,663 µs |
-| 100k ops/s  |     192 µs |     426 µs |     1,659 µs |    182 µs |    483 µs |    1,916 µs |
-| 200k ops/s  |     168 µs |     367 µs |     1,362 µs |    137 µs |    274 µs |      979 µs |
+| Target rate | Beyond p50 | Beyond p99 | Redis p50 | Redis p99 |
+| ----------- | ---------: | ---------: | --------: | --------: |
+| 10k ops/s   |     217 µs |     993 µs |    252 µs |  1,183 µs |
+| 25k ops/s   |     261 µs |   1,047 µs |    270 µs |  1,073 µs |
+| 50k ops/s   |     263 µs |     866 µs |    252 µs |    760 µs |
+| 100k ops/s  |     202 µs |     633 µs |    186 µs |    454 µs |
+| 200k ops/s  |     183 µs |     364 µs |    153 µs |    317 µs |
 
-Both sustain 200k ops/s cleanly. Beyond's p99 service latency is **50–80% lower** than Redis at 10–100k ops/s. Redis edges ahead on p50 and ceiling at very high rates (>200k); Beyond's advantage is in the tail.
+Both sustain 200k ops/s. Beyond has a p99 service latency advantage at low rates (10k: 993 µs vs 1,183 µs); the two converge through mid-range. Redis pulls ahead on both p50 and p99 at 100k+.
 
 ---
 

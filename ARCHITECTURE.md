@@ -413,25 +413,25 @@ Across shards (when MSET keys span shard boundaries), atomicity is **not** prese
 
 ## File Map
 
-| File                               | What It Does                                                                                                              |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `crates/proto/src/command.rs`      | Parses RESP arrays into `Command` enum; validates arity and option syntax                                                 |
-| `crates/proto/src/response.rs`     | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply)                                                 |
-| `crates/proto/src/error.rs`        | Protocol-level error variants returned to clients                                                                         |
-| `crates/engine/src/store.rs`       | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET                                  |
-| `crates/engine/src/cache.rs`       | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting                                               |
-| `crates/engine/src/types.rs`       | `Entry`, `SetOptions`, `TtlResult`, `ScanPage`                                                                            |
-| `crates/engine/src/error.rs`       | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON)                                    |
-| `crates/engine/src/log/mod.rs`     | `NamespaceLog`: index + active + sealed files; put_full / put_many / tombstone / ttl_update / bulk_read / flush / reclaim |
-| `crates/engine/src/log/file.rs`    | `LogFile`: monoio io_uring file wrapper; append, read_at, write_footer, read_footer                                       |
-| `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                           |
-| `crates/engine/src/log/index.rs`   | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN                                                                     |
-| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers, replay active-file tail; orphan TTL-update handling                                   |
-| `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file                                                           |
-| `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                    |
-| `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                   |
-| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS            |
-| `crates/server/src/cross_shard.rs` | `CrossShardRequest` enum + per-shard receiver loop; `futures_channel::mpsc` transport for fan-out sub-requests            |
-| `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                    |
-| `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                          |
-| `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint                              |
+| File                               | What It Does                                                                                                                       |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/proto/src/command.rs`      | Parses RESP arrays into `Command` enum; validates arity and option syntax                                                          |
+| `crates/proto/src/response.rs`     | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply)                                                          |
+| `crates/proto/src/error.rs`        | Protocol-level error variants returned to clients                                                                                  |
+| `crates/engine/src/store.rs`       | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET                                           |
+| `crates/engine/src/cache.rs`       | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting                                                        |
+| `crates/engine/src/types.rs`       | `Entry`, `SetOptions`, `TtlResult`, `ScanPage`                                                                                     |
+| `crates/engine/src/error.rs`       | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON)                                             |
+| `crates/engine/src/log/mod.rs`     | `NamespaceLog`: index + active + sealed files; put_full / put_many / tombstone / ttl_update / bulk_read / flush / reclaim          |
+| `crates/engine/src/log/file.rs`    | `LogFile`: monoio io_uring file wrapper; append, read_at, write_footer, read_footer                                                |
+| `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                                    |
+| `crates/engine/src/log/index.rs`   | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN                                                                              |
+| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers; clean-shutdown active file has a footer (fast path), crash falls back to CRC-truncating replay |
+| `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file                                                                    |
+| `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                             |
+| `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                            |
+| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS                     |
+| `crates/server/src/cross_shard.rs` | `CrossShardRequest` enum + per-shard receiver loop; `futures_channel::mpsc` transport for fan-out sub-requests                     |
+| `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                             |
+| `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                                   |
+| `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint                                       |

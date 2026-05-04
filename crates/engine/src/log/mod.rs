@@ -487,6 +487,28 @@ impl NamespaceLog {
         Ok(events)
     }
 
+    /// Write a footer to the active file without rotating. Called on clean shutdown
+    /// so the next startup can load this file as a sealed file (fast footer read)
+    /// instead of replaying it record-by-record.
+    pub async fn seal_active_for_shutdown(&self) -> Result<()> {
+        let active = self.active.borrow().clone();
+        let footer: Vec<FooterEntry> = {
+            let index = self.index.borrow();
+            index
+                .iter()
+                .filter(|(_, e)| e.file_id == active.file_id)
+                .map(|(k, e)| FooterEntry {
+                    key: k.clone(),
+                    record_offset: e.record_offset,
+                    record_size: e.record_size,
+                    expires_at_ms: index.ttl(k),
+                    tstamp_ms: e.tstamp_ms,
+                })
+                .collect()
+        };
+        active.write_footer(&footer).await
+    }
+
     /// Seal the current active file (writing its footer) and open a new active file.
     /// Called automatically when `active.write_offset() >= config.rotate_threshold`.
     ///

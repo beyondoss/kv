@@ -1022,6 +1022,20 @@ impl ShardStore {
         Ok(())
     }
 
+    /// Write a footer to every active namespace file. Call on clean shutdown after
+    /// `sync_logs` so the next startup loads each file via fast footer read instead
+    /// of replaying records.
+    pub async fn seal_all_for_shutdown(&self) -> crate::error::Result<()> {
+        let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
+        let results = join_all(ns_list.iter().map(|ns| ns.seal_active_for_shutdown())).await;
+        for result in results {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "failed to seal namespace on shutdown");
+            }
+        }
+        Ok(())
+    }
+
     /// Trigger reclaim on one namespace. Used by `BGREWRITEAOF`.
     pub async fn reclaim(&self, ns: &str) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;

@@ -69,8 +69,30 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
         sealed.push(file);
     }
 
-    let active = LogFile::open_rw(active_path, active_id).await?;
-    replay_active(&active, active_id, &mut index).await?;
+    // Check if the highest-id file was cleanly sealed on shutdown (footer present).
+    // If so, load it as a sealed file and open a fresh empty active file.
+    let highest = LogFile::open_ro(active_path.clone(), active_id).await?;
+    let active = match highest.read_footer().await? {
+        Some(entries) => {
+            apply_footer_entries(&mut index, active_id, &entries);
+            sealed.push(highest);
+            let next_id = active_id.checked_add(1).ok_or(EngineError::BadRecord {
+                offset: 0,
+                reason: "file_id overflow on clean-shutdown recovery",
+            })?;
+            let new_path = active_path
+                .parent()
+                .expect("namespace dir has a parent")
+                .join(crate::log::file::data_filename(next_id));
+            LogFile::open_rw(new_path, next_id).await?
+        }
+        None => {
+            drop(highest);
+            let active = LogFile::open_rw(active_path, active_id).await?;
+            replay_active(&active, active_id, &mut index).await?;
+            active
+        }
+    };
 
     Ok(OpenedFiles {
         sealed,

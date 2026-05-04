@@ -294,6 +294,11 @@ fn main() -> anyhow::Result<()> {
                             } else {
                                 tracing::debug!("worker {i}: final log sync complete");
                             }
+                            // Seal active files so the next startup reads footers
+                            // instead of replaying records.
+                            store.seal_all_for_shutdown().await.unwrap_or_else(|e| {
+                                tracing::error!(error = %e, "seal on shutdown failed");
+                            });
                         })
                     })
                     .expect("failed to spawn worker thread")
