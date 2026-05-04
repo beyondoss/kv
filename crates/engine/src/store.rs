@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_channel::mpsc::UnboundedReceiver;
+use futures_channel::mpsc::Receiver;
 use futures_util::future::join_all;
 use rustc_hash::FxHashMap;
 use tracing::info;
@@ -347,6 +347,7 @@ impl ShardStore {
         let mut results: Vec<Option<Entry>> = vec![None; keys.len()];
         let mut misses: Vec<(usize, IndexEntry)> = Vec::new();
         let mut miss_ttls: Vec<Option<u64>> = Vec::new();
+        let mut expired_keys: Vec<&[u8]> = Vec::new();
 
         for (i, key) in keys.iter().enumerate() {
             // L1
@@ -369,12 +370,20 @@ impl ShardStore {
                 }
             };
             if ttl.map_or(false, |ms| ms <= now) {
-                // Expired — lazy-delete and skip.
-                nslog.tombstone(key).await?;
+                expired_keys.push(key);
                 continue;
             }
             misses.push((i, entry));
             miss_ttls.push(ttl);
+        }
+
+        // Batch-tombstone expired keys concurrently so their individual disk writes
+        // don't serialize inside the per-key loop above.
+        if !expired_keys.is_empty() {
+            let tombstone_futs: Vec<_> = expired_keys.iter().map(|k| nslog.tombstone(k)).collect();
+            for result in join_all(tombstone_futs).await {
+                result?;
+            }
         }
 
         if !misses.is_empty() {
@@ -588,11 +597,12 @@ impl ShardStore {
             }
         };
 
-        if found.is_none() {
+        let Some(found) = found else {
             return Ok(None);
-        }
+        };
 
-        match op.unwrap() {
+        // op.is_some() is guaranteed by the early return at the top of this function.
+        match op.expect("op is Some; checked at function entry") {
             GetExOp::SetTtl(ttl) => {
                 let new_ms = now + Self::validate_ttl(ttl)?;
                 nslog.ttl_update(key, Some(new_ms)).await?;
@@ -604,7 +614,7 @@ impl ShardStore {
             }
         }
 
-        Ok(found)
+        Ok(Some(found))
     }
 
     pub async fn ttl(&self, ns: &str, key: &[u8]) -> Result<TtlResult> {
@@ -624,9 +634,21 @@ impl ShardStore {
         let old = self.get_inline(&nslog, ns, key, now).await?;
         // Inline set — same nslog, no second ensure_ns call.
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog.put_full(key_bytes, &value, &[], None).await?;
+        nslog.put_full(key_bytes.clone(), &value, &[], None).await?;
+        let revision = nslog.last_revision();
         self.cache
-            .insert(Self::cache_key(ns, key), value, None, None);
+            .insert(Self::cache_key(ns, key), value.clone(), None, None);
+        self.watchers.borrow_mut().notify(
+            ns,
+            key,
+            WatchEvent::Set {
+                key: key_bytes,
+                value,
+                metadata: None,
+                expires_at_ms: None,
+                revision,
+            },
+        );
         Ok(old)
     }
 
@@ -636,6 +658,17 @@ impl ShardStore {
         let old = self.get_inline(&nslog, ns, key, now).await?;
         nslog.tombstone(key).await?;
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+        if old.is_some() {
+            let revision = nslog.last_revision();
+            self.watchers.borrow_mut().notify(
+                ns,
+                key,
+                WatchEvent::Del {
+                    key: Bytes::copy_from_slice(key),
+                    revision,
+                },
+            );
+        }
         Ok(old)
     }
 
@@ -667,7 +700,7 @@ impl ShardStore {
         ns: &str,
         filter: KeyFilter<'_>,
         since: u64,
-    ) -> Result<(Vec<WatchEvent>, UnboundedReceiver<WatchEvent>)> {
+    ) -> Result<(Vec<WatchEvent>, Receiver<WatchEvent>)> {
         let ns_b = Bytes::copy_from_slice(ns.as_bytes());
 
         let rx = match &filter {
@@ -754,8 +787,7 @@ impl ShardStore {
         } else if cursor.len() == 8 {
             cursor.try_into().map(u64::from_le_bytes).unwrap_or(0)
         } else {
-            return Err(EngineError::BadRecord {
-                offset: 0,
+            return Err(EngineError::InvalidInput {
                 reason: "invalid scan cursor",
             });
         };
@@ -1463,6 +1495,54 @@ mod tests {
             set(&s, b"cleanup", b"v").await;
             // A second set also works (prune already happened).
             set(&s, b"cleanup", b"v2").await;
+        });
+    }
+
+    #[test]
+    fn getset_delivers_watch_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            let (_initial, mut rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"gsk"), 0)
+                .await
+                .unwrap();
+
+            s.getset("default", b"gsk", Bytes::from_static(b"new"))
+                .await
+                .unwrap();
+
+            let event = rx.try_recv().unwrap();
+            match event {
+                WatchEvent::Set { key, value, .. } => {
+                    assert_eq!(key.as_ref(), b"gsk");
+                    assert_eq!(value.as_ref(), b"new");
+                }
+                other => panic!("expected Set, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn getdel_delivers_watch_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"gdk", b"v").await;
+            let (_initial, mut rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"gdk"), 0)
+                .await
+                .unwrap();
+
+            s.getdel("default", b"gdk").await.unwrap();
+
+            let event = rx.try_recv().unwrap();
+            assert!(
+                matches!(event, WatchEvent::Del { .. }),
+                "expected Del, got {event:?}"
+            );
         });
     }
 

@@ -321,19 +321,37 @@ impl NamespaceLog {
                 .collect()
         };
 
+        if live.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Submit all value reads concurrently via io_uring (same pattern as bulk_read).
+        let misses: Vec<(usize, index::IndexEntry)> = live
+            .iter()
+            .enumerate()
+            .map(|(i, (_, e, _))| (i, *e))
+            .collect();
+        let read_results = self.bulk_read(misses).await?;
+
         let mut events = Vec::with_capacity(live.len());
-        for (key, entry, expires_at_ms) in live {
-            let (value, meta_bytes) = self.read_value(entry).await?;
+        for (slot, value, meta_bytes) in read_results {
+            let (key, _, expires_at_ms) = &live[slot];
             let metadata = if meta_bytes.is_empty() {
                 None
             } else {
-                serde_json::from_slice(&meta_bytes).ok()
+                match serde_json::from_slice(&meta_bytes) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!(key = ?key, error = %e, "corrupt metadata during current_entries; dropping field");
+                        None
+                    }
+                }
             };
             events.push(WatchEvent::Set {
-                key,
+                key: key.clone(),
                 value,
                 metadata,
-                expires_at_ms,
+                expires_at_ms: *expires_at_ms,
                 revision: 0,
             });
         }
@@ -449,18 +467,26 @@ impl NamespaceLog {
         // Unlink all data-* files (including current active — it's still held
         // through the Rc until we replace it; on Linux the inode's blocks stay
         // alive for the open handle and are freed when we drop the Rc).
-        if self.dir.exists() {
-            for entry in std::fs::read_dir(&self.dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if name.starts_with("data-") {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        warn!(path = %path.display(), error = %e, "failed to unlink data file during flush");
-                    }
-                }
+        let to_unlink: Vec<PathBuf> = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.starts_with("data-"))
+                })
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let unlink_futures: Vec<_> = to_unlink
+            .iter()
+            .map(|p| monoio::fs::remove_file(p.clone()))
+            .collect();
+        for (path, res) in to_unlink.iter().zip(join_all(unlink_futures).await) {
+            if let Err(e) = res {
+                warn!(path = %path.display(), error = %e, "failed to unlink data file during flush");
             }
         }
 
@@ -623,7 +649,13 @@ async fn scan_file_records(
                     let metadata = if meta_bytes.is_empty() {
                         None
                     } else {
-                        serde_json::from_slice(meta_bytes).ok()
+                        match serde_json::from_slice(meta_bytes) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                warn!(offset, error = %e, "corrupt metadata in scan_file_records; dropping field");
+                                None
+                            }
+                        }
                     };
                     let expires_at_ms = if hdr.flags & record::flags::NO_EXPIRY != 0 {
                         None

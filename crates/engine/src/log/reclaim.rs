@@ -33,7 +33,7 @@ pub async fn reclaim_namespace(
     live: &[(Bytes, IndexEntry, Option<u64>)],
 ) -> Result<(ReclaimReport, Vec<(Bytes, IndexEntry, Option<u64>)>)> {
     let tmp_path = dir.join(reclaim_tmp_filename(next_file_id));
-    match std::fs::remove_file(&tmp_path) {
+    match monoio::fs::remove_file(&tmp_path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!(
@@ -89,13 +89,19 @@ pub async fn reclaim_namespace(
     drop(new_file); // close fd before rename (not strictly required, but clean)
 
     let final_path = dir.join(data_filename(next_file_id));
-    std::fs::rename(&tmp_path, &final_path)?;
+    monoio::fs::rename(&tmp_path, &final_path).await?;
 
     let live_keys = new_entries.len() as u64;
 
+    // Unlink all old sealed files concurrently via io_uring.
+    let unlink_futures: Vec<_> = sealed_files
+        .iter()
+        .map(|f| monoio::fs::remove_file(f.path.clone()))
+        .collect();
+    let unlink_results = join_all(unlink_futures).await;
     let mut dead_files_dropped = 0u32;
-    for f in sealed_files {
-        match std::fs::remove_file(&f.path) {
+    for (f, res) in sealed_files.iter().zip(unlink_results) {
+        match res {
             Ok(()) => dead_files_dropped += 1,
             Err(e) => warn!(
                 path = %f.path.display(),

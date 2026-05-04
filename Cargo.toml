@@ -19,7 +19,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 http = "1.0"
 mimalloc = { version = "0.1", features = ["v2"] }
-monoio = { version = "0.2", features = ["io-uring"] }
+monoio = { version = "0.2", features = ["io-uring", "unlinkat", "renameat"] }
 monoio-codec = "0.3"
 monoio-http = "0.3"
 rustc-hash = "2"

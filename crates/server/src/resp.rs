@@ -9,7 +9,7 @@ use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use beyond_kv_proto::command::Command;
 use beyond_resp::{RespCodec, Value};
 use bytes::Bytes;
-use futures_channel::mpsc::UnboundedReceiver;
+use futures_channel::mpsc::Receiver;
 use futures_util::StreamExt as FuturesStreamExt;
 use futures_util::stream::SelectAll;
 use monoio::net::TcpStream;
@@ -151,7 +151,7 @@ async fn run_key_watch_loop(
     use monoio::io::sink::Sink;
 
     let since_rev = since.unwrap_or(0);
-    let mut merged: SelectAll<UnboundedReceiver<WatchEvent>> = SelectAll::new();
+    let mut merged: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
 
     for key in &keys {
         match store
@@ -228,7 +228,7 @@ async fn run_prefix_watch_loop(
                 return;
             }
 
-            let mut merged: SelectAll<UnboundedReceiver<WatchEvent>> = SelectAll::new();
+            let mut merged: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
             merged.push(rx);
             watch_stream_loop(framed, merged).await;
         }
@@ -242,7 +242,7 @@ async fn run_prefix_watch_loop(
 
 async fn watch_stream_loop(
     framed: &mut Framed<TcpStream, RespCodec>,
-    mut rx: SelectAll<UnboundedReceiver<WatchEvent>>,
+    mut rx: SelectAll<Receiver<WatchEvent>>,
 ) {
     use monoio::io::sink::Sink;
     use monoio::io::stream::Stream;

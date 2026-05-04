@@ -10,7 +10,7 @@ use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::SetOptions;
 use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use bytes::Bytes;
-use futures_channel::mpsc::UnboundedReceiver;
+use futures_channel::mpsc::Receiver;
 use futures_util::StreamExt as FuturesStreamExt;
 use futures_util::stream::SelectAll;
 use monoio::io::{
@@ -384,7 +384,7 @@ async fn handle_watch_sse(
         return;
     }
 
-    let mut rx_stream: SelectAll<UnboundedReceiver<WatchEvent>> = SelectAll::new();
+    let mut rx_stream: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
     rx_stream.push(rx);
 
     loop {

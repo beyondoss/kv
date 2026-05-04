@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 struct CacheEntry {
     value: Bytes,
@@ -25,11 +26,11 @@ struct Slot {
 /// Entries evicted from Small are tracked in the ghost set; if re-inserted before
 /// the ghost entry is displaced they go directly to Main, preventing churn.
 pub struct MemCache {
-    entries: RefCell<HashMap<Bytes, CacheEntry>>,
+    entries: RefCell<FxHashMap<Bytes, CacheEntry>>,
     small: RefCell<VecDeque<Slot>>,
     main: RefCell<VecDeque<Slot>>,
     /// Hash set for O(1) ghost membership checks. Stores full keys to avoid hash collision.
-    ghost: RefCell<HashSet<Bytes>>,
+    ghost: RefCell<FxHashSet<Bytes>>,
     /// Insertion-ordered queue for bounded eviction of ghost entries.
     ghost_queue: RefCell<VecDeque<Bytes>>,
     /// Maximum number of ghost entries (~10% of estimated total capacity).
@@ -45,10 +46,10 @@ impl MemCache {
         // Bound ghost to ~10% of estimated entry count (assuming ≥64 bytes per entry).
         let ghost_max = (max_bytes / 640).max(64);
         Self {
-            entries: RefCell::new(HashMap::new()),
+            entries: RefCell::new(FxHashMap::default()),
             small: RefCell::new(VecDeque::new()),
             main: RefCell::new(VecDeque::new()),
-            ghost: RefCell::new(HashSet::new()),
+            ghost: RefCell::new(FxHashSet::default()),
             ghost_queue: RefCell::new(VecDeque::new()),
             ghost_max,
             current_bytes: Cell::new(0),

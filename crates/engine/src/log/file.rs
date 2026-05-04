@@ -325,11 +325,13 @@ pub(crate) fn footer_entry_from_index(
 
 /// List all `data-*.log` files in `dir`, sorted ascending by file_id.
 pub fn list_data_files(dir: &Path) -> Result<Vec<(u16, PathBuf)>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
     let mut out: Vec<(u16, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in read_dir {
         let entry = entry?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
