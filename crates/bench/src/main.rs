@@ -89,6 +89,17 @@ struct Cli {
     /// (`rocksdb-baseline`, `lsm-rewrite-v1`, …) that survives in JSON greps.
     #[arg(long)]
     label: Option<String>,
+
+    /// Total number of Beyond shards (= `--threads` passed to beyond-kv).
+    /// When > 1, each target must pair with a `--shard-index`.
+    #[arg(long, default_value_t = 1)]
+    shards: usize,
+
+    /// Which shard this run targets (0-based). The keyspace is pre-filtered to
+    /// only the keys that Beyond's router sends to this shard, so the shard's
+    /// L1 cache covers exactly its 1/N slice of the dataset.
+    #[arg(long, default_value_t = 0)]
+    shard_index: usize,
 }
 
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
@@ -137,7 +148,16 @@ async fn main() -> anyhow::Result<()> {
         seed: cli.seed,
     };
 
-    let keyspace = Keyspace::new(cli.keys, cli.keydist)?;
+    if cli.shards > 1 {
+        eprintln!(
+            "shard filter: shard {}/{} — pre-filtering keyspace (this may take a moment for large key counts)",
+            cli.shard_index, cli.shards,
+        );
+    }
+    let keyspace = Keyspace::new_sharded(cli.keys, cli.keydist, cli.shard_index, cli.shards)?;
+    if cli.shards > 1 {
+        eprintln!("shard filter: {} keys in this shard's partition", keyspace.size());
+    }
     let workload = Workload::new(keyspace, cli.workload, cli.value_size, cli.batch);
     let driver = Driver::new(workload, plan);
 
@@ -248,11 +268,17 @@ fn mode_summary(m: &Mode) -> ModeSummary {
 }
 
 fn print_plan(cli: &Cli, plan: &Plan) {
+    let shard_info = if cli.shards > 1 {
+        format!(" shard={}/{}", cli.shard_index, cli.shards)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "plan: workload={:?} keys={} keydist={:?} value_size={}B \
+        "plan: workload={:?} keys={}{} keydist={:?} value_size={}B \
          concurrency={} duration={:?} warmup={:?} mode={:?} populate={} seed={:#x}",
         cli.workload,
         cli.keys,
+        shard_info,
         cli.keydist,
         cli.value_size,
         plan.concurrency,

@@ -7,9 +7,8 @@ use std::time::Duration;
 use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::SetOptions;
 use bytes::Bytes;
-use monoio::io::AsyncReadRent;
 use monoio::io::{sink::Sink, stream::Stream};
-use monoio::net::{TcpStream, UnixStream};
+use monoio::net::TcpStream;
 use monoio_http::common::body::{Body, BodyExt, FixedBody, HttpBody};
 use monoio_http::h1::codec::{decoder::FillPayload, ServerCodec};
 use monoio_http::h1::payload::Payload;
@@ -18,56 +17,53 @@ pub async fn serve_routed(
     store: Rc<ShardStore>,
     rx: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     wakeup_read: StdUnixStream,
+    max_conns: usize,
+    idle_timeout: Duration,
+    max_value_bytes: usize,
 ) {
-    wakeup_read.set_nonblocking(true).expect("wakeup set_nonblocking");
-    let mut wakeup = match UnixStream::from_std(wakeup_read) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to create HTTP wakeup stream: {e}");
-            return;
-        }
-    };
-
-    let mut buf = vec![0u8; 64];
-    loop {
-        let res;
-        (res, buf) = wakeup.read(buf).await;
-        match res {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        loop {
-            match rx.try_recv() {
-                Ok((stream, peer)) => {
-                    if stream.set_nonblocking(true).is_err() {
-                        tracing::error!(%peer, "HTTP set_nonblocking failed");
-                        continue;
-                    }
-                    match TcpStream::from_std(stream) {
-                        Ok(s) => {
-                            tracing::debug!(%peer, "accepted HTTP connection");
-                            let store = store.clone();
-                            monoio::spawn(async move { handle_conn(s, store).await });
-                        }
-                        Err(e) => tracing::error!(%peer, "HTTP TcpStream::from_std: {e}"),
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
+    crate::serve_loop(rx, wakeup_read, max_conns, "HTTP", |s, _peer, guard| {
+        let store = store.clone();
+        monoio::spawn(async move {
+            let _guard = guard;
+            handle_conn(s, store, idle_timeout, max_value_bytes).await;
+        });
+    })
+    .await;
 }
 
-async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>) {
+async fn handle_conn(
+    stream: TcpStream,
+    store: Rc<ShardStore>,
+    idle_timeout: Duration,
+    max_value_bytes: usize,
+) {
     let mut codec: ServerCodec<TcpStream> = ServerCodec::new(stream);
 
     loop {
-        let req = match Stream::next(&mut codec).await {
-            Some(Ok(r)) => r,
-            _ => break,
+        let req = match monoio::time::timeout(idle_timeout, Stream::next(&mut codec)).await {
+            Ok(Some(Ok(r))) => r,
+            Ok(Some(Err(e))) => {
+                tracing::debug!("HTTP decode error: {e}");
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::debug!("HTTP connection idle timeout");
+                break;
+            }
         };
 
-        // Fill request body from IO into the payload channel before reading
+        // Reject oversized bodies before reading them.
+        let content_len: Option<usize> = req
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        if content_len.map_or(false, |n| n > max_value_bytes) {
+            let _ = Sink::send(&mut codec, payload_too_large()).await;
+            break; // close connection — body not drained
+        }
+
         if codec.fill_payload().await.is_err() {
             break;
         }
@@ -75,7 +71,14 @@ async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>) {
         let (parts, body) = req.into_parts();
         let body_bytes = read_body(body).await;
 
-        let response: http::Response<HttpBody> = route(&parts, body_bytes, &store).await;
+        // Secondary check on actual body size (handles chunked transfer).
+        if body_bytes.len() > max_value_bytes {
+            let response = payload_too_large();
+            let _ = Sink::send(&mut codec, response).await;
+            break;
+        }
+
+        let response = route(&parts, body_bytes, &store).await;
 
         if Sink::send(&mut codec, response).await.is_err() {
             break;
@@ -113,7 +116,7 @@ async fn route(
                     _ => method_not_allowed(),
                 };
             }
-            if rest == "keys" || rest.starts_with("keys?") {
+            if rest == "keys" {
                 if *method == http::Method::GET {
                     let query = parts.uri.query().unwrap_or("");
                     return handle_list(ns, query, store).await;
@@ -180,10 +183,7 @@ async fn handle_put(
 
     if nx {
         match store.setnx(ns, key, body, opts).await {
-            Ok(true) => http::Response::builder()
-                .status(204)
-                .body(HttpBody::fixed_body(None))
-                .unwrap(),
+            Ok(true) => no_content(),
             Ok(false) => json_response(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "key already exists" }),
@@ -192,10 +192,7 @@ async fn handle_put(
         }
     } else if xx {
         match store.setxx(ns, key, body, opts).await {
-            Ok(true) => http::Response::builder()
-                .status(204)
-                .body(HttpBody::fixed_body(None))
-                .unwrap(),
+            Ok(true) => no_content(),
             Ok(false) => json_response(
                 409,
                 &serde_json::json!({ "error": "conflict", "message": "key does not exist" }),
@@ -204,10 +201,7 @@ async fn handle_put(
         }
     } else {
         match store.set(ns, key, body, opts).await {
-            Ok(()) => http::Response::builder()
-                .status(204)
-                .body(HttpBody::fixed_body(None))
-                .unwrap(),
+            Ok(()) => no_content(),
             Err(e) => internal_error(&e.to_string()),
         }
     }
@@ -215,10 +209,7 @@ async fn handle_put(
 
 async fn handle_delete(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
     match store.del(ns, &[key]).await {
-        Ok(_) => http::Response::builder()
-            .status(204)
-            .body(HttpBody::fixed_body(None))
-            .unwrap(),
+        Ok(_) => no_content(),
         Err(e) => internal_error(&e.to_string()),
     }
 }
@@ -345,20 +336,45 @@ fn split_once(s: &str, delim: char) -> Option<(&str, &str)> {
     Some((&s[..pos], &s[pos + 1..]))
 }
 
+fn fallback_500() -> http::Response<HttpBody> {
+    http::Response::builder()
+        .status(500)
+        .header("Content-Type", "text/plain")
+        .body(HttpBody::fixed_body(Some(Bytes::from_static(b"internal error"))))
+        .expect("static response must build")
+}
+
 fn json_response(status: u16, body: &serde_json::Value) -> http::Response<HttpBody> {
     let json = serde_json::to_vec(body).unwrap_or_default();
     http::Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
         .body(HttpBody::fixed_body(Some(Bytes::from(json))))
-        .unwrap()
+        .unwrap_or_else(|_| fallback_500())
 }
 
 fn ok_text(msg: &'static str) -> http::Response<HttpBody> {
     http::Response::builder()
         .status(200)
         .body(HttpBody::fixed_body(Some(Bytes::from_static(msg.as_bytes()))))
-        .unwrap()
+        .unwrap_or_else(|_| fallback_500())
+}
+
+fn no_content() -> http::Response<HttpBody> {
+    http::Response::builder()
+        .status(204)
+        .body(HttpBody::fixed_body(None))
+        .unwrap_or_else(|_| fallback_500())
+}
+
+fn payload_too_large() -> http::Response<HttpBody> {
+    json_response(
+        413,
+        &serde_json::json!({
+            "error": "payload_too_large",
+            "message": "request body exceeds maximum allowed size"
+        }),
+    )
 }
 
 fn not_found_json(code: &str, msg: &str) -> http::Response<HttpBody> {

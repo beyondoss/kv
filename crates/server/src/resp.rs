@@ -2,12 +2,12 @@ use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use beyond_kv_engine::store::{ShardStore, DEFAULT_NS};
 use beyond_kv_proto::command::Command;
 use beyond_resp::{RespCodec, Value};
-use monoio::io::AsyncReadRent;
-use monoio::net::{TcpStream, UnixStream};
+use monoio::net::TcpStream;
 use monoio_codec::Framed;
 
 use crate::dispatch::dispatch;
@@ -28,47 +28,20 @@ pub async fn serve(
     store: Rc<ShardStore>,
     rx: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     wakeup_read: StdUnixStream,
+    max_conns: usize,
+    idle_timeout: Duration,
 ) {
-    wakeup_read.set_nonblocking(true).expect("wakeup set_nonblocking");
-    let mut wakeup = match UnixStream::from_std(wakeup_read) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to create wakeup stream: {e}");
-            return;
-        }
-    };
-
-    let mut buf = vec![0u8; 64];
-    loop {
-        let res;
-        (res, buf) = wakeup.read(buf).await;
-        match res {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        loop {
-            match rx.try_recv() {
-                Ok((stream, peer)) => {
-                    if stream.set_nonblocking(true).is_err() {
-                        tracing::error!(%peer, "set_nonblocking failed");
-                        continue;
-                    }
-                    match TcpStream::from_std(stream) {
-                        Ok(s) => {
-                            tracing::debug!(%peer, "accepted RESP connection");
-                            let store = store.clone();
-                            monoio::spawn(async move { handle_conn(s, store).await });
-                        }
-                        Err(e) => tracing::error!(%peer, "TcpStream::from_std: {e}"),
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
+    crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
+        let store = store.clone();
+        monoio::spawn(async move {
+            let _guard = guard;
+            handle_conn(s, store, idle_timeout).await;
+        });
+    })
+    .await;
 }
 
-async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>) {
+async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>, idle_timeout: Duration) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
     let mut state = ConnState::default();
 
@@ -76,13 +49,17 @@ async fn handle_conn(stream: TcpStream, store: Rc<ShardStore>) {
         use monoio::io::sink::Sink;
         use monoio::io::stream::Stream;
 
-        let value = match framed.next().await {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
+        let value = match monoio::time::timeout(idle_timeout, framed.next()).await {
+            Ok(Some(Ok(v))) => v,
+            Ok(Some(Err(e))) => {
                 tracing::debug!("decode error: {e}");
                 break;
             }
-            None => break,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                tracing::debug!("RESP connection idle timeout");
+                break;
+            }
         };
 
         // HELLO needs codec version switch before we respond

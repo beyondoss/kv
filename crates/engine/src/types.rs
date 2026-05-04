@@ -28,6 +28,12 @@ pub enum TtlResult {
     Remaining(u64),
 }
 
+#[derive(Debug, Clone)]
+pub enum GetExOp {
+    SetTtl(Duration),
+    Persist,
+}
+
 #[derive(Debug)]
 pub struct ScanPage {
     pub next_cursor: Bytes,

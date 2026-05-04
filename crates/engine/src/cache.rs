@@ -6,8 +6,8 @@ use bytes::Bytes;
 struct CacheEntry {
     value: Bytes,
     expires_at_ms: Option<u64>,
-    metadata: Option<Bytes>, // pre-serialized JSON; clone is a refcount bump, not a deep copy
-    freq: Cell<u8>,          // capped at 1
+    metadata: Option<serde_json::Value>,
+    freq: Cell<u8>, // capped at 1
     size: usize,
 }
 
@@ -74,8 +74,7 @@ impl MemCache {
         entry.freq.set(1);
         let value = entry.value.clone();
         let expires_at_ms = entry.expires_at_ms;
-        let metadata = entry.metadata.as_deref()
-            .and_then(|b| serde_json::from_slice(b).ok());
+        let metadata = entry.metadata.clone();
         Some((value, expires_at_ms, metadata))
     }
 
@@ -86,10 +85,11 @@ impl MemCache {
         expires_at_ms: Option<u64>,
         metadata: Option<serde_json::Value>,
     ) {
-        let meta_bytes: Option<Bytes> = metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_vec(m).ok().map(Bytes::from));
-        let size = (key.len() + value.len() + meta_bytes.as_ref().map_or(0, |b| b.len())).max(1);
+        // Serialize once to get the byte size for memory accounting, then store the parsed value.
+        let meta_size = metadata.as_ref()
+            .and_then(|m| serde_json::to_vec(m).ok())
+            .map_or(0, |b| b.len());
+        let size = (key.len() + value.len() + meta_size).max(1);
 
         // Update in-place if already present
         {
@@ -99,7 +99,7 @@ impl MemCache {
                 e.freq.set(1);
                 e.value = value;
                 e.expires_at_ms = expires_at_ms;
-                e.metadata = meta_bytes;
+                e.metadata = metadata;
                 e.size = size;
                 let cur = self.current_bytes.get();
                 self.current_bytes.set(cur.saturating_sub(old_size) + size);
@@ -114,7 +114,7 @@ impl MemCache {
         let entry = CacheEntry {
             value,
             expires_at_ms,
-            metadata: meta_bytes,
+            metadata,
             freq: Cell::new(0),
             size,
         };
@@ -145,6 +145,37 @@ impl MemCache {
             if stale > queue_len / 2 {
                 self.compact_queues();
             }
+        }
+    }
+
+    /// Remove all entries whose key starts with `prefix`. More efficient than
+    /// calling `remove` per-key for namespace flushes: one pass over the entry
+    /// map, one compaction if needed.
+    pub fn remove_by_prefix(&self, prefix: &[u8]) {
+        let to_remove: Vec<Bytes> = self.entries.borrow().keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        if to_remove.is_empty() {
+            return;
+        }
+        let mut freed = 0usize;
+        {
+            let mut entries = self.entries.borrow_mut();
+            for k in &to_remove {
+                if let Some(e) = entries.remove(k) {
+                    freed += e.size;
+                }
+            }
+        }
+        if freed > 0 {
+            self.current_bytes.set(self.current_bytes.get().saturating_sub(freed));
+        }
+        let stale = self.stale_slots.get() + to_remove.len();
+        self.stale_slots.set(stale);
+        let queue_len = self.small.borrow().len() + self.main.borrow().len();
+        if stale > queue_len / 2 {
+            self.compact_queues();
         }
     }
 

@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::os::unix::prelude::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use monoio::fs::{File, OpenOptions};
@@ -102,6 +103,7 @@ impl LogFile {
             .read(true)
             .write(true)
             .create(true)
+            .mode(0o600)
             .open(&path)
             .await?;
         let metadata = file.metadata().await?;

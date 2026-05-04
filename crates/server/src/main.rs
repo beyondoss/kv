@@ -6,9 +6,10 @@ use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustc_hash::FxHasher;
 
@@ -25,131 +26,49 @@ fn route(key: Option<Vec<u8>>, n: usize, rr: &AtomicUsize) -> usize {
     }
 }
 
-fn peek_routing_key_bytes(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+use beyond_kv::routing::{peek_http_key, peek_resp_key};
+
+/// Write a minimal RESP error to a freshly-accepted stream that can't be
+/// dispatched (inbox full). Does not panic on I/O failure.
+fn reject_resp(mut stream: TcpStream) {
+    let _ = stream.write_all(b"-ERR server busy, please retry later\r\n");
 }
 
-fn percent_decode_routing(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (peek_routing_key_bytes(bytes[i + 1]), peek_routing_key_bytes(bytes[i + 2]))
-            {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
+/// Write a minimal HTTP 503 to a freshly-accepted stream that can't be
+/// dispatched (inbox full). Does not panic on I/O failure.
+fn reject_http(mut stream: TcpStream) {
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
 }
 
-/// Peek the leading bytes of an incoming RESP connection, returning the key
-/// (the second bulk-string argument of an array command) when one is present.
-fn peek_resp_key(stream: &TcpStream) -> Option<Vec<u8>> {
-    let _ = stream.set_nonblocking(true);
-    let mut buf = [0u8; 4096];
-    let n = stream.peek(&mut buf).unwrap_or(0);
-    let _ = stream.set_nonblocking(false);
-    if n == 0 {
-        return None;
-    }
-    let buf = &buf[..n];
-
-    if buf.first().copied() != Some(b'*') {
-        return None;
-    }
-    // Find first \n
-    let nl1 = buf.iter().position(|&b| b == b'\n')?;
-    // Array count between buf[1..nl1-1] (strip \r)
-    let count_end = if nl1 > 0 && buf[nl1 - 1] == b'\r' { nl1 - 1 } else { nl1 };
-    let count_str = std::str::from_utf8(&buf[1..count_end]).ok()?;
-    let count: usize = count_str.parse().ok()?;
-    if count < 2 {
-        return None;
-    }
-
-    // Skip first bulk-string element: $len\r\ncmd\r\n
-    let mut i = nl1 + 1;
-    if i >= buf.len() || buf[i] != b'$' {
-        return None;
-    }
-    let len_start = i + 1;
-    let nl2 = len_start + buf[len_start..].iter().position(|&b| b == b'\n')?;
-    let len_end = if nl2 > 0 && buf[nl2 - 1] == b'\r' { nl2 - 1 } else { nl2 };
-    let cmd_len: usize = std::str::from_utf8(&buf[len_start..len_end]).ok()?.parse().ok()?;
-    i = nl2 + 1 + cmd_len + 2; // skip cmd bytes + \r\n
-
-    // Read second bulk-string element's value
-    if i >= buf.len() || buf[i] != b'$' {
-        return None;
-    }
-    let len_start = i + 1;
-    let nl3 = len_start + buf[len_start..].iter().position(|&b| b == b'\n')?;
-    let len_end = if nl3 > 0 && buf[nl3 - 1] == b'\r' { nl3 - 1 } else { nl3 };
-    let key_len: usize = std::str::from_utf8(&buf[len_start..len_end]).ok()?.parse().ok()?;
-    let key_start = nl3 + 1;
-    let key_end = key_start.checked_add(key_len)?;
-    if key_end > buf.len() {
-        return None;
-    }
-    Some(buf[key_start..key_end].to_vec())
-}
-
-/// Peek the leading bytes of an incoming HTTP connection, returning the key
-/// extracted from `/values/{key}` segments when one is present.
-fn peek_http_key(stream: &TcpStream) -> Option<Vec<u8>> {
-    let _ = stream.set_nonblocking(true);
-    let mut buf = [0u8; 4096];
-    let n = stream.peek(&mut buf).unwrap_or(0);
-    let _ = stream.set_nonblocking(false);
-    if n == 0 {
-        return None;
-    }
-    let buf = &buf[..n];
-
-    // Find end of request line
-    let nl = buf.iter().position(|&b| b == b'\n')?;
-    let line = &buf[..nl];
-    // Parse: METHOD SP /path SP HTTP/1.1
-    let mut parts = line.splitn(3, |&b| b == b' ');
-    let _method = parts.next()?;
-    let path = parts.next()?;
-    let needle = b"/values/";
-    let pos = path.windows(needle.len()).position(|w| w == needle)?;
-    let after = &path[pos + needle.len()..];
-    // Stop at query string or end of request line; slashes are part of the key.
-    let key_end = after
-        .iter()
-        .position(|&b| b == b'?' || b == b' ')
-        .unwrap_or(after.len());
-    if key_end == 0 {
-        return None;
-    }
-    // Percent-decode so the routing key matches the stored key.
-    Some(percent_decode_routing(&after[..key_end]))
-}
-
+/// Route one accepted connection to a worker shard.
+///
+/// Returns `false` only when a worker channel has been permanently
+/// disconnected (dead worker), indicating the accept loop should stop.
+/// A full inbox sheds the connection and returns `true` so the caller
+/// keeps accepting.
 fn accept_one(
     stream: TcpStream,
     peer: SocketAddr,
     peek_key: fn(&TcpStream) -> Option<Vec<u8>>,
+    on_reject: fn(TcpStream),
     senders: &[SyncSender<(TcpStream, SocketAddr)>],
     wakeup_writers: &mut [UnixStream],
     rr: &AtomicUsize,
 ) -> bool {
     let idx = route(peek_key(&stream), senders.len(), rr);
-    if senders[idx].send((stream, peer)).is_err() {
-        return false;
+    match senders[idx].try_send((stream, peer)) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full((stream, _))) => {
+            tracing::warn!(worker = idx, %peer, "worker inbox full; shedding connection");
+            on_reject(stream);
+            return true;
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            tracing::error!(worker = idx, "worker channel disconnected; stopping accept loop");
+            return false;
+        }
     }
     if let Err(e) = wakeup_writers[idx].write_all(&[1u8]) {
         tracing::error!(worker = idx, error = %e, "wakeup pipe write failed; worker likely dead");
@@ -158,8 +77,40 @@ fn accept_one(
     true
 }
 
+/// Non-blocking accept loop shared by both protocols. Exits when the shutdown
+/// flag is set or a worker channel is permanently disconnected.
+fn accept_loop(
+    listener: &TcpListener,
+    peek_key: fn(&TcpStream) -> Option<Vec<u8>>,
+    on_reject: fn(TcpStream),
+    senders: &[SyncSender<(TcpStream, SocketAddr)>],
+    wakeup_writers: &mut [UnixStream],
+    rr: &AtomicUsize,
+    shutdown: &AtomicBool,
+    label: &str,
+) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("{label} accept loop: shutdown signal received, draining");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if !accept_one(stream, peer, peek_key, on_reject, senders, wakeup_writers, rr) {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => tracing::error!("{label} accept error: {e}"),
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cfg = beyond_kv::config::Config::parse();
+    cfg.validate()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -167,6 +118,13 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "beyond_kv=info".into()),
         )
         .init();
+
+    // Log panics (including those in worker threads) before the process
+    // aborts (release) or the thread unwinds (debug).
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!(panic = %info, "thread panicked");
+        eprintln!("PANIC: {info}");
+    }));
 
     let n_threads = cfg.threads.unwrap_or_else(num_cpus::get).max(1);
     tracing::info!(threads = n_threads, resp_port = cfg.resp_port, "starting beyond-kv");
@@ -177,6 +135,9 @@ fn main() -> anyhow::Result<()> {
     let memory_per_shard = cfg.memory_bytes / n_threads;
     let reclaim_sealed_threshold = cfg.reclaim_sealed_threshold;
     let reclaim_interval_secs = cfg.reclaim_interval_secs;
+    let max_conns = cfg.max_conns_per_shard;
+    let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
+    let max_value_bytes = cfg.max_value_bytes;
     tracing::info!(http_port, "HTTP server enabled");
 
     // Per-worker, per-protocol channel + wakeup pipe.
@@ -223,27 +184,47 @@ fn main() -> anyhow::Result<()> {
                             .await
                             .expect("failed to open store");
                             let store = Rc::new(store);
+
                             let sweep_store = store.clone();
                             monoio::spawn(async move {
                                 loop {
-                                    monoio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                    monoio::time::sleep(Duration::from_secs(30)).await;
                                     sweep_store.sweep_cache();
                                 }
                             });
+
                             let sync_store = store.clone();
                             monoio::spawn(async move {
+                                let mut consecutive_failures = 0u32;
                                 loop {
-                                    monoio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    if let Err(e) = sync_store.sync_logs().await {
-                                        tracing::warn!(error = %e, "periodic log sync failed");
+                                    monoio::time::sleep(Duration::from_secs(1)).await;
+                                    match sync_store.sync_logs().await {
+                                        Ok(()) => consecutive_failures = 0,
+                                        Err(e) => {
+                                            consecutive_failures += 1;
+                                            if consecutive_failures >= 3 {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    consecutive = consecutive_failures,
+                                                    "periodic log sync failing repeatedly; \
+                                                     durability degraded"
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "periodic log sync failed"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             });
+
                             if reclaim_sealed_threshold > 0 {
                                 let reclaim_store = store.clone();
                                 monoio::spawn(async move {
                                     loop {
-                                        monoio::time::sleep(std::time::Duration::from_secs(
+                                        monoio::time::sleep(Duration::from_secs(
                                             reclaim_interval_secs,
                                         ))
                                         .await;
@@ -256,12 +237,36 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 });
                             }
+
                             let http_store = store.clone();
                             monoio::spawn(async move {
-                                beyond_kv::http::serve_routed(http_store, http_rx, http_wake_read)
-                                    .await;
+                                beyond_kv::http::serve_routed(
+                                    http_store,
+                                    http_rx,
+                                    http_wake_read,
+                                    max_conns,
+                                    idle_timeout,
+                                    max_value_bytes,
+                                )
+                                .await;
                             });
-                            beyond_kv::resp::serve(store, resp_rx, resp_wake_read).await;
+
+                            beyond_kv::resp::serve(
+                                store.clone(),
+                                resp_rx,
+                                resp_wake_read,
+                                max_conns,
+                                idle_timeout,
+                            )
+                            .await;
+
+                            // Flush WAL before the worker exits so that all acked
+                            // writes are durable even when we shut down mid-interval.
+                            if let Err(e) = store.sync_logs().await {
+                                tracing::error!(error = %e, "final log sync failed on shutdown");
+                            } else {
+                                tracing::debug!("worker {i}: final log sync complete");
+                            }
                         })
                 })
                 .expect("failed to spawn worker thread")
@@ -270,81 +275,72 @@ fn main() -> anyhow::Result<()> {
 
     let rr = Arc::new(AtomicUsize::new(0));
 
-    // HTTP accept thread.
+    // Register SIGTERM and SIGINT to set the shutdown flag atomically.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+
+    // HTTP accept thread (non-blocking listener + shutdown-aware loop).
     let http_addr = format!("0.0.0.0:{http_port}");
     let http_listener = TcpListener::bind(&http_addr)?;
+    http_listener.set_nonblocking(true)?;
     tracing::info!("HTTP listening on {http_addr}");
 
-    {
+    let http_thread = {
         let rr = rr.clone();
-        let mut http_wakeup_writers = http_wakeup_writers;
-        let http_senders = http_senders;
+        let shutdown = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("kv-http-accept".into())
             .spawn(move || {
-                for result in http_listener.incoming() {
-                    match result {
-                        Ok(stream) => {
-                            let peer = match stream.peer_addr() {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::debug!("HTTP peer_addr: {e}");
-                                    continue;
-                                }
-                            };
-                            if !accept_one(
-                                stream,
-                                peer,
-                                peek_http_key,
-                                &http_senders,
-                                &mut http_wakeup_writers,
-                                &rr,
-                            ) {
-                                tracing::warn!("HTTP channel closed, stopping accept loop");
-                                break;
-                            }
-                        }
-                        Err(e) => tracing::error!("HTTP accept error: {e}"),
-                    }
-                }
-            })
-            .expect("failed to spawn http accept thread");
-    }
+                accept_loop(
+                    &http_listener,
+                    peek_http_key,
+                    reject_http,
+                    &http_senders,
+                    &mut http_wakeup_writers,
+                    &rr,
+                    &shutdown,
+                    "HTTP",
+                );
+                // Dropping http_senders + http_wakeup_writers here signals workers.
+            })?
+    };
 
     // RESP accept loop runs on the main thread.
     let resp_addr = format!("0.0.0.0:{resp_port}");
     let resp_listener = TcpListener::bind(&resp_addr)?;
+    resp_listener.set_nonblocking(true)?;
     tracing::info!("RESP listening on {resp_addr}");
 
-    for result in resp_listener.incoming() {
-        match result {
-            Ok(stream) => {
-                let peer = match stream.peer_addr() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::debug!("peer_addr: {e}");
-                        continue;
-                    }
-                };
-                if !accept_one(
-                    stream,
-                    peer,
-                    peek_resp_key,
-                    &resp_senders,
-                    &mut resp_wakeup_writers,
-                    &rr,
-                ) {
-                    tracing::warn!("RESP channel closed, stopping accept loop");
-                    break;
-                }
-            }
-            Err(e) => tracing::error!("accept error: {e}"),
-        }
+    accept_loop(
+        &resp_listener,
+        peek_resp_key,
+        reject_resp,
+        &resp_senders,
+        &mut resp_wakeup_writers,
+        &rr,
+        &shutdown,
+        "RESP",
+    );
+
+    // Dropping senders + wakeup writers closes the channels and pipes,
+    // which causes workers' serve() loops to return so they can flush.
+    drop(resp_senders);
+    drop(resp_wakeup_writers);
+
+    // Ensure the HTTP thread has also finished and released its resources.
+    shutdown.store(true, Ordering::Relaxed);
+    if let Err(e) = http_thread.join() {
+        tracing::error!("HTTP accept thread panicked: {e:?}");
     }
 
+    tracing::info!("waiting for workers to flush and exit");
     for h in handles {
-        let _ = h.join();
+        if let Err(e) = h.join() {
+            tracing::error!("worker thread panicked: {e:?}");
+        }
     }
+    tracing::info!("shutdown complete");
 
     Ok(())
 }

@@ -9,7 +9,10 @@ use beyond_resp::Value;
 
 use crate::resp::ConnState;
 
+const KEYS_SCAN_LIMIT: usize = 1_000_000;
+
 pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
+    tracing::debug!(cmd = cmd_name(&cmd), ns = %state.ns);
     match cmd {
         Command::Ping { message } => {
             message.map(r::bulk).unwrap_or_else(|| Value::SimpleString(bytes::Bytes::from_static(b"PONG")))
@@ -35,9 +38,16 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::Quit | Command::Reset => {
+        Command::Quit => {
             state.quit = true;
             r::ok()
+        }
+
+        Command::Reset => {
+            // RESP spec: RESET clears per-connection state and replies "+RESET",
+            // but does NOT close the connection (unlike QUIT).
+            *state = ConnState::default();
+            Value::SimpleString(bytes::Bytes::from_static(b"RESET"))
         }
 
         Command::Get { key } => {
@@ -117,10 +127,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::ExpireAt { key, unix_secs } => {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_secs = now_unix_secs();
             if unix_secs <= now_secs {
                 match store.del(&state.ns, &[key.as_ref()]).await {
                     Ok(_) => r::integer(1),
@@ -137,10 +144,7 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::PExpireAt { key, unix_millis } => {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_unix_ms();
             if unix_millis <= now_ms {
                 match store.del(&state.ns, &[key.as_ref()]).await {
                     Ok(_) => r::integer(1),
@@ -234,26 +238,14 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::GetEx { key, ttl } => {
-            match store.get(&state.ns, &key).await {
+            use beyond_kv_engine::types::GetExOp;
+            let op = ttl.map(|t| match t {
+                GetExTtl::Set(spec) => GetExOp::SetTtl(ttl_duration_from_spec(&spec)),
+                GetExTtl::Persist => GetExOp::Persist,
+            });
+            match store.getex(&state.ns, &key, op).await {
                 Ok(None) => r::nil(),
-                Ok(Some(entry)) => {
-                    let value = entry.value.clone();
-                    match ttl {
-                        Some(GetExTtl::Set(ttl_spec)) => {
-                            let dur = ttl_duration_from_spec(&ttl_spec);
-                            if let Err(e) = store.expire(&state.ns, &key, dur).await {
-                                return r::error("ERR", &e.to_string());
-                            }
-                        }
-                        Some(GetExTtl::Persist) => {
-                            if let Err(e) = store.persist(&state.ns, &key).await {
-                                return r::error("ERR", &e.to_string());
-                            }
-                        }
-                        None => {}
-                    }
-                    r::bulk(value)
-                }
+                Ok(Some(entry)) => r::bulk(entry.value),
                 Err(e) => r::error("ERR", &e.to_string()),
             }
         }
@@ -268,6 +260,9 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
                     Ok(page) => {
                         let done = page.next_cursor == b"0".as_ref();
                         all_keys.extend(page.keys.into_iter().map(r::bulk));
+                        if all_keys.len() >= KEYS_SCAN_LIMIT {
+                            return r::error("ERR", "KEYS result too large; use SCAN to paginate large keyspaces");
+                        }
                         cursor = page.next_cursor;
                         if done { break; }
                         yield_now().await;
@@ -319,17 +314,11 @@ fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
         SetTtl::Seconds(s) => Duration::from_secs(*s),
         SetTtl::Millis(ms) => Duration::from_millis(*ms),
         SetTtl::UnixSecs(ts) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now = now_unix_secs();
             Duration::from_secs(ts.saturating_sub(now))
         }
         SetTtl::UnixMillis(ts) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now = now_unix_ms();
             Duration::from_millis(ts.saturating_sub(now))
         }
     }
@@ -337,6 +326,51 @@ fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
 
 fn set_opts_from_args(ttl: &Option<SetTtl>) -> SetOptions {
     SetOptions { ttl: ttl.as_ref().map(ttl_duration_from_spec), metadata: None }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn cmd_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Ping { .. } => "PING",
+        Command::Hello { .. } => "HELLO",
+        Command::Select { .. } => "SELECT",
+        Command::BgRewriteAof => "BGREWRITEAOF",
+        Command::Quit | Command::Reset => "QUIT/RESET",
+        Command::Get { .. } => "GET",
+        Command::Set { .. } => "SET",
+        Command::Del { .. } => "DEL",
+        Command::Exists { .. } => "EXISTS",
+        Command::Expire { .. } => "EXPIRE",
+        Command::PExpire { .. } => "PEXPIRE",
+        Command::ExpireAt { .. } => "EXPIREAT",
+        Command::PExpireAt { .. } => "PEXPIREAT",
+        Command::Ttl { .. } => "TTL",
+        Command::PTtl { .. } => "PTTL",
+        Command::Persist { .. } => "PERSIST",
+        Command::MGet { .. } => "MGET",
+        Command::MSet { .. } => "MSET",
+        Command::GetSet { .. } => "GETSET",
+        Command::SetNx { .. } => "SETNX",
+        Command::GetDel { .. } => "GETDEL",
+        Command::GetEx { .. } => "GETEX",
+        Command::Keys { .. } => "KEYS",
+        Command::Scan { .. } => "SCAN",
+        Command::DbSize => "DBSIZE",
+        Command::FlushDb => "FLUSHDB",
+    }
 }
 
 #[cfg(test)]

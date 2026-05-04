@@ -28,11 +28,41 @@ pub struct Config {
     /// Seconds between auto-reclaim scans. Ignored when reclaim_sealed_threshold is 0.
     #[arg(long, env = "KV_RECLAIM_INTERVAL_SECS", default_value_t = 300)]
     pub reclaim_interval_secs: u64,
+
+    /// Maximum concurrent connections accepted per worker shard. Excess connections
+    /// are dropped immediately with a busy response.
+    #[arg(long, env = "KV_MAX_CONNS_PER_SHARD", default_value_t = 10_000)]
+    pub max_conns_per_shard: usize,
+
+    /// Seconds of inactivity before an idle connection is closed.
+    #[arg(long, env = "KV_IDLE_TIMEOUT_SECS", default_value_t = 60)]
+    pub idle_timeout_secs: u64,
+
+    /// Maximum value size in bytes accepted via HTTP PUT or RESP SET.
+    /// Requests with a Content-Length or body exceeding this are rejected with 413 / ERR.
+    #[arg(long, env = "KV_MAX_VALUE_BYTES", default_value_t = 64 * 1024 * 1024)]
+    pub max_value_bytes: usize,
 }
 
 impl Config {
     pub fn parse() -> Self {
         <Self as Parser>::parse()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.memory_bytes == 0 {
+            anyhow::bail!("KV_MEMORY_BYTES must be > 0");
+        }
+        let threads = self.threads.unwrap_or(1).max(1);
+        if self.memory_bytes < threads {
+            anyhow::bail!(
+                "KV_MEMORY_BYTES ({}) is less than the thread count ({}); \
+                 each shard would receive 0 bytes of cache",
+                self.memory_bytes,
+                threads
+            );
+        }
+        Ok(())
     }
 }
 

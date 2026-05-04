@@ -108,10 +108,19 @@ impl TestServer {
                                 http_store,
                                 http_rx,
                                 http_wakeup_read,
+                                10_000,
+                                std::time::Duration::from_secs(60),
                             )
                             .await;
                         });
-                        beyond_kv::resp::serve(store, resp_rx, resp_wakeup_read).await;
+                        beyond_kv::resp::serve(
+                            store,
+                            resp_rx,
+                            resp_wakeup_read,
+                            10_000,
+                            std::time::Duration::from_secs(60),
+                        )
+                        .await;
                     });
             })
             .expect("spawn server thread");

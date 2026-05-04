@@ -4,15 +4,16 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::future::join_all;
 use rustc_hash::FxHashMap;
-use tracing::warn;
+use tracing::info;
 
 use crate::cache::MemCache;
 use crate::error::{EngineError, Result};
 use crate::log::config::LogConfig;
 use crate::log::index::IndexEntry;
 use crate::log::{now_ms, NamespaceLog};
-use crate::types::{Entry, ScanPage, SetOptions, TtlResult};
+use crate::types::{Entry, GetExOp, ScanPage, SetOptions, TtlResult};
 
 pub const DEFAULT_NS: &str = "default";
 
@@ -40,21 +41,32 @@ pub struct ShardStore {
 }
 
 impl ShardStore {
+    /// Open or create the shard store at `data_dir`.
+    ///
+    /// `std::fs::create_dir_all` and `std::fs::read_dir` are blocking syscalls.
+    /// Acceptable at startup before any traffic begins, but should not be called
+    /// from a hot async path after the runtime is handling requests.
     pub async fn open(data_dir: &Path, memory_bytes: usize) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let config = LogConfig::default();
         let mut namespaces: FxHashMap<String, Rc<NamespaceLog>> = FxHashMap::default();
 
-        // Open all existing namespace subdirectories found on disk.
+        // Collect valid namespace subdirectories, then open them concurrently.
         if let Ok(entries) = std::fs::read_dir(data_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map_or(false, |t| t.is_dir()) {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if is_valid_ns_name(&name) {
-                        let nslog = NamespaceLog::open(entry.path(), config).await?;
-                        namespaces.insert(name, Rc::new(nslog));
-                    }
-                }
+            let dirs: Vec<(String, std::path::PathBuf)> = entries
+                .flatten()
+                .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if is_valid_ns_name(&name) { Some((name, e.path())) } else { None }
+                })
+                .collect();
+            let futures: Vec<_> = dirs.iter()
+                .map(|(_, path)| NamespaceLog::open(path.clone(), config))
+                .collect();
+            let opened = join_all(futures).await;
+            for ((name, _), nslog) in dirs.into_iter().zip(opened) {
+                namespaces.insert(name, Rc::new(nslog?));
             }
         }
 
@@ -86,12 +98,34 @@ impl ShardStore {
         Ok(self.namespaces.borrow_mut().entry(ns.to_string()).or_insert(nslog).clone())
     }
 
-    #[allow(dead_code)]
+    /// Test-only accessor that bypasses `ensure_ns` validation. Do not use in production code.
+    #[cfg(test)]
     pub(crate) fn get_ns(&self, ns: &str) -> Result<Rc<NamespaceLog>> {
         self.namespaces.borrow().get(ns).cloned()
             .ok_or_else(|| EngineError::InvalidNamespace { name: ns.to_owned() })
     }
 
+    /// Build the composite cache key `ns\x00key` into a stack buffer for lookups,
+    /// avoiding heap allocation for the common case (total ≤ 128 bytes).
+    fn with_cache_key<R>(ns: &str, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+        let total = ns.len() + 1 + key.len();
+        if total <= 128 {
+            let mut buf = [0u8; 128];
+            let nb = ns.as_bytes();
+            buf[..nb.len()].copy_from_slice(nb);
+            buf[nb.len()] = b'\x00';
+            buf[nb.len() + 1..total].copy_from_slice(key);
+            f(&buf[..total])
+        } else {
+            let mut v = Vec::with_capacity(total);
+            v.extend_from_slice(ns.as_bytes());
+            v.push(b'\x00');
+            v.extend_from_slice(key);
+            f(&v)
+        }
+    }
+
+    /// Build an owned composite cache key for insertions.
     fn cache_key(ns: &str, key: &[u8]) -> Bytes {
         let mut ck = Vec::with_capacity(ns.len() + 1 + key.len());
         ck.extend_from_slice(ns.as_bytes());
@@ -104,18 +138,119 @@ impl ShardStore {
         expires_at_ms.map(|ms| Instant::now() + Duration::from_millis(ms.saturating_sub(now)))
     }
 
-    fn metadata_from_bytes(meta: &[u8]) -> Option<serde_json::Value> {
+    fn metadata_from_bytes(meta: &[u8]) -> Result<Option<serde_json::Value>> {
         if meta.is_empty() {
-            return None;
+            return Ok(None);
         }
-        serde_json::from_slice(meta)
-            .map_err(|e| warn!(error = %e, "metadata decode failed"))
-            .ok()
+        serde_json::from_slice(meta).map(Some).map_err(Into::into)
+    }
+
+    fn validate_ttl(d: Duration) -> Result<u64> {
+        u64::try_from(d.as_millis())
+            .map_err(|_| EngineError::CapacityExceeded { reason: "ttl exceeds u64::MAX milliseconds" })
+    }
+
+    /// Inline get used by `getset` and `getdel`: check L1 cache, then index, then disk.
+    /// Tombstones and evicts expired keys. Does NOT populate the cache on disk reads
+    /// because the caller is about to overwrite or delete the key anyway.
+    async fn get_inline(
+        &self,
+        nslog: &NamespaceLog,
+        ns: &str,
+        key: &[u8],
+        now: u64,
+    ) -> Result<Option<Entry>> {
+        if let Some((value, expires_at_ms, metadata)) =
+            Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
+        {
+            return Ok(Some(Entry {
+                value,
+                expires_at: Self::instant_from_ms(expires_at_ms, now),
+                metadata,
+            }));
+        }
+        let (entry, expires_at_ms) = {
+            let idx = nslog.index.borrow();
+            match idx.get(key) {
+                None => return Ok(None),
+                Some(e) => (*e, idx.ttl(key)),
+            }
+        };
+        if expires_at_ms.map_or(false, |ms| ms <= now) {
+            nslog.tombstone(key).await?;
+            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+            return Ok(None);
+        }
+        let (value, meta_bytes) = nslog.read_value(entry).await?;
+        let metadata = Self::metadata_from_bytes(&meta_bytes)?;
+        Ok(Some(Entry {
+            value,
+            expires_at: Self::instant_from_ms(expires_at_ms, now),
+            metadata,
+        }))
+    }
+
+    /// Inner TTL read returning `Remaining` in **milliseconds**.
+    /// `ttl` divides by 1000; `pttl` returns the raw millisecond value.
+    async fn ttl_raw(&self, ns: &str, key: &[u8]) -> Result<TtlResult> {
+        let nslog = self.ensure_ns(ns).await?;
+        let now = now_ms();
+        let (result, should_tombstone) = {
+            let idx = nslog.index.borrow();
+            match idx.get(key) {
+                None => (TtlResult::NotFound, false),
+                Some(_) => match idx.ttl(key) {
+                    None => (TtlResult::NoExpiry, false),
+                    Some(ms) if ms <= now => (TtlResult::NotFound, true),
+                    Some(ms) => (TtlResult::Remaining(ms.saturating_sub(now)), false),
+                },
+            }
+        };
+        if should_tombstone {
+            nslog.tombstone(key).await?;
+            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+        }
+        Ok(result)
+    }
+
+    /// Common body for `setnx` and `setxx`.
+    /// `require_live = false` → write only if key does NOT exist (SETNX).
+    /// `require_live = true`  → write only if key already exists (SETXX).
+    async fn set_conditional(
+        &self,
+        ns: &str,
+        key: &[u8],
+        value: Bytes,
+        opts: SetOptions,
+        require_live: bool,
+    ) -> Result<bool> {
+        let nslog = self.ensure_ns(ns).await?;
+        let now = now_ms();
+        let live = {
+            let idx = nslog.index.borrow();
+            idx.get(key).is_some() && !idx.is_expired(key, now)
+        };
+        if live != require_live {
+            return Ok(false);
+        }
+        let expires_at_ms = opts.ttl
+            .map(|d| Self::validate_ttl(d).map(|ms| now + ms))
+            .transpose()?;
+        let meta_bytes: Vec<u8> = opts.metadata.as_ref()
+            .map(|m| serde_json::to_vec(m))
+            .transpose()?
+            .unwrap_or_default();
+        let key_bytes = Bytes::copy_from_slice(key);
+        nslog.put_full(key_bytes, &value, &meta_bytes, expires_at_ms).await?;
+        self.cache.insert(Self::cache_key(ns, key), value, expires_at_ms, opts.metadata);
+        Ok(true)
     }
 
     pub async fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Entry>> {
         let now = now_ms();
-        if let Some((value, expires_at_ms, metadata)) = self.cache.get(&Self::cache_key(ns, key), now) {
+        if let Some((value, expires_at_ms, metadata)) =
+            Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
+        {
             return Ok(Some(Entry {
                 value,
                 expires_at: Self::instant_from_ms(expires_at_ms, now),
@@ -124,9 +259,12 @@ impl ShardStore {
         }
         let nslog = self.ensure_ns(ns).await?;
 
-        let (entry, expires_at_ms) = match nslog.index.borrow().get(key) {
-            None => return Ok(None),
-            Some(e) => (*e, nslog.index.borrow().ttl(key)),
+        let (entry, expires_at_ms) = {
+            let idx = nslog.index.borrow();
+            match idx.get(key) {
+                None => return Ok(None),
+                Some(e) => (*e, idx.ttl(key)),
+            }
         };
         if expires_at_ms.map_or(false, |ms| ms <= now) {
             // Lazy delete on read.
@@ -135,7 +273,7 @@ impl ShardStore {
         }
 
         let (value, meta_bytes) = nslog.read_value(entry).await?;
-        let metadata = Self::metadata_from_bytes(&meta_bytes);
+        let metadata = Self::metadata_from_bytes(&meta_bytes)?;
         self.cache.insert(
             Self::cache_key(ns, key),
             value.clone(),
@@ -163,7 +301,7 @@ impl ShardStore {
         for (i, key) in keys.iter().enumerate() {
             // L1
             if let Some((value, expires_at_ms, metadata)) =
-                self.cache.get(&Self::cache_key(ns, key), now)
+                Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
             {
                 results[i] = Some(Entry {
                     value,
@@ -192,7 +330,7 @@ impl ShardStore {
         if !misses.is_empty() {
             let read = nslog.bulk_read(misses).await?;
             for ((slot, value, meta_bytes), ttl) in read.into_iter().zip(miss_ttls.into_iter()) {
-                let metadata = Self::metadata_from_bytes(&meta_bytes);
+                let metadata = Self::metadata_from_bytes(&meta_bytes)?;
                 self.cache.insert(
                     Self::cache_key(ns, keys[slot]),
                     value.clone(),
@@ -211,27 +349,21 @@ impl ShardStore {
 
     pub async fn set(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        let expires_at_ms = opts
-            .ttl
-            .map(|d| now_ms() + u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        let meta_bytes: Vec<u8> = opts
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_vec(m).ok())
+        let expires_at_ms = opts.ttl
+            .map(|d| Self::validate_ttl(d).map(|ms| now_ms() + ms))
+            .transpose()?;
+        let meta_bytes: Vec<u8> = opts.metadata.as_ref()
+            .map(|m| serde_json::to_vec(m))
+            .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog
-            .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
-            .await?;
-        self.cache.insert(
-            Self::cache_key(ns, key),
-            value,
-            expires_at_ms,
-            opts.metadata,
-        );
+        nslog.put_full(key_bytes, &value, &meta_bytes, expires_at_ms).await?;
+        self.cache.insert(Self::cache_key(ns, key), value, expires_at_ms, opts.metadata);
         Ok(())
     }
 
+    /// MSET: atomically set multiple keys. Per-key TTL and metadata are not
+    /// supported; use `set` for keys that require them.
     pub async fn mset(&self, ns: &str, pairs: &[(Bytes, Bytes)]) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
         nslog.put_many(pairs).await?;
@@ -253,8 +385,7 @@ impl ShardStore {
                 idx.is_expired(key, now)
             };
             let was_present = nslog.tombstone(key).await?;
-
-            self.cache.remove(&Self::cache_key(ns, key));
+            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             if was_present && !was_expired {
                 count += 1;
             }
@@ -284,101 +415,129 @@ impl ShardStore {
         };
         if !present_and_live {
             // Drop the cached entry if it shows up expired.
-            self.cache.remove(&Self::cache_key(ns, key));
+            Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             return Ok(false);
         }
-        let new_ms = now + u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let new_ms = now + Self::validate_ttl(ttl)?;
         nslog.ttl_update(key, Some(new_ms)).await?;
         // L1 carries its own copy of expires_at_ms; refresh on next get.
-        self.cache.remove(&Self::cache_key(ns, key));
+        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
         Ok(true)
     }
 
     pub async fn persist(&self, ns: &str, key: &[u8]) -> Result<bool> {
         let nslog = self.ensure_ns(ns).await?;
-        let (present, has_ttl) = {
+        let now = now_ms();
+        let (present, has_ttl, expired) = {
             let idx = nslog.index.borrow();
-            let p = idx.get(key).is_some();
-            let t = idx.ttl(key).is_some();
-            (p, t)
+            (idx.get(key).is_some(), idx.ttl(key).is_some(), idx.is_expired(key, now))
         };
-        if !present || !has_ttl {
+        if !present || !has_ttl || expired {
             return Ok(false);
         }
         nslog.ttl_update(key, None).await?;
-        self.cache.remove(&Self::cache_key(ns, key));
+        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
         Ok(true)
     }
 
-    pub async fn ttl(&self, ns: &str, key: &[u8]) -> Result<TtlResult> {
-        let nslog = self.ensure_ns(ns).await?;
-        let now = now_ms();
-        let idx = nslog.index.borrow();
-        match idx.get(key) {
-            None => Ok(TtlResult::NotFound),
-            Some(_) => match idx.ttl(key) {
-                None => Ok(TtlResult::NoExpiry),
-                Some(ms) if ms <= now => Ok(TtlResult::NotFound),
-                Some(ms) => Ok(TtlResult::Remaining((ms - now) / 1000)),
-            },
+    pub async fn getex(&self, ns: &str, key: &[u8], op: Option<GetExOp>) -> Result<Option<Entry>> {
+        if op.is_none() {
+            return self.get(ns, key).await;
         }
+        let now = now_ms();
+        let nslog = self.ensure_ns(ns).await?;
+
+        // Inline get — same nslog reference ensures the TTL update shares the
+        // same ensure_ns context with no intervening yield between read and write.
+        let found = if let Some((cv, ce, cm)) =
+            Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
+        {
+            Some(Entry { value: cv, expires_at: Self::instant_from_ms(ce, now), metadata: cm })
+        } else {
+            let lookup = {
+                let idx = nslog.index.borrow();
+                idx.get(key).map(|e| (*e, idx.ttl(key)))
+            };
+            match lookup {
+                None => return Ok(None),
+                Some((entry, expires_at_ms)) => {
+                    if expires_at_ms.map_or(false, |ms| ms <= now) {
+                        nslog.tombstone(key).await?;
+                        return Ok(None);
+                    }
+                    let (val, meta_bytes) = nslog.read_value(entry).await?;
+                    let metadata = Self::metadata_from_bytes(&meta_bytes)?;
+                    self.cache.insert(
+                        Self::cache_key(ns, key),
+                        val.clone(),
+                        expires_at_ms,
+                        metadata.clone(),
+                    );
+                    Some(Entry {
+                        value: val,
+                        expires_at: Self::instant_from_ms(expires_at_ms, now),
+                        metadata,
+                    })
+                }
+            }
+        };
+
+        if found.is_none() {
+            return Ok(None);
+        }
+
+        match op.unwrap() {
+            GetExOp::SetTtl(ttl) => {
+                let new_ms = now + Self::validate_ttl(ttl)?;
+                nslog.ttl_update(key, Some(new_ms)).await?;
+                Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+            }
+            GetExOp::Persist => {
+                nslog.ttl_update(key, None).await?;
+                Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
+            }
+        }
+
+        Ok(found)
+    }
+
+    pub async fn ttl(&self, ns: &str, key: &[u8]) -> Result<TtlResult> {
+        Ok(match self.ttl_raw(ns, key).await? {
+            TtlResult::Remaining(ms) => TtlResult::Remaining(ms / 1000),
+            other => other,
+        })
     }
 
     pub async fn pttl(&self, ns: &str, key: &[u8]) -> Result<TtlResult> {
-        let nslog = self.ensure_ns(ns).await?;
-        let now = now_ms();
-        let idx = nslog.index.borrow();
-        match idx.get(key) {
-            None => Ok(TtlResult::NotFound),
-            Some(_) => match idx.ttl(key) {
-                None => Ok(TtlResult::NoExpiry),
-                Some(ms) if ms <= now => Ok(TtlResult::NotFound),
-                Some(ms) => Ok(TtlResult::Remaining(ms.saturating_sub(now))),
-            },
-        }
+        self.ttl_raw(ns, key).await
     }
 
     pub async fn getset(&self, ns: &str, key: &[u8], value: Bytes) -> Result<Option<Entry>> {
-        let old = self.get(ns, key).await?;
-        self.set(ns, key, value, SetOptions::default()).await?;
+        let now = now_ms();
+        let nslog = self.ensure_ns(ns).await?;
+        let old = self.get_inline(&nslog, ns, key, now).await?;
+        // Inline set — same nslog, no second ensure_ns call.
+        let key_bytes = Bytes::copy_from_slice(key);
+        nslog.put_full(key_bytes, &value, &[], None).await?;
+        self.cache.insert(Self::cache_key(ns, key), value, None, None);
         Ok(old)
     }
 
     pub async fn getdel(&self, ns: &str, key: &[u8]) -> Result<Option<Entry>> {
-        let old = self.get(ns, key).await?;
+        let now = now_ms();
         let nslog = self.ensure_ns(ns).await?;
+        let old = self.get_inline(&nslog, ns, key, now).await?;
         nslog.tombstone(key).await?;
-        self.cache.remove(&Self::cache_key(ns, key));
+        Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
         Ok(old)
     }
 
     pub async fn setnx(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<bool> {
-        let nslog = self.ensure_ns(ns).await?;
-        let now = now_ms();
-        let live = {
-            let idx = nslog.index.borrow();
-            idx.get(key).is_some() && !idx.is_expired(key, now)
-        };
-        if live {
-            return Ok(false);
-        }
-        // If expired, the index still holds it — treat as absent and proceed.
-        self.set(ns, key, value, opts).await?;
-        Ok(true)
+        self.set_conditional(ns, key, value, opts, false).await
     }
 
     pub async fn setxx(&self, ns: &str, key: &[u8], value: Bytes, opts: SetOptions) -> Result<bool> {
-        let nslog = self.ensure_ns(ns).await?;
-        let now = now_ms();
-        let live = {
-            let idx = nslog.index.borrow();
-            idx.get(key).is_some() && !idx.is_expired(key, now)
-        };
-        if !live {
-            return Ok(false);
-        }
-        self.set(ns, key, value, opts).await?;
-        Ok(true)
+        self.set_conditional(ns, key, value, opts, true).await
     }
 
     pub fn sweep_cache(&self) {
@@ -389,8 +548,9 @@ impl ShardStore {
     /// 1-second timer to provide `appendfsync everysec` durability semantics.
     pub async fn sync_logs(&self) -> crate::error::Result<()> {
         let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
-        for ns in ns_list {
-            ns.sync().await?;
+        let results = join_all(ns_list.iter().map(|ns| ns.sync())).await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -398,7 +558,8 @@ impl ShardStore {
     /// Trigger reclaim on one namespace. Used by `BGREWRITEAOF`.
     pub async fn reclaim(&self, ns: &str) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        nslog.reclaim().await?;
+        let report = nslog.reclaim().await?;
+        info!(?report, ns, "reclaim complete");
         Ok(())
     }
 
@@ -409,10 +570,14 @@ impl ShardStore {
             return Ok(());
         }
         let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
-        for nslog in ns_list {
-            if nslog.sealed_file_count() > threshold {
-                nslog.reclaim().await?;
-            }
+        let to_reclaim: Vec<Rc<NamespaceLog>> = ns_list
+            .into_iter()
+            .filter(|ns| ns.sealed_file_count() > threshold)
+            .collect();
+        let results = join_all(to_reclaim.iter().map(|ns| ns.reclaim())).await;
+        for (ns, result) in to_reclaim.iter().zip(results) {
+            let report = result?;
+            info!(?report, dir = %ns.dir.display(), "auto-reclaim complete");
         }
         Ok(())
     }
@@ -438,8 +603,7 @@ impl ShardStore {
         } else if cursor.len() == 8 {
             cursor.try_into().map(u64::from_le_bytes).unwrap_or(0)
         } else {
-            // Backwards-compat for `\x01`-prefixed cursors from prior versions: just restart.
-            0
+            return Err(EngineError::BadRecord { offset: 0, reason: "invalid scan cursor" });
         };
 
         let pat = pattern;
@@ -456,26 +620,23 @@ impl ShardStore {
         Ok(ScanPage { next_cursor, keys })
     }
 
+    /// Returns the number of live keys in the namespace. O(1) via the index's
+    /// maintained live_count — may overcount by the number of logically-expired
+    /// but not-yet-tombstoned keys, matching Redis DBSIZE semantics.
     pub async fn db_size(&self, ns: &str) -> Result<u64> {
         let nslog = self.ensure_ns(ns).await?;
-        Ok(nslog.len() as u64)
+        let count = nslog.index.borrow().live_len();
+        Ok(count as u64)
     }
 
     pub async fn flush_db(&self, ns: &str) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        // Drop matching L1 entries — the namespace prefix uniquely identifies them.
-        // We can't iterate L1 by namespace cheaply, so we walk the index first to
-        // know which keys to remove. After flush the index is empty, so do this
-        // before the unlink-and-recreate.
-        let cache_keys: Vec<Bytes> = nslog
-            .index
-            .borrow()
-            .iter()
-            .map(|(k, _)| Self::cache_key(ns, k))
-            .collect();
-        for ck in cache_keys {
-            self.cache.remove(&ck);
-        }
+        // Evict all L1 entries for this namespace in one prefix sweep, done
+        // before flush so the index is still intact for prefix derivation.
+        let mut prefix = Vec::with_capacity(ns.len() + 1);
+        prefix.extend_from_slice(ns.as_bytes());
+        prefix.push(b'\x00');
+        self.cache.remove_by_prefix(&prefix);
         nslog.flush().await?;
         Ok(())
     }

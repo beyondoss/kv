@@ -34,6 +34,9 @@ pub struct NsIndex {
     map: FxHashMap<Bytes, IndexEntry>,
     /// TTL sidecar — only TTL'd keys pay extra memory.
     ttl: FxHashMap<Bytes, u64>,
+    /// Best-effort live key count: incremented on insert, decremented on remove.
+    /// Lazy-expired keys are included until tombstoned, matching Redis DBSIZE semantics.
+    live_count: usize,
 }
 
 impl Default for NsIndex {
@@ -47,6 +50,7 @@ impl NsIndex {
         Self {
             map: FxHashMap::default(),
             ttl: FxHashMap::default(),
+            live_count: 0,
         }
     }
 
@@ -75,7 +79,11 @@ impl NsIndex {
                 self.ttl.remove(&key);
             }
         }
+        let is_new = !self.map.contains_key(key.as_ref());
         self.map.insert(key, entry);
+        if is_new {
+            self.live_count += 1;
+        }
     }
 
     pub fn set_ttl(&mut self, key: &Bytes, expires_at_ms: Option<u64>) {
@@ -91,12 +99,21 @@ impl NsIndex {
 
     pub fn remove(&mut self, key: &[u8]) -> Option<IndexEntry> {
         self.ttl.remove(key);
-        self.map.remove(key)
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            self.live_count = self.live_count.saturating_sub(1);
+        }
+        removed
     }
 
     pub fn clear(&mut self) {
         self.map.clear();
         self.ttl.clear();
+        self.live_count = 0;
+    }
+
+    pub fn live_len(&self) -> usize {
+        self.live_count
     }
 
     /// Returns true if `expires_at_ms` is set and is at or before `now_ms`.

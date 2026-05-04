@@ -64,6 +64,10 @@ pub struct NamespaceLog {
     /// requiring external serialization; this flag turns a would-be RefCell
     /// panic into a clean Err at the call site.
     reclaim_in_progress: Cell<bool>,
+    /// Guards against two async tasks both trying to rotate the active file when
+    /// the threshold is crossed simultaneously (monoio yields between the check
+    /// and the rotate_active await).
+    rotate_in_progress: Cell<bool>,
 }
 
 impl NamespaceLog {
@@ -83,6 +87,7 @@ impl NamespaceLog {
             unsynced_bytes: Cell::new(0),
             last_tstamp: Cell::new(0),
             reclaim_in_progress: Cell::new(false),
+            rotate_in_progress: Cell::new(false),
         })
     }
 
@@ -126,6 +131,7 @@ impl NamespaceLog {
             }
         };
         let buf = record::encode(tstamp, flags, exp, &key, value, metadata)?;
+        // SAFETY: record::encode validates the record fits in u32::MAX before returning Ok.
         let record_size = buf.len() as u32;
 
         let active = self.active();
@@ -133,6 +139,9 @@ impl NamespaceLog {
         self.unsynced_bytes.set(self.unsynced_bytes.get() + record_size as u64);
         let entry = IndexEntry::new(active.file_id, offset, record_size);
         self.index.borrow_mut().insert(key, entry, expires_at_ms);
+        if active.write_offset() >= self.config.rotate_threshold {
+            self.rotate_active().await?;
+        }
         Ok(())
     }
 
@@ -157,10 +166,15 @@ impl NamespaceLog {
         let buf_len = buf.len() as u64;
         let base_offset = active.append(buf).await?;
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
-        let mut index = self.index.borrow_mut();
-        for ((k, _v), (rel_start, size)) in pairs.iter().zip(layout.iter()) {
-            let entry = IndexEntry::new(active.file_id, base_offset + *rel_start as u64, *size);
-            index.insert(k.clone(), entry, None);
+        {
+            let mut index = self.index.borrow_mut();
+            for ((k, _v), (rel_start, size)) in pairs.iter().zip(layout.iter()) {
+                let entry = IndexEntry::new(active.file_id, base_offset + *rel_start as u64, *size);
+                index.insert(k.clone(), entry, None);
+            }
+        }
+        if active.write_offset() >= self.config.rotate_threshold {
+            self.rotate_active().await?;
         }
         Ok(())
     }
@@ -282,10 +296,22 @@ impl NamespaceLog {
     }
 
     /// Seal the current active file (writing its footer) and open a new active file.
-    /// Call when `active.write_offset() >= config.rotate_threshold` to bound file size.
+    /// Called automatically when `active.write_offset() >= config.rotate_threshold`.
     ///
-    /// NOT concurrent-safe with other write operations on this namespace. Caller must serialize.
+    /// NOT concurrent-safe with other write operations on this namespace. The
+    /// `rotate_in_progress` guard prevents a second monoio task from racing in
+    /// while the first is awaiting the footer write.
     pub async fn rotate_active(&self) -> Result<()> {
+        if self.rotate_in_progress.get() {
+            return Ok(());
+        }
+        self.rotate_in_progress.set(true);
+        let result = self.rotate_active_inner().await;
+        self.rotate_in_progress.set(false);
+        result
+    }
+
+    async fn rotate_active_inner(&self) -> Result<()> {
         let old_active = self.active.borrow().clone();
         let footer: Vec<FooterEntry> = {
             let index = self.index.borrow();

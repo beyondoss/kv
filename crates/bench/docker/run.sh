@@ -6,6 +6,9 @@
 #   ./run.sh --duration 60s --rate 100000      # override bench args
 #   ./run.sh --rebuild                         # force a full image rebuild
 #   ./run.sh --purge                           # remove the image after the run
+#   ./run.sh --shards=8                        # run Beyond with 8 threads, bench
+#                                              # each shard in parallel with
+#                                              # partitioned keyspace
 
 set -euo pipefail
 
@@ -18,12 +21,14 @@ CONTAINER="beyond-kv-bench-run"
 
 REBUILD=0
 PURGE=0
+SHARDS=1
 PASSTHROUGH=()
 for arg in "$@"; do
     case "$arg" in
-        --rebuild) REBUILD=1 ;;
-        --purge)   PURGE=1 ;;
-        *)         PASSTHROUGH+=("$arg") ;;
+        --rebuild)   REBUILD=1 ;;
+        --purge)     PURGE=1 ;;
+        --shards=*)  SHARDS="${arg#--shards=}" ;;
+        *)           PASSTHROUGH+=("$arg") ;;
     esac
 done
 
@@ -55,7 +60,7 @@ if [[ $REBUILD -eq 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         -
 fi
 
-echo "==> Running bench"
+echo "==> Running bench (BEYOND_SHARDS=$SHARDS)"
 # --network none keeps the container off the host's network — only loopback,
 # which is all the bench and servers need. Removes one entire class of variance.
 #
@@ -75,5 +80,6 @@ docker run \
     --volume "$RESULTS_DIR:/results" \
     --env "BENCH_GIT_SHA=$GIT_SHA" \
     --env "BENCH_TIMESTAMP=$TIMESTAMP" \
+    --env "BEYOND_SHARDS=$SHARDS" \
     "$IMAGE" \
     "${PASSTHROUGH[@]}"

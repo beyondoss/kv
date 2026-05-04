@@ -16,6 +16,9 @@ mkdir -p "$DATA_BEYOND" "$DATA_REDIS" "$LOG_DIR"
 MEMORY_BYTES="${MEMORY_BYTES:-$((256 * 1024 * 1024))}"
 BEYOND_PORT="${BEYOND_PORT:-6479}"
 REDIS_PORT="${REDIS_PORT:-6480}"
+# Number of Beyond worker threads. When > 1, each shard bench runs in parallel
+# with a partitioned keyspace so each shard's L1 cache covers its 1/N slice.
+BEYOND_SHARDS="${BEYOND_SHARDS:-1}"
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 BEYOND_PID=
@@ -37,6 +40,7 @@ print_header() {
     echo "kernel:        $(uname -srm)"
     echo "container cpu: $(nproc) logical cores"
     echo "memory budget: $MEMORY_BYTES bytes ($((MEMORY_BYTES / 1024 / 1024)) MiB)"
+    echo "beyond shards: $BEYOND_SHARDS"
     echo
     echo "beyond-kv:     $(beyond-kv --version 2>/dev/null || echo 'unknown')"
     echo "redis-server:  $(redis-server --version)"
@@ -60,7 +64,7 @@ start_beyond() {
         --resp-port "$BEYOND_PORT" \
         --http-port 4870 \
         --memory-bytes "$MEMORY_BYTES" \
-        --threads 1 \
+        --threads "$BEYOND_SHARDS" \
         > "$LOG_DIR/beyond.log" 2>&1 &
     BEYOND_PID=$!
 }
@@ -98,6 +102,70 @@ wait_for_port() {
     return 1
 }
 
+# ── Extract --out VALUE from an arg list, returning the rest ───────────────────
+# Sets OUT_PATH and populates ARGS_WITHOUT_OUT.
+extract_out() {
+    OUT_PATH=""
+    ARGS_WITHOUT_OUT=()
+    local i=0
+    local args=("$@")
+    while [[ $i -lt ${#args[@]} ]]; do
+        if [[ "${args[$i]}" == "--out" ]] && [[ $((i+1)) -lt ${#args[@]} ]]; then
+            OUT_PATH="${args[$((i+1))]}"
+            i=$((i+2))
+        else
+            ARGS_WITHOUT_OUT+=("${args[$i]}")
+            i=$((i+1))
+        fi
+    done
+}
+
+# ── Run bench: single-shard or multi-shard ────────────────────────────────────
+run_bench() {
+    if [[ "$BEYOND_SHARDS" -le 1 ]]; then
+        kv-bench \
+            --target "beyond=redis://127.0.0.1:$BEYOND_PORT" \
+            --target "redis=redis://127.0.0.1:$REDIS_PORT" \
+            "$@"
+        return
+    fi
+
+    # Multi-shard: run N parallel beyond bench processes (one per shard),
+    # then one redis bench. Each beyond bench uses a partitioned keyspace so
+    # each shard's L1 cache covers exactly its 1/N slice of the dataset.
+    extract_out "$@"
+    local base_args=("${ARGS_WITHOUT_OUT[@]}")
+
+    echo "==> Running $BEYOND_SHARDS Beyond shards in parallel"
+    local pids=()
+    for ((s=0; s<BEYOND_SHARDS; s++)); do
+        local shard_args=("${base_args[@]}" "--shards" "$BEYOND_SHARDS" "--shard-index" "$s")
+        if [[ -n "$OUT_PATH" ]]; then
+            shard_args+=("--out" "${OUT_PATH%.json}-beyond-shard${s}.json")
+        fi
+        kv-bench \
+            --target "beyond-shard${s}=redis://127.0.0.1:$BEYOND_PORT" \
+            "${shard_args[@]}" &
+        pids+=($!)
+    done
+
+    local ok=0
+    for pid in "${pids[@]}"; do
+        wait "$pid" || ok=1
+    done
+
+    echo "==> Running Redis bench"
+    local redis_args=("${base_args[@]}")
+    if [[ -n "$OUT_PATH" ]]; then
+        redis_args+=("--out" "${OUT_PATH%.json}-redis.json")
+    fi
+    kv-bench \
+        --target "redis=redis://127.0.0.1:$REDIS_PORT" \
+        "${redis_args[@]}"
+
+    return $ok
+}
+
 main() {
     print_header
     start_beyond
@@ -111,10 +179,7 @@ main() {
     export BENCH_REDIS_VERSION="$(redis-server --version)"
     # BENCH_GIT_SHA + BENCH_TIMESTAMP are passed in from run.sh on the host.
 
-    kv-bench \
-        --target "beyond=redis://127.0.0.1:$BEYOND_PORT" \
-        --target "redis=redis://127.0.0.1:$REDIS_PORT" \
-        "$@"
+    run_bench "$@"
 }
 
 main "$@"
