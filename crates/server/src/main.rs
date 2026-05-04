@@ -170,15 +170,25 @@ fn main() -> anyhow::Result<()> {
         worker_inboxes.push((resp_rx, resp_wake_read, http_rx, http_wake_read));
     }
 
+    // Cross-shard request channels: one inbox per shard, shared sender array.
+    // Senders are cheap to clone; the `Arc<[Sender]>` lets every connection
+    // route a sub-request to any shard without taking a lock.
+    let (cross_shard_tx_vec, cross_shard_rx_vec) =
+        beyond_kv::cross_shard::build_channels(n_threads);
+    let cross_shard_txs: Arc<[_]> = Arc::from(cross_shard_tx_vec);
+
     let handles: Vec<_> = (0..n_threads)
         .zip(worker_inboxes)
-        .map(|(i, (resp_rx, resp_wake_read, http_rx, http_wake_read))| {
-            let data_dir = data_dir.clone();
-            std::thread::Builder::new()
-                .name(format!("kv-worker-{i}"))
-                .spawn(move || {
-                    let shard_dir = data_dir.join(format!("shard-{i}"));
-                    monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        .zip(cross_shard_rx_vec)
+        .map(
+            |((i, (resp_rx, resp_wake_read, http_rx, http_wake_read)), cross_shard_rx)| {
+                let data_dir = data_dir.clone();
+                let cross_shard_txs = cross_shard_txs.clone();
+                std::thread::Builder::new()
+                    .name(format!("kv-worker-{i}"))
+                    .spawn(move || {
+                        let shard_dir = data_dir.join(format!("shard-{i}"));
+                        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                         .enable_timer()
                         .build()
                         .expect("failed to build monoio runtime")
@@ -257,6 +267,14 @@ fn main() -> anyhow::Result<()> {
                                 .await;
                             });
 
+                            // Cross-shard request handler: drains this shard's
+                            // inbox of MGET/MSET/DEL/EXISTS sub-requests sent by
+                            // other shards, runs them against the local store.
+                            let cross_store = store.clone();
+                            monoio::spawn(async move {
+                                beyond_kv::cross_shard::serve(cross_store, cross_shard_rx).await;
+                            });
+
                             beyond_kv::resp::serve(
                                 store.clone(),
                                 resp_rx,
@@ -265,6 +283,7 @@ fn main() -> anyhow::Result<()> {
                                 idle_timeout,
                                 i,
                                 n_threads,
+                                cross_shard_txs,
                             )
                             .await;
 
@@ -276,9 +295,10 @@ fn main() -> anyhow::Result<()> {
                                 tracing::debug!("worker {i}: final log sync complete");
                             }
                         })
-                })
-                .expect("failed to spawn worker thread")
-        })
+                    })
+                    .expect("failed to spawn worker thread")
+            },
+        )
         .collect();
 
     let rr = Arc::new(AtomicUsize::new(0));

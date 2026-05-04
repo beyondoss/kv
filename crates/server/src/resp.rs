@@ -15,6 +15,7 @@ use futures_util::stream::SelectAll;
 use monoio::net::TcpStream;
 use monoio_codec::Framed;
 
+use crate::cross_shard::ShardSenders;
 use crate::dispatch::dispatch;
 
 pub struct ConnState {
@@ -23,6 +24,7 @@ pub struct ConnState {
     pub quit: bool,
     pub shard_idx: usize,
     pub n_shards: usize,
+    pub cross_shard_txs: Option<ShardSenders>,
 }
 
 impl Default for ConnState {
@@ -33,6 +35,7 @@ impl Default for ConnState {
             quit: false,
             shard_idx: 0,
             n_shards: 1,
+            cross_shard_txs: None,
         }
     }
 }
@@ -45,12 +48,14 @@ pub async fn serve(
     idle_timeout: Duration,
     shard_idx: usize,
     n_shards: usize,
+    cross_shard_txs: ShardSenders,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
         let store = store.clone();
+        let cross_shard_txs = cross_shard_txs.clone();
         monoio::spawn(async move {
             let _guard = guard;
-            handle_conn(s, store, idle_timeout, shard_idx, n_shards).await;
+            handle_conn(s, store, idle_timeout, shard_idx, n_shards, cross_shard_txs).await;
         });
     })
     .await;
@@ -62,11 +67,13 @@ async fn handle_conn(
     idle_timeout: Duration,
     shard_idx: usize,
     n_shards: usize,
+    cross_shard_txs: ShardSenders,
 ) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
     let mut state = ConnState {
         shard_idx,
         n_shards,
+        cross_shard_txs: Some(cross_shard_txs),
         ..ConnState::default()
     };
 

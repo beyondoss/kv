@@ -15,11 +15,11 @@ beyond-resp = { path = "../resp", features = ["monoio"] }
 base64 = "0.22"
 bytes = "1.11"
 crc-fast = "1.10"
-futures-channel = "0.3"
-futures-util = "0.3"
+futures-channel = { version = "0.3", features = ["sink"] }
+futures-util = { version = "0.3", features = ["sink"] }
 http = "1.0"
 mimalloc = { version = "0.1", features = ["v2"] }
-monoio = { version = "0.2", features = ["io-uring", "unlinkat", "renameat"] }
+monoio = { version = "0.2", features = ["io-uring", "unlinkat", "renameat", "sync"] }
 monoio-codec = "0.3"
 monoio-http = "0.3"
 rustc-hash = "2"

@@ -1,22 +1,19 @@
 use std::task::Poll;
 use std::time::Duration;
 
-use beyond_kv_engine::store::ShardStore;
-use beyond_kv_engine::types::SetOptions;
+use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
+use beyond_kv_engine::types::{Entry, SetOptions};
 use beyond_kv_proto::command::{Command, GetExTtl, SetCondition, SetTtl};
 use beyond_kv_proto::response::{self as r};
 use beyond_resp::Value;
+use bytes::Bytes;
+use futures_channel::oneshot;
+use futures_util::future::join_all;
+use futures_util::sink::SinkExt;
 
+use crate::cross_shard::{CrossShardRequest, MGetReply};
 use crate::resp::ConnState;
 use crate::routing::shard_for_key;
-
-/// Returns true if any key in `keys` hashes to a shard other than `shard_idx`.
-fn has_crossslot(keys: &[impl AsRef<[u8]>], shard_idx: usize, n_shards: usize) -> bool {
-    n_shards > 1
-        && keys
-            .iter()
-            .any(|k| shard_for_key(k.as_ref(), n_shards) != shard_idx)
-}
 
 const KEYS_SCAN_LIMIT: usize = 1_000_000;
 
@@ -52,9 +49,13 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
 
         Command::Reset => {
             // RESP spec: RESET clears per-connection state and replies "+RESET",
-            // but does NOT close the connection (unlike QUIT).
-            *state = ConnState::default();
-            Value::SimpleString(bytes::Bytes::from_static(b"RESET"))
+            // but does NOT close the connection (unlike QUIT). Preserve routing
+            // fields and cross-shard transport — the connection's shard pinning
+            // and the shared sender array are not "per-session" state.
+            state.ns = DEFAULT_NS.to_string();
+            state.resp_version = 2;
+            state.quit = false;
+            Value::SimpleString(Bytes::from_static(b"RESET"))
         }
 
         Command::Get { key } => match store.get(&state.ns, &key).await {
@@ -102,27 +103,15 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::Del { keys } => {
-            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
-                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
-            }
-            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
-            match store.del(&state.ns, &refs).await {
-                Ok(n) => r::integer(n as i64),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::Del { keys } => match dispatch_del(keys, store, state).await {
+            Ok(n) => r::integer(n as i64),
+            Err(e) => r::error("ERR", &e),
+        },
 
-        Command::Exists { keys } => {
-            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
-                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
-            }
-            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
-            match store.exists(&state.ns, &refs).await {
-                Ok(n) => r::integer(n as i64),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::Exists { keys } => match dispatch_exists(keys, store, state).await {
+            Ok(n) => r::integer(n as i64),
+            Err(e) => r::error("ERR", &e),
+        },
 
         Command::Expire { key, secs } => {
             match store
@@ -200,42 +189,24 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             Err(e) => r::error("ERR", &e.to_string()),
         },
 
-        Command::MGet { keys } => {
-            if has_crossslot(&keys, state.shard_idx, state.n_shards) {
-                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
+        Command::MGet { keys } => match dispatch_mget(keys, store, state).await {
+            Ok(entries) => {
+                let values: Vec<Value> = entries
+                    .into_iter()
+                    .map(|opt| match opt {
+                        Some(entry) => r::bulk(entry.value),
+                        None => r::nil(),
+                    })
+                    .collect();
+                r::array(values)
             }
-            // Bulk lookup: store.mget batches L1 misses through io_uring via
-            // join_all, so a 100-key MGET dispatches all the cold reads
-            // concurrently rather than serially awaiting each one.
-            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
-            match store.mget(&state.ns, &refs).await {
-                Err(e) => r::error("ERR", &e.to_string()),
-                Ok(entries) => {
-                    let values: Vec<Value> = entries
-                        .into_iter()
-                        .map(|opt| match opt {
-                            Some(entry) => r::bulk(entry.value),
-                            None => r::nil(),
-                        })
-                        .collect();
-                    r::array(values)
-                }
-            }
-        }
+            Err(e) => r::error("ERR", &e),
+        },
 
-        Command::MSet { pairs } => {
-            if state.n_shards > 1
-                && pairs
-                    .iter()
-                    .any(|(k, _)| shard_for_key(k.as_ref(), state.n_shards) != state.shard_idx)
-            {
-                return r::error("CROSSSLOT", "Keys in request don't hash to the same slot");
-            }
-            match store.mset(&state.ns, &pairs).await {
-                Ok(()) => r::ok(),
-                Err(e) => r::error("ERR", &e.to_string()),
-            }
-        }
+        Command::MSet { pairs } => match dispatch_mset(pairs, store, state).await {
+            Ok(()) => r::ok(),
+            Err(e) => r::error("ERR", &e),
+        },
 
         Command::GetSet { key, value } => match store.getset(&state.ns, &key, value).await {
             Ok(Some(old)) => r::bulk(old.value),
@@ -329,6 +300,326 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             "WATCH must be sent as the first command after HELLO 3",
         ),
     }
+}
+
+/// Returns the per-shard senders if fan-out is even possible on this connection.
+/// `n_shards == 1` or a missing sender array (test/embedded use) means everything
+/// runs on the local shard.
+fn fan_out_txs(state: &ConnState) -> Option<&[futures_channel::mpsc::Sender<CrossShardRequest>]> {
+    if state.n_shards <= 1 {
+        return None;
+    }
+    state.cross_shard_txs.as_deref()
+}
+
+/// Bucket the keys by target shard, preserving each key's original index.
+/// Returns `Vec<Option<Vec<(orig_idx, key)>>>` of length `n_shards`.
+fn bucket_by_shard(keys: &[Bytes], n_shards: usize) -> Vec<Option<Vec<(usize, Bytes)>>> {
+    let mut buckets: Vec<Option<Vec<(usize, Bytes)>>> = (0..n_shards).map(|_| None).collect();
+    let approx = keys.len() / n_shards + 1;
+    for (i, k) in keys.iter().enumerate() {
+        let s = shard_for_key(k.as_ref(), n_shards);
+        buckets[s]
+            .get_or_insert_with(|| Vec::with_capacity(approx))
+            .push((i, k.clone()));
+    }
+    buckets
+}
+
+async fn dispatch_mget(
+    keys: Vec<Bytes>,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<Vec<Option<Entry>>, String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            // Fast path: single shard, or all keys local by construction.
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+            return store
+                .mget(&state.ns, &refs)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        Some(txs) => txs,
+    };
+
+    let n_shards = state.n_shards;
+    let buckets = bucket_by_shard(&keys, n_shards);
+    // All-local fast path: every key bucketed to our shard.
+    if buckets
+        .iter()
+        .enumerate()
+        .all(|(s, b)| s == state.shard_idx || b.is_none())
+    {
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+        return store
+            .mget(&state.ns, &refs)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let mut results: Vec<Option<Entry>> = vec![None; keys.len()];
+    let mut local_bucket: Option<Vec<(usize, Bytes)>> = None;
+    let mut pending: Vec<oneshot::Receiver<MGetReply>> = Vec::new();
+
+    // Send to all remote shards first so they start working while we do the
+    // local lookup. Stash local keys for after the sends.
+    for (shard, bucket) in buckets.into_iter().enumerate() {
+        let Some(bucket) = bucket else { continue };
+        if shard == state.shard_idx {
+            local_bucket = Some(bucket);
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::MGet {
+            ns: state.ns.clone(),
+            keys: bucket,
+            reply: reply_tx,
+        };
+        let mut tx = txs[shard].clone();
+        tx.send(req)
+            .await
+            .map_err(|_| format!("shard {shard} unavailable"))?;
+        pending.push(reply_rx);
+    }
+
+    // Local lookup runs while remote shards are processing.
+    if let Some(bucket) = local_bucket {
+        let refs: Vec<&[u8]> = bucket.iter().map(|(_, k)| k.as_ref()).collect();
+        let local = store
+            .mget(&state.ns, &refs)
+            .await
+            .map_err(|e| e.to_string())?;
+        for ((orig_idx, _), entry) in bucket.into_iter().zip(local) {
+            results[orig_idx] = entry;
+        }
+    }
+
+    for rx in pending {
+        let entries = rx
+            .await
+            .map_err(|_| "cross-shard reply dropped".to_string())??;
+        for (orig_idx, entry) in entries {
+            results[orig_idx] = entry;
+        }
+    }
+    Ok(results)
+}
+
+async fn dispatch_mset(
+    pairs: Vec<(Bytes, Bytes)>,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<(), String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            return store
+                .mset(&state.ns, &pairs)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        Some(txs) => txs,
+    };
+
+    let n_shards = state.n_shards;
+    // Bucket by shard. Fast path when everything is local.
+    let mut buckets: Vec<Option<Vec<(Bytes, Bytes)>>> = (0..n_shards).map(|_| None).collect();
+    let approx = pairs.len() / n_shards + 1;
+    let mut all_local = true;
+    for (k, v) in pairs.into_iter() {
+        let s = shard_for_key(k.as_ref(), n_shards);
+        if s != state.shard_idx {
+            all_local = false;
+        }
+        buckets[s]
+            .get_or_insert_with(|| Vec::with_capacity(approx))
+            .push((k, v));
+    }
+    if all_local {
+        let local = buckets[state.shard_idx].take().unwrap_or_default();
+        return store
+            .mset(&state.ns, &local)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    // NOTE: cross-shard MSET is NOT atomic — each shard applies its subset
+    // independently. Matches Redis Cluster semantics.
+    let mut local_pairs: Option<Vec<(Bytes, Bytes)>> = None;
+    let mut pending: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
+    for (shard, bucket) in buckets.into_iter().enumerate() {
+        let Some(bucket) = bucket else { continue };
+        if shard == state.shard_idx {
+            local_pairs = Some(bucket);
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::MSet {
+            ns: state.ns.clone(),
+            pairs: bucket,
+            reply: reply_tx,
+        };
+        let mut tx = txs[shard].clone();
+        tx.send(req)
+            .await
+            .map_err(|_| format!("shard {shard} unavailable"))?;
+        pending.push(reply_rx);
+    }
+
+    if let Some(local) = local_pairs {
+        store
+            .mset(&state.ns, &local)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for rx in pending {
+        rx.await
+            .map_err(|_| "cross-shard reply dropped".to_string())??;
+    }
+    Ok(())
+}
+
+async fn dispatch_del(
+    keys: Vec<Bytes>,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<u64, String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+            return store.del(&state.ns, &refs).await.map_err(|e| e.to_string());
+        }
+        Some(txs) => txs,
+    };
+
+    let n_shards = state.n_shards;
+    // DEL/EXISTS only need the keys, no original index — recipients reduce to a count.
+    let mut buckets: Vec<Option<Vec<Bytes>>> = (0..n_shards).map(|_| None).collect();
+    let approx = keys.len() / n_shards + 1;
+    let mut all_local = true;
+    for k in keys.into_iter() {
+        let s = shard_for_key(k.as_ref(), n_shards);
+        if s != state.shard_idx {
+            all_local = false;
+        }
+        buckets[s]
+            .get_or_insert_with(|| Vec::with_capacity(approx))
+            .push(k);
+    }
+    if all_local {
+        let local = buckets[state.shard_idx].take().unwrap_or_default();
+        let refs: Vec<&[u8]> = local.iter().map(|k| k.as_ref()).collect();
+        return store.del(&state.ns, &refs).await.map_err(|e| e.to_string());
+    }
+
+    let mut local_keys: Option<Vec<Bytes>> = None;
+    let mut pending: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::new();
+    for (shard, bucket) in buckets.into_iter().enumerate() {
+        let Some(bucket) = bucket else { continue };
+        if shard == state.shard_idx {
+            local_keys = Some(bucket);
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::Del {
+            ns: state.ns.clone(),
+            keys: bucket,
+            reply: reply_tx,
+        };
+        let mut tx = txs[shard].clone();
+        tx.send(req)
+            .await
+            .map_err(|_| format!("shard {shard} unavailable"))?;
+        pending.push(reply_rx);
+    }
+
+    let mut total: u64 = 0;
+    if let Some(local) = local_keys {
+        let refs: Vec<&[u8]> = local.iter().map(|k| k.as_ref()).collect();
+        total += store
+            .del(&state.ns, &refs)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let replies = join_all(pending).await;
+    for r in replies {
+        total += r.map_err(|_| "cross-shard reply dropped".to_string())??;
+    }
+    Ok(total)
+}
+
+async fn dispatch_exists(
+    keys: Vec<Bytes>,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<u64, String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+            return store
+                .exists(&state.ns, &refs)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        Some(txs) => txs,
+    };
+
+    let n_shards = state.n_shards;
+    let mut buckets: Vec<Option<Vec<Bytes>>> = (0..n_shards).map(|_| None).collect();
+    let approx = keys.len() / n_shards + 1;
+    let mut all_local = true;
+    for k in keys.into_iter() {
+        let s = shard_for_key(k.as_ref(), n_shards);
+        if s != state.shard_idx {
+            all_local = false;
+        }
+        buckets[s]
+            .get_or_insert_with(|| Vec::with_capacity(approx))
+            .push(k);
+    }
+    if all_local {
+        let local = buckets[state.shard_idx].take().unwrap_or_default();
+        let refs: Vec<&[u8]> = local.iter().map(|k| k.as_ref()).collect();
+        return store
+            .exists(&state.ns, &refs)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let mut local_keys: Option<Vec<Bytes>> = None;
+    let mut pending: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::new();
+    for (shard, bucket) in buckets.into_iter().enumerate() {
+        let Some(bucket) = bucket else { continue };
+        if shard == state.shard_idx {
+            local_keys = Some(bucket);
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::Exists {
+            ns: state.ns.clone(),
+            keys: bucket,
+            reply: reply_tx,
+        };
+        let mut tx = txs[shard].clone();
+        tx.send(req)
+            .await
+            .map_err(|_| format!("shard {shard} unavailable"))?;
+        pending.push(reply_rx);
+    }
+
+    let mut total: u64 = 0;
+    if let Some(local) = local_keys {
+        let refs: Vec<&[u8]> = local.iter().map(|k| k.as_ref()).collect();
+        total += store
+            .exists(&state.ns, &refs)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let replies = join_all(pending).await;
+    for r in replies {
+        total += r.map_err(|_| "cross-shard reply dropped".to_string())??;
+    }
+    Ok(total)
 }
 
 async fn yield_now() {

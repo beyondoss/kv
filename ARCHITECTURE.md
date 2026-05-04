@@ -118,17 +118,17 @@ SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
 
 ## Concepts & Terminology
 
-| Term                   | What It Controls                                                                                                                                                       | NOT                                                         |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary                              |
-| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                     | Not a partition of data; all shards hold the full key space |
-| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                | Not write-through durable storage                           |
-| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                | Not the hot path for reads after first access               |
-| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                        | Not modified in place; only appended                        |
-| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                 | Not deleted until reclaim runs again                        |
-| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                            | Not a tombstone or deletion marker                          |
-| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                   | Not a literal zero integer                                  |
-| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                       | Not a user-visible value; internal to scan                  |
+| Term                   | What It Controls                                                                                                                                                       | NOT                                                                                               |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary                                                                    |
+| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                     | A partition of the keyspace: a key lives on exactly one shard, picked by `FxHash(key) % n_shards` |
+| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                | Not write-through durable storage                                                                 |
+| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                | Not the hot path for reads after first access                                                     |
+| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                        | Not modified in place; only appended                                                              |
+| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                 | Not deleted until reclaim runs again                                                              |
+| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                            | Not a tombstone or deletion marker                                                                |
+| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                   | Not a literal zero integer                                                                        |
+| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                       | Not a user-visible value; internal to scan                                                        |
 
 ## Core Mechanism
 
@@ -151,7 +151,9 @@ SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
 ... (N threads)
 ```
 
-`ShardStore` is `!Sync` (via `Rc<>` wrapping). There is no shared mutable state between threads — each is fully autonomous. A routing layer (not in this codebase) is expected to hash client connections to a specific thread so that a given key always lands on the same shard.
+`ShardStore` is `!Sync` (via `Rc<>` wrapping). There is no shared mutable state between threads — each shard owns its slice of the keyspace and has no read or write path into another shard's storage.
+
+The accept loop in `main.rs` peeks the first command's key on each new connection and routes it to the owning shard; the connection is then **pinned** to that shard for its lifetime (Redis-cluster-style). Single-key commands (GET/SET/DEL/EXISTS/...) execute locally on the pinned shard. Multi-key commands (MGET/MSET/DEL/EXISTS) **fan out across shards** transparently — see "Cross-Shard Fan-Out" below.
 
 ### Two-Level Storage
 
@@ -220,6 +222,18 @@ Expired keys that are never accessed accumulate as dead bytes in the log files u
 ### MGET batching
 
 `ShardStore::mget` resolves all keys in-RAM (index + L1 lookup), then submits the cold-read futures concurrently via `futures_util::future::join_all`. io_uring sees them as a batch of SQEs and processes them in parallel rather than serialising one round-trip per key. This is the load-bearing optimization for batched-GET throughput; a 100-key MGET completes in ≈ one disk round-trip instead of N.
+
+### Cross-Shard Fan-Out
+
+A connection is pinned to one shard, but multi-key commands (MGET, MSET, DEL, EXISTS) routinely receive keys whose hashes span multiple shards. Rather than reject those with `CROSSSLOT` (Redis Cluster's behavior), the dispatcher transparently fans them out.
+
+- Each shard exposes one inbound `futures_channel::mpsc::Receiver<CrossShardRequest>` (capacity `1024`). Senders are shared across all shards via `Arc<[Sender]>` on `ConnState`.
+- `crates/server/src/cross_shard.rs` runs a per-shard task that drains the inbox; each request is `monoio::spawn`ed so a slow store op (e.g. cold MGET reads) doesn't block the next inbound request.
+- Reply channel is `futures_channel::oneshot` per request — light, single-use, `Send`. Cross-thread waker support requires monoio's `sync` feature.
+- The dispatcher (`crates/server/src/dispatch.rs`) buckets keys by `shard_for_key`. The local subset runs against the pinned shard's `ShardStore`; foreign subsets are sent over the channel. Results are reassembled by original key index for MGET (which must preserve order); DEL/EXISTS reduce to a count on the receiving shard so only the count crosses the channel.
+- Fast path: when `n_shards == 1` or every key already hashes to the connection's shard, dispatch skips bucketing and calls the local store directly.
+
+**MSET is not atomic across shards.** A single-shard MSET still uses one fsynced write (atomic), but a cross-shard MSET applies each shard's subset independently — a crash between sub-replies leaves some keys written and others not. This matches Redis Cluster's MSET semantics. If you need cross-shard atomicity, partition writes by key prefix so all keys in one MSET hash to the same shard.
 
 ### SCAN Glob Matching
 
@@ -341,7 +355,7 @@ absent ──CAS──────────────────► absent
 
 Sharing storage across threads would require locking on the index and the active-file write offset. Per-thread instances eliminate that coordination entirely and keep the hot path lock-free. The tradeoff is that the routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
 
-Connection routing is built into the server: `peek_resp_key` peeks the first bytes of a new TCP connection (without consuming them), extracts the key from the first command, and runs `FxHash(key) % n_shards` to pick a worker thread. The connection is then pinned to that thread for its lifetime. Multi-key commands (MGET, MSET, DEL, EXISTS) whose keys don't all hash to the pinned shard receive a `-CROSSSLOT` error — same semantics as Redis Cluster — so callers receive an explicit error rather than a silent wrong answer.
+Connection routing is built into the server: `peek_resp_key` peeks the first bytes of a new TCP connection (without consuming them), extracts the key from the first command, and runs `FxHash(key) % n_shards` to pick a worker thread. The connection is then pinned to that thread for its lifetime. Multi-key commands (MGET, MSET, DEL, EXISTS) whose keys span shards are transparently fanned out via per-shard request channels (see "Cross-Shard Fan-Out") so the client sees a single response in original key order — no `CROSSSLOT` error.
 
 ### Why expiry is lazy rather than proactive
 
@@ -363,9 +377,11 @@ We control the on-disk format directly because every record gets a fixed-size he
 
 Redis protocol defines SCAN to return "0" when iteration is complete. Reusing "0" as the start sentinel matches the Redis API contract exactly — clients loop `while cursor != "0"` after the first call, which naturally handles both starting and stopping. Internal continuation cursors are prefixed with `\x01` to ensure they can never collide with the literal "0" string.
 
-### Why MSET is atomic
+### Why MSET is atomic (within one shard)
 
-Redis MSET is documented as atomic. This implementation builds a single buffer containing every record, calls `write_at(buf, base_offset)` and `fsync()` once, then bulk-updates the index. Either all keys land or none do. The L1 cache is populated after the disk fsync; in the narrow window between the two a cache miss will correctly fall back to disk and see all keys.
+Redis MSET is documented as atomic. Within a single shard this implementation builds one buffer containing every record, calls `write_at(buf, base_offset)` and `fsync()` once, then bulk-updates the index — all keys land or none do. The L1 cache is populated after the disk fsync; in the narrow window between the two, a cache miss correctly falls back to disk and sees all keys.
+
+Across shards (when MSET keys span shard boundaries), atomicity is **not** preserved: each shard's subset commits independently, matching Redis Cluster's semantics. If you need cross-shard atomicity, key your batch so all entries hash to the same shard.
 
 ## Configuration
 
@@ -381,18 +397,19 @@ Redis MSET is documented as atomic. This implementation builds a single buffer c
 
 ## Failure Modes
 
-| Failure                | What Actually Happens                                                                                                                           | Recovery                                                          |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| Thread panic           | `panic = "abort"` — process terminates immediately; no unwinding                                                                                | External process supervisor restarts the process                  |
-| Disk write error       | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open                                                        | Client retries; underlying disk issue must be resolved externally |
-| CRC mismatch on replay | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records | Automatic; the offending tail bytes are dropped                   |
-| Bad record header      | `EngineError::BadRecord`; treated as the truncation point during replay                                                                         | Affected tail records are lost; older records survive             |
-| RESP parse error       | Connection closed; no response sent                                                                                                             | Client reconnects                                                 |
-| HTTP malformed request | JSON error body `{"error": "...", "message": "..."}` with 4xx status                                                                            | Client fixes request                                              |
-| Expired key read       | Tombstone appended, evicted from L1; `None` returned to caller                                                                                  | Transparent; client sees cache miss                               |
-| Crash during MSET      | Single fsynced write — either all records land or the partial tail is truncated by recovery's CRC check                                         | No partial state; client can safely retry                         |
-| Crash mid-reclaim      | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim                                          | Automatic; no data loss (no rename happened)                      |
-| L1 cache over capacity | Eviction runs inline during insert; oldest Small-queue entries dropped first                                                                    | Automatic; no data loss (L2 is authoritative)                     |
+| Failure                          | What Actually Happens                                                                                                                           | Recovery                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Thread panic                     | `panic = "abort"` — process terminates immediately; no unwinding                                                                                | External process supervisor restarts the process                    |
+| Disk write error                 | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open                                                        | Client retries; underlying disk issue must be resolved externally   |
+| CRC mismatch on replay           | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records | Automatic; the offending tail bytes are dropped                     |
+| Bad record header                | `EngineError::BadRecord`; treated as the truncation point during replay                                                                         | Affected tail records are lost; older records survive               |
+| RESP parse error                 | Connection closed; no response sent                                                                                                             | Client reconnects                                                   |
+| HTTP malformed request           | JSON error body `{"error": "...", "message": "..."}` with 4xx status                                                                            | Client fixes request                                                |
+| Expired key read                 | Tombstone appended, evicted from L1; `None` returned to caller                                                                                  | Transparent; client sees cache miss                                 |
+| Crash during MSET (single shard) | Single fsynced write — either all records land or the partial tail is truncated by recovery's CRC check                                         | No partial state; client can safely retry                           |
+| Crash during cross-shard MSET    | Each shard's subset is independent; some shards may have committed before the crash                                                             | Client retries; idempotent overwrites converge to the desired state |
+| Crash mid-reclaim                | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim                                          | Automatic; no data loss (no rename happened)                        |
+| L1 cache over capacity           | Eviction runs inline during insert; oldest Small-queue entries dropped first                                                                    | Automatic; no data loss (L2 is authoritative)                       |
 
 ## File Map
 
@@ -413,7 +430,8 @@ Redis MSET is documented as atomic. This implementation builds a single buffer c
 | `crates/engine/src/log/reclaim.rs` | Operator-triggered merge of sealed files into a new sealed file                                                           |
 | `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                    |
 | `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                   |
-| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`                                                          |
+| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS            |
+| `crates/server/src/cross_shard.rs` | `CrossShardRequest` enum + per-shard receiver loop; `futures_channel::mpsc` transport for fan-out sub-requests            |
 | `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                    |
 | `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                          |
 | `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint                              |

@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use beyond_kv_engine::store::ShardStore;
 use tempfile::TempDir;
@@ -100,6 +101,17 @@ impl TestServer {
                                 .await
                                 .expect("ShardStore::open"),
                         );
+                        // Single-shard test harness: build a one-element sender
+                        // array so dispatch can short-circuit (n_shards == 1
+                        // already triggers the local fast path; this just keeps
+                        // the API uniform).
+                        let (txs, mut rxs) = beyond_kv::cross_shard::build_channels(1);
+                        let cross_shard_txs: Arc<[_]> = Arc::from(txs);
+                        let cross_store = store.clone();
+                        let cross_rx = rxs.remove(0);
+                        monoio::spawn(async move {
+                            beyond_kv::cross_shard::serve(cross_store, cross_rx).await;
+                        });
                         let http_store = store.clone();
                         monoio::spawn(async move {
                             beyond_kv::http::serve_routed(
@@ -120,6 +132,7 @@ impl TestServer {
                             std::time::Duration::from_secs(60),
                             0,
                             1,
+                            cross_shard_txs,
                         )
                         .await;
                     });
