@@ -255,6 +255,7 @@ fn main() -> anyhow::Result<()> {
                             }
 
                             let http_store = store.clone();
+                            let http_txs = cross_shard_txs.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -263,6 +264,9 @@ fn main() -> anyhow::Result<()> {
                                     max_conns,
                                     idle_timeout,
                                     max_value_bytes,
+                                    i,
+                                    n_threads,
+                                    http_txs,
                                 )
                                 .await;
                             });

@@ -113,6 +113,7 @@ impl TestServer {
                             beyond_kv::cross_shard::serve(cross_store, cross_rx).await;
                         });
                         let http_store = store.clone();
+                        let http_txs = cross_shard_txs.clone();
                         monoio::spawn(async move {
                             beyond_kv::http::serve_routed(
                                 http_store,
@@ -121,6 +122,9 @@ impl TestServer {
                                 10_000,
                                 std::time::Duration::from_secs(60),
                                 64 * 1024 * 1024,
+                                0,
+                                1,
+                                http_txs,
                             )
                             .await;
                         });

@@ -4,6 +4,8 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
+
 use base64::Engine as _;
 use beyond_kv_engine::error::EngineError;
 use beyond_kv_engine::log::now_ms;
@@ -31,12 +33,25 @@ pub async fn serve_routed(
     max_conns: usize,
     idle_timeout: Duration,
     max_value_bytes: usize,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: ShardSenders,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "HTTP", |s, _peer, guard| {
         let store = store.clone();
+        let txs = cross_shard_txs.clone();
         monoio::spawn(async move {
             let _guard = guard;
-            handle_conn(s, store, idle_timeout, max_value_bytes).await;
+            handle_conn(
+                s,
+                store,
+                idle_timeout,
+                max_value_bytes,
+                shard_idx,
+                n_shards,
+                txs,
+            )
+            .await;
         });
     })
     .await;
@@ -47,6 +62,9 @@ async fn handle_conn(
     store: Rc<ShardStore>,
     idle_timeout: Duration,
     max_value_bytes: usize,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: ShardSenders,
 ) {
     // Split so we can keep the write half for SSE streaming later.
     let (r, mut w) = stream.into_split();
@@ -73,7 +91,7 @@ async fn handle_conn(
                 let _ = Sink::send(&mut enc, method_not_allowed()).await;
                 break;
             }
-            handle_watch_sse(&mut w, &store, wp).await;
+            handle_watch_sse(&mut w, &store, wp, shard_idx, n_shards, &cross_shard_txs).await;
             return;
         }
 
@@ -412,6 +430,9 @@ async fn handle_watch_sse(
     w: &mut OwnedWriteHalf<TcpStream>,
     store: &ShardStore,
     params: WatchParams,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
 ) {
     let headers = b"HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
@@ -425,31 +446,80 @@ async fn handle_watch_sse(
         return;
     }
 
-    let filter = if params.is_prefix {
-        KeyFilter::Prefix(&params.key)
-    } else {
-        KeyFilter::Exact(&params.key)
-    };
     let since_rev = params.since.unwrap_or(0);
+    let mut rx_stream: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
 
-    let (initial, rx) = match store.watch_subscribe(&params.ns, filter, since_rev).await {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = format!(
-                "data: {{\"type\":\"error\",\"message\":{}}}\n\n",
-                serde_json::json!(e.to_string())
-            );
-            let _ = w.write_all(msg.into_bytes()).await;
-            return;
+    if params.is_prefix && n_shards > 1 {
+        // Prefix watch must subscribe on every shard.
+        for shard in 0..n_shards {
+            let result = if shard == shard_idx {
+                store
+                    .watch_subscribe(&params.ns, KeyFilter::Prefix(&params.key), since_rev)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                let req = CrossShardRequest::WatchSubscribe {
+                    ns: params.ns.clone(),
+                    filter: OwnedKeyFilter::Prefix(Bytes::copy_from_slice(&params.key)),
+                    since: since_rev,
+                    reply: reply_tx,
+                };
+                if cross_shard_txs[shard].clone().try_send(req).is_err() {
+                    let msg = b"data: {\"type\":\"error\",\"message\":\"shard inbox full\"}\n\n";
+                    let _ = w.write_all(msg.to_vec()).await;
+                    return;
+                }
+                match reply_rx.await {
+                    Ok(r) => r,
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            match result {
+                Ok((initial, rx)) => {
+                    for event in &initial {
+                        let data = format!("data: {}\n\n", sse_event_json(event));
+                        if w.write_all(data.into_bytes()).await.0.is_err() {
+                            return;
+                        }
+                    }
+                    rx_stream.push(rx);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "data: {{\"type\":\"error\",\"message\":{}}}\n\n",
+                        serde_json::json!(e)
+                    );
+                    let _ = w.write_all(msg.into_bytes()).await;
+                    return;
+                }
+            }
         }
-    };
-
-    for event in &initial {
-        let data = format!("data: {}\n\n", sse_event_json(event));
-        let (res, _) = w.write_all(data.into_bytes()).await;
-        if res.is_err() {
-            return;
+    } else {
+        // Exact-key watch: the connection is already routed to the key's shard.
+        let filter = if params.is_prefix {
+            KeyFilter::Prefix(&params.key)
+        } else {
+            KeyFilter::Exact(&params.key)
+        };
+        let (initial, rx) = match store.watch_subscribe(&params.ns, filter, since_rev).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!(
+                    "data: {{\"type\":\"error\",\"message\":{}}}\n\n",
+                    serde_json::json!(e.to_string())
+                );
+                let _ = w.write_all(msg.into_bytes()).await;
+                return;
+            }
+        };
+        for event in &initial {
+            let data = format!("data: {}\n\n", sse_event_json(event));
+            if w.write_all(data.into_bytes()).await.0.is_err() {
+                return;
+            }
         }
+        rx_stream.push(rx);
     }
 
     let (res, _) = w
@@ -458,9 +528,6 @@ async fn handle_watch_sse(
     if res.is_err() {
         return;
     }
-
-    let mut rx_stream: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
-    rx_stream.push(rx);
 
     loop {
         match monoio::time::timeout(

@@ -92,6 +92,7 @@ impl ShardedServer {
                                 cross_shard::serve(cross_store, cross_rx).await;
                             });
                             let http_store = store.clone();
+                            let http_txs = cross_shard_txs.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -100,6 +101,9 @@ impl ShardedServer {
                                     10_000,
                                     Duration::from_secs(60),
                                     64 * 1024 * 1024,
+                                    i,
+                                    N_SHARDS,
+                                    http_txs,
                                 )
                                 .await;
                             });
@@ -491,6 +495,346 @@ fn http_routing_consistent_with_resp() {
             v.as_deref(),
             Some(format!("x{i}").as_str()),
             "key[{i}] written via HTTP not visible via RESP MGET"
+        );
+    }
+}
+
+// ── SCAN / KEYS / DBSIZE / FLUSHDB cross-shard tests ─────────────────────────
+
+fn scan_all_keys(con: &mut redis::Connection) -> Vec<String> {
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    let mut all_keys = Vec::new();
+    loop {
+        let (next, batch): (Vec<u8>, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor.as_slice())
+            .arg("COUNT")
+            .arg(100u64)
+            .query(con)
+            .unwrap();
+        all_keys.extend(batch);
+        if next == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    all_keys
+}
+
+#[test]
+fn scan_returns_keys_from_all_shards() {
+    let srv = ShardedServer::start();
+    let mut con = srv.resp();
+    let keys = keys_one_per_shard();
+
+    let mut cmd = redis::cmd("MSET");
+    for (i, k) in keys.iter().enumerate() {
+        cmd.arg(k).arg(format!("v{i}"));
+    }
+    let _: () = cmd.query(&mut con).unwrap();
+
+    let mut scan_con = srv.resp();
+    let found = scan_all_keys(&mut scan_con);
+    for k in &keys {
+        assert!(found.contains(k), "SCAN missing key {k} (found {found:?})");
+    }
+}
+
+#[test]
+fn keys_star_returns_all_keys_across_shards() {
+    let srv = ShardedServer::start();
+    let mut con = srv.resp();
+    let keys = keys_one_per_shard();
+
+    let mut cmd = redis::cmd("MSET");
+    for (i, k) in keys.iter().enumerate() {
+        cmd.arg(k).arg(format!("v{i}"));
+    }
+    let _: () = cmd.query(&mut con).unwrap();
+
+    let mut keys_con = srv.resp();
+    let found: Vec<String> = redis::cmd("KEYS").arg("*").query(&mut keys_con).unwrap();
+    for k in &keys {
+        assert!(
+            found.contains(k),
+            "KEYS * missing key {k} (found {found:?})"
+        );
+    }
+}
+
+#[test]
+fn dbsize_counts_keys_on_all_shards() {
+    let srv = ShardedServer::start();
+    let mut con = srv.resp();
+    let keys = keys_one_per_shard();
+
+    let mut cmd = redis::cmd("MSET");
+    for (i, k) in keys.iter().enumerate() {
+        cmd.arg(k).arg(format!("v{i}"));
+    }
+    let _: () = cmd.query(&mut con).unwrap();
+
+    let mut size_con = srv.resp();
+    let n: u64 = redis::cmd("DBSIZE").query(&mut size_con).unwrap();
+    assert_eq!(n, N_SHARDS as u64, "DBSIZE should count keys on all shards");
+}
+
+#[test]
+fn flushdb_clears_all_shards() {
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+
+    // Write one key per shard.
+    let mut con = srv.resp();
+    let mut cmd = redis::cmd("MSET");
+    for (i, k) in keys.iter().enumerate() {
+        cmd.arg(k).arg(format!("v{i}"));
+    }
+    let _: () = cmd.query(&mut con).unwrap();
+
+    // Flush — must clear every shard.
+    let mut flush_con = srv.resp();
+    let _: () = redis::cmd("FLUSHDB").query(&mut flush_con).unwrap();
+
+    // All keys must be gone.
+    let mut check_con = srv.resp();
+    let mut mget = redis::cmd("MGET");
+    for k in &keys {
+        mget.arg(k);
+    }
+    let vals: Vec<Option<String>> = mget.query(&mut check_con).unwrap();
+    assert!(
+        vals.iter().all(|v| v.is_none()),
+        "FLUSHDB left keys on unflushed shards: {vals:?}"
+    );
+
+    let n: u64 = redis::cmd("DBSIZE").query(&mut check_con).unwrap();
+    assert_eq!(n, 0, "DBSIZE after FLUSHDB should be 0");
+}
+
+// ── WATCH / PWATCH cross-shard tests ─────────────────────────────────────────
+
+/// Minimal blocking RESP3 client for watch tests.
+/// Uses raw TCP so we can stream push frames without ioredis limitations.
+struct Resp3Conn {
+    w: std::net::TcpStream,
+    r: std::io::BufReader<std::net::TcpStream>,
+}
+
+impl Resp3Conn {
+    fn connect(port: u16) -> Self {
+        let s = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let r = std::io::BufReader::new(s.try_clone().unwrap());
+        Self { w: s, r }
+    }
+
+    fn send(&mut self, args: &[&[u8]]) {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            buf.extend(format!("${}\r\n", a.len()).as_bytes());
+            buf.extend_from_slice(a);
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.w.write_all(&buf).unwrap();
+    }
+
+    fn read_line(&mut self) -> String {
+        use std::io::BufRead as _;
+        let mut s = String::new();
+        self.r.read_line(&mut s).unwrap();
+        s.trim_end_matches("\r\n").to_string()
+    }
+
+    /// Read one complete RESP3 value and return its string content.
+    /// Compound types (map, array) are consumed and "" is returned.
+    fn read_value_as_string(&mut self) -> String {
+        let line = self.read_line();
+        if line.is_empty() {
+            return String::new();
+        }
+        let (sigil, rest) = (&line[..1], &line[1..]);
+        match sigil {
+            "$" => {
+                use std::io::Read as _;
+                let n: usize = rest.parse().unwrap_or(0);
+                let mut buf = vec![0u8; n + 2];
+                self.r.read_exact(&mut buf).unwrap();
+                String::from_utf8_lossy(&buf[..n]).into_owned()
+            }
+            "+" | "-" | ":" | "," | "(" | "_" | "#" => rest.to_string(),
+            "*" | ">" | "~" => {
+                let n: usize = rest.parse().unwrap_or(0);
+                for _ in 0..n {
+                    self.read_value_as_string();
+                }
+                String::new()
+            }
+            "%" | "|" => {
+                let n: usize = rest.parse().unwrap_or(0);
+                for _ in 0..n * 2 {
+                    self.read_value_as_string();
+                }
+                String::new()
+            }
+            _ => rest.to_string(),
+        }
+    }
+
+    /// Read the next push (`>`) frame; skip any non-push values encountered first.
+    fn next_push(&mut self) -> Vec<String> {
+        loop {
+            let line = self.read_line();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(n_str) = line.strip_prefix('>') {
+                let n: usize = n_str.parse().unwrap_or(0);
+                return (0..n).map(|_| self.read_value_as_string()).collect();
+            }
+            // Non-push value: skip remaining parts after the first line.
+            let (sigil, rest) = (&line[..1], &line[1..]);
+            match sigil {
+                "$" => {
+                    use std::io::Read as _;
+                    let n: usize = rest.parse().unwrap_or(0);
+                    let mut buf = vec![0u8; n + 2];
+                    self.r.read_exact(&mut buf).unwrap();
+                }
+                "*" | "~" => {
+                    let n: usize = rest.parse().unwrap_or(0);
+                    for _ in 0..n {
+                        self.read_value_as_string();
+                    }
+                }
+                "%" | "|" => {
+                    let n: usize = rest.parse().unwrap_or(0);
+                    for _ in 0..n * 2 {
+                        self.read_value_as_string();
+                    }
+                }
+                _ => {} // single-line types, already consumed
+            }
+        }
+    }
+
+    /// Block until the `watch ready` push frame arrives.
+    fn wait_ready(&mut self) {
+        loop {
+            let push = self.next_push();
+            if push.get(1).map(String::as_str) == Some("ready") {
+                return;
+            }
+        }
+    }
+}
+
+#[test]
+fn watch_multi_key_receives_event_from_foreign_shard() {
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+    // keys[0] → shard 0, keys[1] → shard 1 (guaranteed by keys_one_per_shard).
+    let key_a = keys[0].as_bytes().to_vec();
+    let key_b = keys[1].as_bytes().to_vec();
+    assert_ne!(
+        shard_for_key(&key_a, N_SHARDS),
+        shard_for_key(&key_b, N_SHARDS),
+    );
+
+    // Open RESP3 watch connection (will be pinned to key_a's shard).
+    let mut watcher = Resp3Conn::connect(srv.resp_port);
+    watcher.send(&[b"HELLO", b"3"]);
+    watcher.read_value_as_string(); // skip HELLO response map
+    watcher.send(&[b"WATCH", &key_a, &key_b]);
+    watcher.wait_ready();
+
+    // Write to both keys from a second connection after ready.
+    let port = srv.resp_port;
+    let ka = keys[0].clone();
+    let kb = keys[1].clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        rx.recv().unwrap();
+        let mut con = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let _: () = redis::cmd("MSET")
+            .arg(&ka)
+            .arg("va")
+            .arg(&kb)
+            .arg("vb")
+            .query(&mut con)
+            .unwrap();
+    });
+    tx.send(()).unwrap();
+
+    // Both keys must arrive as watch set events.
+    let mut received = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let push = watcher.next_push();
+        // push = ["watch", "set", key, value, revision]
+        if push.get(1).map(String::as_str) == Some("set") {
+            if let Some(k) = push.get(2) {
+                received.insert(k.clone());
+            }
+        }
+    }
+    let key_a_str = String::from_utf8(key_a).unwrap();
+    let key_b_str = String::from_utf8(key_b).unwrap();
+    assert!(
+        received.contains(&key_a_str),
+        "missing watch event for {key_a_str}"
+    );
+    assert!(
+        received.contains(&key_b_str),
+        "missing watch event for {key_b_str}"
+    );
+}
+
+#[test]
+fn pwatch_receives_events_from_all_shards() {
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+    // All keys start with "k" — use that as the PWATCH prefix.
+
+    let mut watcher = Resp3Conn::connect(srv.resp_port);
+    watcher.send(&[b"HELLO", b"3"]);
+    watcher.read_value_as_string(); // skip HELLO response map
+    watcher.send(&[b"PWATCH", b"k"]);
+    watcher.wait_ready();
+
+    // Write all keys from a second connection.
+    let port = srv.resp_port;
+    let keys_clone = keys.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        rx.recv().unwrap();
+        let mut con = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let mut cmd = redis::cmd("MSET");
+        for (i, k) in keys_clone.iter().enumerate() {
+            cmd.arg(k).arg(format!("v{i}"));
+        }
+        let _: () = cmd.query(&mut con).unwrap();
+    });
+    tx.send(()).unwrap();
+
+    // Must receive one set event per shard.
+    let mut received = std::collections::HashSet::new();
+    for _ in 0..N_SHARDS {
+        let push = watcher.next_push();
+        if push.get(1).map(String::as_str) == Some("set") {
+            if let Some(k) = push.get(2) {
+                received.insert(k.clone());
+            }
+        }
+    }
+    for k in &keys {
+        assert!(
+            received.contains(k.as_str()),
+            "PWATCH missing event for {k}"
         );
     }
 }

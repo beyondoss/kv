@@ -15,8 +15,9 @@ use futures_util::stream::SelectAll;
 use monoio::net::TcpStream;
 use monoio_codec::Framed;
 
-use crate::cross_shard::ShardSenders;
+use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
 use crate::dispatch::dispatch;
+use crate::routing::shard_for_key;
 
 pub struct ConnState {
     pub ns: String,
@@ -166,6 +167,27 @@ async fn handle_conn(
     }
 }
 
+async fn watch_subscribe_remote(
+    txs: &[futures_channel::mpsc::Sender<CrossShardRequest>],
+    target: usize,
+    ns: String,
+    filter: OwnedKeyFilter,
+    since: u64,
+) -> Result<(Vec<WatchEvent>, Receiver<WatchEvent>), String> {
+    let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+    let req = CrossShardRequest::WatchSubscribe {
+        ns,
+        filter,
+        since,
+        reply: reply_tx,
+    };
+    txs[target]
+        .clone()
+        .try_send(req)
+        .map_err(|e| e.to_string())?;
+    reply_rx.await.map_err(|e| e.to_string())?
+}
+
 async fn run_key_watch_loop(
     framed: &mut Framed<TcpStream, RespCodec>,
     store: &ShardStore,
@@ -179,10 +201,29 @@ async fn run_key_watch_loop(
     let mut merged: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
 
     for key in &keys {
-        match store
-            .watch_subscribe(&state.ns, KeyFilter::Exact(key), since_rev)
+        let target = shard_for_key(key, state.n_shards);
+        let result = if target == state.shard_idx || state.n_shards <= 1 {
+            store
+                .watch_subscribe(&state.ns, KeyFilter::Exact(key), since_rev)
+                .await
+                .map_err(|e| e.to_string())
+        } else if let Some(txs) = state.cross_shard_txs.as_deref() {
+            watch_subscribe_remote(
+                txs,
+                target,
+                state.ns.clone(),
+                OwnedKeyFilter::Exact(key.clone()),
+                since_rev,
+            )
             .await
-        {
+        } else {
+            store
+                .watch_subscribe(&state.ns, KeyFilter::Exact(key), since_rev)
+                .await
+                .map_err(|e| e.to_string())
+        };
+
+        match result {
             Ok((initial, rx)) => {
                 for event in &initial {
                     if framed.send(event_to_push(event)).await.is_err() {
@@ -192,7 +233,7 @@ async fn run_key_watch_loop(
                 merged.push(rx);
             }
             Err(e) => {
-                let err = beyond_kv_proto::response::error("ERR", &e.to_string());
+                let err = beyond_kv_proto::response::error("ERR", &e);
                 let _ = framed.send(err).await;
                 let _ = <_ as Sink<Value>>::flush(framed).await;
                 return;
@@ -228,41 +269,69 @@ async fn run_prefix_watch_loop(
     use monoio::io::sink::Sink;
 
     let since_rev = since.unwrap_or(0);
+    let mut merged: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
+    let mut had_error = false;
 
-    match store
-        .watch_subscribe(&state.ns, KeyFilter::Prefix(&prefix), since_rev)
-        .await
-    {
-        Ok((initial, rx)) => {
-            for event in &initial {
-                if framed.send(event_to_push(event)).await.is_err() {
+    for shard in 0..state.n_shards {
+        let result = if shard == state.shard_idx || state.n_shards <= 1 {
+            store
+                .watch_subscribe(&state.ns, KeyFilter::Prefix(&prefix), since_rev)
+                .await
+                .map_err(|e| e.to_string())
+        } else if let Some(txs) = state.cross_shard_txs.as_deref() {
+            watch_subscribe_remote(
+                txs,
+                shard,
+                state.ns.clone(),
+                OwnedKeyFilter::Prefix(prefix.clone()),
+                since_rev,
+            )
+            .await
+        } else {
+            break; // single-shard, already handled above
+        };
+
+        match result {
+            Ok((initial, rx)) => {
+                for event in &initial {
+                    if framed.send(event_to_push(event)).await.is_err() {
+                        had_error = true;
+                        break;
+                    }
+                }
+                if had_error {
                     return;
                 }
+                merged.push(rx);
             }
-            if <_ as Sink<Value>>::flush(framed).await.is_err() {
+            Err(e) => {
+                let err = beyond_kv_proto::response::error("ERR", &e);
+                let _ = framed.send(err).await;
+                let _ = <_ as Sink<Value>>::flush(framed).await;
                 return;
             }
-            let ready = Value::Push(vec![
-                Value::BulkString(Bytes::from_static(b"watch")),
-                Value::BulkString(Bytes::from_static(b"ready")),
-            ]);
-            if framed.send(ready).await.is_err() {
-                return;
-            }
-            if <_ as Sink<Value>>::flush(framed).await.is_err() {
-                return;
-            }
-
-            let mut merged: SelectAll<Receiver<WatchEvent>> = SelectAll::new();
-            merged.push(rx);
-            watch_stream_loop(framed, merged).await;
         }
-        Err(e) => {
-            let err = beyond_kv_proto::response::error("ERR", &e.to_string());
-            let _ = framed.send(err).await;
-            let _ = <_ as Sink<Value>>::flush(framed).await;
+
+        if state.n_shards <= 1 {
+            break; // single-shard fast path: only one iteration needed
         }
     }
+
+    if <_ as Sink<Value>>::flush(framed).await.is_err() {
+        return;
+    }
+    let ready = Value::Push(vec![
+        Value::BulkString(Bytes::from_static(b"watch")),
+        Value::BulkString(Bytes::from_static(b"ready")),
+    ]);
+    if framed.send(ready).await.is_err() {
+        return;
+    }
+    if <_ as Sink<Value>>::flush(framed).await.is_err() {
+        return;
+    }
+
+    watch_stream_loop(framed, merged).await;
 }
 
 async fn watch_stream_loop(

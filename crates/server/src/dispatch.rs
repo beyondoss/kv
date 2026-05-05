@@ -15,6 +15,10 @@ use crate::cross_shard::{CrossShardRequest, MGetReply};
 use crate::resp::ConnState;
 use crate::routing::shard_for_key;
 
+/// Byte prefix that distinguishes a multi-shard SCAN continuation cursor from
+/// a plain "0" (start/done) sentinel. Format: `\x02 + [shard: u8] + [per-shard cursor]`.
+const SCAN_CURSOR_PREFIX: u8 = 0x02;
+
 const KEYS_SCAN_LIMIT: usize = 1_000_000;
 
 pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
@@ -250,53 +254,43 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
         }
 
         Command::Keys { pattern } => {
-            const CHUNK: u64 = 512;
-            let mut all_keys: Vec<Value> = Vec::new();
-            let mut cursor = bytes::Bytes::from_static(b"0");
-            loop {
-                match store
-                    .scan(&state.ns, &cursor, pattern.as_deref(), CHUNK)
-                    .await
-                {
-                    Err(e) => return r::error("ERR", &e.to_string()),
-                    Ok(page) => {
-                        let done = page.next_cursor == b"0".as_ref();
-                        all_keys.extend(page.keys.into_iter().map(r::bulk));
-                        if all_keys.len() >= KEYS_SCAN_LIMIT {
-                            return r::error(
-                                "ERR",
-                                "KEYS result too large; use SCAN to paginate large keyspaces",
-                            );
-                        }
-                        cursor = page.next_cursor;
-                        if done {
-                            break;
-                        }
-                        yield_now().await;
+            match dispatch_keys(pattern.map(Bytes::from), store, state).await {
+                Ok(keys) => {
+                    if keys.len() >= KEYS_SCAN_LIMIT {
+                        return r::error(
+                            "ERR",
+                            "KEYS result too large; use SCAN to paginate large keyspaces",
+                        );
                     }
+                    r::array(keys.into_iter().map(r::bulk).collect())
                 }
+                Err(e) => r::error("ERR", &e),
             }
-            r::array(all_keys)
         }
 
         Command::Scan { cursor, args } => {
-            match store
-                .scan(&state.ns, &cursor, args.pattern.as_deref(), args.count)
-                .await
+            match dispatch_scan(
+                cursor,
+                args.pattern.map(Bytes::from),
+                args.count,
+                store,
+                state,
+            )
+            .await
             {
                 Ok(page) => r::scan_reply(page.next_cursor, page.keys),
-                Err(e) => r::error("ERR", &e.to_string()),
+                Err(e) => r::error("ERR", &e),
             }
         }
 
-        Command::DbSize => match store.db_size(&state.ns).await {
+        Command::DbSize => match dispatch_dbsize(store, state).await {
             Ok(n) => r::integer(n as i64),
-            Err(e) => r::error("ERR", &e.to_string()),
+            Err(e) => r::error("ERR", &e),
         },
 
-        Command::FlushDb => match store.flush_db(&state.ns).await {
+        Command::FlushDb => match dispatch_flushdb(store, state).await {
             Ok(()) => r::ok(),
-            Err(e) => r::error("ERR", &e.to_string()),
+            Err(e) => r::error("ERR", &e),
         },
 
         Command::Revision { key } => match store.get(&state.ns, &key).await {
@@ -353,6 +347,179 @@ fn bucket_by_shard(keys: &[Bytes], n_shards: usize) -> Vec<Option<Vec<(usize, By
             .push((i, k.clone()));
     }
     buckets
+}
+
+async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, String> {
+    let txs = match fan_out_txs(state) {
+        None => return store.db_size(&state.ns).await.map_err(|e| e.to_string()),
+        Some(txs) => txs,
+    };
+    let ns = state.ns.clone();
+    let futs: Vec<_> = txs
+        .iter()
+        .map(|tx| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let req = CrossShardRequest::DbSize {
+                ns: ns.clone(),
+                reply: reply_tx,
+            };
+            let _ = tx.clone().try_send(req);
+            reply_rx
+        })
+        .collect();
+    let results = join_all(futs).await;
+    let mut total = 0u64;
+    for r in results {
+        total += r.map_err(|e| e.to_string())?.map_err(|e| e)?;
+    }
+    Ok(total)
+}
+
+async fn dispatch_flushdb(store: &ShardStore, state: &ConnState) -> Result<(), String> {
+    let txs = match fan_out_txs(state) {
+        None => return store.flush_db(&state.ns).await.map_err(|e| e.to_string()),
+        Some(txs) => txs,
+    };
+    let ns = state.ns.clone();
+    let futs: Vec<_> = txs
+        .iter()
+        .map(|tx| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let req = CrossShardRequest::FlushDb {
+                ns: ns.clone(),
+                reply: reply_tx,
+            };
+            let _ = tx.clone().try_send(req);
+            reply_rx
+        })
+        .collect();
+    let results = join_all(futs).await;
+    for r in results {
+        r.map_err(|e| e.to_string())??;
+    }
+    Ok(())
+}
+
+async fn dispatch_keys(
+    pattern: Option<Bytes>,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<Vec<Bytes>, String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            // Single shard: scan locally.
+            let mut all = Vec::new();
+            let mut cursor = Bytes::from_static(b"0");
+            loop {
+                let page = store
+                    .scan(&state.ns, &cursor, pattern.as_deref(), 512)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let done = page.next_cursor == b"0".as_ref();
+                all.extend(page.keys);
+                cursor = page.next_cursor;
+                if done {
+                    break;
+                }
+            }
+            return Ok(all);
+        }
+        Some(txs) => txs,
+    };
+    let ns = state.ns.clone();
+    let futs: Vec<_> = txs
+        .iter()
+        .map(|tx| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let req = CrossShardRequest::AllKeys {
+                ns: ns.clone(),
+                pattern: pattern.clone(),
+                reply: reply_tx,
+            };
+            let _ = tx.clone().try_send(req);
+            reply_rx
+        })
+        .collect();
+    let results = join_all(futs).await;
+    let mut all = Vec::new();
+    for r in results {
+        all.extend(r.map_err(|e| e.to_string())??);
+    }
+    Ok(all)
+}
+
+/// Scan a single page across shards using a cursor that encodes the target shard.
+///
+/// Multi-shard cursor format: `\x02 + [shard: u8] + [per-shard cursor bytes]`.
+/// The plain `b"0"` sentinel means start at shard 0. The plain `b"0"` return also
+/// signals completion. Single-shard deployments use the existing cursor format unchanged.
+async fn dispatch_scan(
+    cursor: Bytes,
+    pattern: Option<Bytes>,
+    count: u64,
+    store: &ShardStore,
+    state: &ConnState,
+) -> Result<beyond_kv_engine::types::ScanPage, String> {
+    let txs = match fan_out_txs(state) {
+        None => {
+            return store
+                .scan(&state.ns, &cursor, pattern.as_deref(), count)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        Some(txs) => txs,
+    };
+
+    // Decode cursor → (target_shard, per_shard_cursor).
+    let (target_shard, per_shard_cursor) = if cursor.first() == Some(&SCAN_CURSOR_PREFIX) {
+        let shard = cursor[1] as usize;
+        let inner = cursor.slice(2..);
+        (shard, inner)
+    } else {
+        // b"0" or any other value: start from shard 0.
+        (0usize, Bytes::from_static(b"0"))
+    };
+
+    // Fetch one page from the target shard.
+    let page = if target_shard == state.shard_idx {
+        store
+            .scan(&state.ns, &per_shard_cursor, pattern.as_deref(), count)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::Scan {
+            ns: state.ns.clone(),
+            cursor: per_shard_cursor,
+            pattern: pattern.clone(),
+            count,
+            reply: reply_tx,
+        };
+        let _ = txs[target_shard].clone().try_send(req);
+        reply_rx.await.map_err(|e| e.to_string())??
+    };
+
+    // Build the outgoing cursor.
+    let next = if page.next_cursor == b"0".as_ref() {
+        // This shard is exhausted — advance to next shard.
+        let next_shard = target_shard + 1;
+        if next_shard >= state.n_shards {
+            Bytes::from_static(b"0") // all shards done
+        } else {
+            let mut c = vec![SCAN_CURSOR_PREFIX, next_shard as u8];
+            c.extend_from_slice(b"0");
+            Bytes::from(c)
+        }
+    } else {
+        let mut c = vec![SCAN_CURSOR_PREFIX, target_shard as u8];
+        c.extend_from_slice(&page.next_cursor);
+        Bytes::from(c)
+    };
+
+    Ok(beyond_kv_engine::types::ScanPage {
+        next_cursor: next,
+        keys: page.keys,
+    })
 }
 
 async fn dispatch_mget(

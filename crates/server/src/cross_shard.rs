@@ -13,7 +13,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use beyond_kv_engine::store::ShardStore;
-use beyond_kv_engine::types::Entry;
+use beyond_kv_engine::types::{Entry, ScanPage};
+use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use bytes::Bytes;
 use futures_channel::mpsc::{self, Receiver, Sender};
 use futures_channel::oneshot;
@@ -29,6 +30,21 @@ pub type ShardSenders = Arc<[Sender<CrossShardRequest>]>;
 
 /// MGET sub-result: each entry pairs its original index with the looked-up value.
 pub type MGetReply = Result<Vec<(usize, Option<Entry>)>, String>;
+
+/// Owned version of `KeyFilter<'_>` that can be sent across thread boundaries.
+pub enum OwnedKeyFilter {
+    Exact(Bytes),
+    Prefix(Bytes),
+}
+
+impl OwnedKeyFilter {
+    pub fn as_filter(&self) -> KeyFilter<'_> {
+        match self {
+            Self::Exact(k) => KeyFilter::Exact(k),
+            Self::Prefix(p) => KeyFilter::Prefix(p),
+        }
+    }
+}
 
 pub enum CrossShardRequest {
     MGet {
@@ -50,6 +66,36 @@ pub enum CrossShardRequest {
         ns: String,
         keys: Vec<Bytes>,
         reply: oneshot::Sender<Result<u64, String>>,
+    },
+    DbSize {
+        ns: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    FlushDb {
+        ns: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Scan a single page on this shard. Used by the cross-shard SCAN fan-out.
+    Scan {
+        ns: String,
+        cursor: Bytes,
+        pattern: Option<Bytes>,
+        count: u64,
+        reply: oneshot::Sender<Result<ScanPage, String>>,
+    },
+    /// Return all matching keys from this shard. Used by cross-shard KEYS fan-out.
+    AllKeys {
+        ns: String,
+        pattern: Option<Bytes>,
+        reply: oneshot::Sender<Result<Vec<Bytes>, String>>,
+    },
+    /// Register a watch subscription on this shard and return the initial state
+    /// plus a live event channel. Used for cross-shard WATCH/PWATCH fan-out.
+    WatchSubscribe {
+        ns: String,
+        filter: OwnedKeyFilter,
+        since: u64,
+        reply: oneshot::Sender<Result<(Vec<WatchEvent>, Receiver<WatchEvent>), String>>,
     },
 }
 
@@ -110,6 +156,57 @@ async fn handle(store: Rc<ShardStore>, req: CrossShardRequest) {
         CrossShardRequest::Exists { ns, keys, reply } => {
             let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
             let res = store.exists(&ns, &refs).await.map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::DbSize { ns, reply } => {
+            let res = store.db_size(&ns).await.map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::FlushDb { ns, reply } => {
+            let res = store.flush_db(&ns).await.map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::Scan {
+            ns,
+            cursor,
+            pattern,
+            count,
+            reply,
+        } => {
+            let res = store
+                .scan(&ns, &cursor, pattern.as_deref(), count)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::AllKeys { ns, pattern, reply } => {
+            let mut all: Vec<Bytes> = Vec::new();
+            let mut cursor = Bytes::from_static(b"0");
+            let res = loop {
+                match store.scan(&ns, &cursor, pattern.as_deref(), 512).await {
+                    Err(e) => break Err(e.to_string()),
+                    Ok(page) => {
+                        let done = page.next_cursor == b"0".as_ref();
+                        all.extend(page.keys);
+                        cursor = page.next_cursor;
+                        if done {
+                            break Ok(all);
+                        }
+                    }
+                }
+            };
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::WatchSubscribe {
+            ns,
+            filter,
+            since,
+            reply,
+        } => {
+            let res = store
+                .watch_subscribe(&ns, filter.as_filter(), since)
+                .await
+                .map_err(|e| e.to_string());
             let _ = reply.send(res);
         }
     }

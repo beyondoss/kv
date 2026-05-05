@@ -98,12 +98,14 @@ EXPIRE and PERSIST do not rewrite the value. They append a tiny `TTL_UPDATE` rec
 
 ### SCAN Pagination
 
+Single-shard deployments use a simple per-shard cursor:
+
 ```
 SCAN 0 MATCH user:* COUNT 100
   │
   ▼
 ShardStore::scan(cursor="0", pattern, count=100)
-  ├─ "0" → RocksDB iterator from column family start
+  ├─ "0" → iterator from beginning of keyspace
   ├─ iterate: skip expired, glob-match against pattern
   ├─ collect up to count matching keys
   └─ hit count? → next_cursor = b"\x01" + last_key
@@ -115,6 +117,17 @@ ShardStore::scan(cursor="0", pattern, count=100)
   ▼
 SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
 ```
+
+Multi-shard deployments use a compound cursor that encodes the target shard index alongside the per-shard cursor:
+
+```
+b"0"                       → start of iteration (shard 0, inner cursor "0")
+b"\x02" + [shard: u8] + [per-shard cursor bytes]  → continuation
+```
+
+SCAN iterates shards sequentially: when a shard's inner cursor returns `"0"` (exhausted), the next call begins at shard+1 with inner cursor `"0"`. When all shards are exhausted the outer cursor returns `"0"`. Single-shard deployments never produce the `\x02` prefix — the cursor format is unchanged for existing single-shard deployments.
+
+`KEYS` and `DBSIZE` fan out to all shards in parallel via `CrossShardRequest::AllKeys` / `CrossShardRequest::DbSize` and merge the results. `FLUSHDB` fans out via `CrossShardRequest::FlushDb` and awaits all shards before returning.
 
 ## Concepts & Terminology
 
@@ -128,7 +141,8 @@ SCAN <next_cursor> MATCH user:* COUNT 100   ← client loops until cursor == "0"
 | Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                 | Not deleted until reclaim runs again                                                              |
 | Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                            | Not a tombstone or deletion marker                                                                |
 | Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                   | Not a literal zero integer                                                                        |
-| `\x01`-prefixed cursor | Continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                       | Not a user-visible value; internal to scan                                                        |
+| `\x01`-prefixed cursor | Single-shard continuation cursor: `b"\x01"` + last_key from the previous page                                                                                          | Not a user-visible value; internal to scan                                                        |
+| `\x02`-prefixed cursor | Multi-shard continuation cursor: `b"\x02"` + `[shard_idx: u8]` + per-shard inner cursor; only emitted when `n_shards > 1`                                              | Never produced by single-shard deployments; not a user-visible value                              |
 
 ## Core Mechanism
 
@@ -268,6 +282,8 @@ After each successful `set`, `mset`, or `del`, the store calls `WatchRegistry::n
 
 `UNWATCH` breaks the loop. `WATCH` takes over the connection for its lifetime; normal commands cannot be issued while watching.
 
+**Multi-shard fan-out** — `WATCH key1 key2 ...` routes each key to its owning shard via `CrossShardRequest::WatchSubscribe`. `PWATCH prefix` subscribes on every shard (a prefix may match keys on any shard). All per-shard `Receiver<WatchEvent>` streams are merged into a single `SelectAll` and demultiplexed onto the connection. A single-shard deployment (`n_shards == 1`) uses the local path directly without any cross-shard I/O.
+
 **HTTP/SSE transport** — `GET /namespaces/{ns}/watch/{key}` (exact) or `GET /namespaces/{ns}/watch?prefix=...` streams `text/event-stream`. The raw TCP stream is split before any codec is created (`stream.into_split()`), keeping the write half for direct SSE writes. A 25-second heartbeat comment (`: heartbeat`) prevents proxy timeouts. Reconnect with `?since=<revision>` for catch-up replay. SSE event JSON:
 
 ```json
@@ -276,7 +292,9 @@ After each successful `set`, `mset`, or `del`, the store calls `WatchRegistry::n
 {"type":"ready"}
 ```
 
-**TypeScript SDK** — `kv.watch(key, opts?)` returns an `AsyncGenerator<KvWatchEvent>`. On reconnect the SDK automatically passes `?since=lastRevision` so no mutations are silently lost. The RESP backend throws `KvError("not_supported", 501)`; use the HTTP client for watch.
+HTTP prefix watch applies the same cross-shard fan-out as RESP3 PWATCH: it subscribes on all shards via `CrossShardRequest::WatchSubscribe` and merges their event streams.
+
+**TypeScript SDK** — `kv.watch(key, opts?)` returns an `AsyncGenerator<KvWatchEvent>`. On reconnect the SDK automatically passes `?since=lastRevision` so no mutations are silently lost. Both the HTTP and RESP3 backends support watch; the TypeScript SDK uses raw TCP with RESP3 push frames for the RESP backend.
 
 **HTTP route table additions:**
 
