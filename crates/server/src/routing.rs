@@ -148,7 +148,7 @@ pub fn peek_http_key(stream: &TcpStream) -> Option<Vec<u8>> {
     let mut parts = line.splitn(3, |&b| b == b' ');
     let _method = parts.next()?;
     let path = parts.next()?;
-    let needle = b"/values/";
+    let needle = b"/v1/kv/";
     let pos = path.windows(needle.len()).position(|w| w == needle)?;
     let after = &path[pos + needle.len()..];
     // Stop at query string or end of request line; slashes are part of the key.
@@ -159,8 +159,16 @@ pub fn peek_http_key(stream: &TcpStream) -> Option<Vec<u8>> {
     if key_end == 0 {
         return None;
     }
+    let key_slice = &after[..key_end];
+    // Strip /incr suffix so increment endpoint routes by the same key as GET/PUT.
+    let key_bytes = key_slice
+        .strip_suffix(b"/incr" as &[u8])
+        .unwrap_or(key_slice);
+    if key_bytes.is_empty() {
+        return None;
+    }
     // Percent-decode so the routing key matches the stored key.
-    Some(percent_decode_routing(&after[..key_end]))
+    Some(percent_decode_routing(key_bytes))
 }
 
 #[cfg(test)]
@@ -202,7 +210,7 @@ mod tests {
 
     #[test]
     fn peek_http_key_extracts_values_segment() {
-        let s = pair_with_payload(b"GET /namespaces/default/values/mykey HTTP/1.1\r\n\r\n");
+        let s = pair_with_payload(b"GET /v1/kv/mykey HTTP/1.1\r\n\r\n");
         assert_eq!(peek_http_key(&s), Some(b"mykey".to_vec()));
     }
 
@@ -210,6 +218,18 @@ mod tests {
     fn peek_http_key_returns_none_for_non_values_path() {
         let s = pair_with_payload(b"GET /healthz HTTP/1.1\r\n\r\n");
         assert_eq!(peek_http_key(&s), None);
+    }
+
+    #[test]
+    fn peek_http_key_returns_none_for_list_endpoint() {
+        let s = pair_with_payload(b"GET /v1/kv?ns=0 HTTP/1.1\r\n\r\n");
+        assert_eq!(peek_http_key(&s), None);
+    }
+
+    #[test]
+    fn peek_http_key_extracts_key_for_incr_endpoint() {
+        let s = pair_with_payload(b"GET /v1/kv/mykey/incr HTTP/1.1\r\n\r\n");
+        assert_eq!(peek_http_key(&s), Some(b"mykey".to_vec()));
     }
 
     #[test]

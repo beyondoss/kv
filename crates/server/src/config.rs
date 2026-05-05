@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
-
-#[derive(Parser, Debug, Clone)]
-#[command(name = "beyond-kv", about = "Beyond KV server")]
+#[derive(clap::Args, Debug, Clone)]
 pub struct Config {
     #[arg(long, env = "KV_DATA_DIR", default_value = "/var/lib/beyond/kv")]
     pub data_dir: PathBuf,
@@ -45,10 +42,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn parse() -> Self {
-        <Self as Parser>::parse()
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.memory_bytes == 0 {
             anyhow::bail!("KV_MEMORY_BYTES must be > 0");
@@ -71,8 +64,15 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        config: Config,
+    }
+
     fn parse(args: &[&str]) -> Result<Config, clap::Error> {
-        Config::try_parse_from(["beyond-kv"].iter().chain(args).copied())
+        TestCli::try_parse_from(std::iter::once("beyond-kv").chain(args.iter().copied()))
+            .map(|t| t.config)
     }
 
     #[test]

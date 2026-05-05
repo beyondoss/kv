@@ -195,7 +195,7 @@ impl ShardedServer {
 
     fn http_put(&self, key: &str, value: &[u8]) -> u16 {
         let url = format!(
-            "http://127.0.0.1:{}/namespaces/default/values/{}",
+            "http://127.0.0.1:{}/v1/kv/{}?ns=0",
             self.http_port,
             urlencoding::encode(key)
         );
@@ -211,7 +211,7 @@ impl ShardedServer {
 
     fn http_get(&self, key: &str) -> Option<Vec<u8>> {
         let url = format!(
-            "http://127.0.0.1:{}/namespaces/default/values/{}",
+            "http://127.0.0.1:{}/v1/kv/{}?ns=0",
             self.http_port,
             urlencoding::encode(key)
         );
@@ -229,7 +229,7 @@ impl ShardedServer {
 
     fn http_delete(&self, key: &str) -> u16 {
         let url = format!(
-            "http://127.0.0.1:{}/namespaces/default/values/{}",
+            "http://127.0.0.1:{}/v1/kv/{}?ns=0",
             self.http_port,
             urlencoding::encode(key)
         );
@@ -251,7 +251,7 @@ impl ShardedServer {
         let mut cursor: Option<String> = None;
         loop {
             let mut url = format!(
-                "http://127.0.0.1:{}/namespaces/default/keys?limit={limit}",
+                "http://127.0.0.1:{}/v1/kv?ns=0&limit={limit}",
                 self.http_port
             );
             if let Some(ref c) = cursor {
@@ -276,7 +276,7 @@ impl ShardedServer {
     /// Subscribe to SSE prefix watch; returns a channel that delivers raw JSON event objects.
     fn http_watch_prefix_sse(&self, prefix: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
         let url = format!(
-            "http://127.0.0.1:{}/namespaces/default/watch?prefix={}",
+            "http://127.0.0.1:{}/v1/watch?ns=0&prefix={}",
             self.http_port,
             urlencoding::encode(prefix)
         );

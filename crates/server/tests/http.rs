@@ -697,20 +697,47 @@ fn watch_prefix_receives_matching_events_only() {
 #[test]
 fn put_keepttl_preserves_existing_ttl() {
     let srv = TestServer::start();
-    srv.put_opts(0, "keepttl-k", b"v1", PutOptions { ttl_header: Some(60), ..Default::default() });
+    srv.put_opts(
+        0,
+        "keepttl-k",
+        b"v1",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
     let ttl_before = srv.get("keepttl-k").ttl.expect("x-kv-ttl missing before");
-    srv.put_opts(0, "keepttl-k", b"v2", PutOptions { keep_ttl: true, ..Default::default() });
+    srv.put_opts(
+        0,
+        "keepttl-k",
+        b"v2",
+        PutOptions {
+            keep_ttl: true,
+            ..Default::default()
+        },
+    );
     let res = srv.get("keepttl-k");
     assert_eq!(res.body, b"v2");
     let ttl_after = res.ttl.expect("x-kv-ttl must be preserved");
-    assert!(ttl_after > 0 && ttl_after <= ttl_before, "TTL should be preserved");
+    assert!(
+        ttl_after > 0 && ttl_after <= ttl_before,
+        "TTL should be preserved"
+    );
 }
 
 #[test]
 fn put_keepttl_on_key_without_ttl_stays_persistent() {
     let srv = TestServer::start();
     srv.put("no-ttl-k", b"v1");
-    srv.put_opts(0, "no-ttl-k", b"v2", PutOptions { keep_ttl: true, ..Default::default() });
+    srv.put_opts(
+        0,
+        "no-ttl-k",
+        b"v2",
+        PutOptions {
+            keep_ttl: true,
+            ..Default::default()
+        },
+    );
     let res = srv.get("no-ttl-k");
     assert_eq!(res.body, b"v2");
     assert!(res.ttl.is_none(), "key should remain persistent");
@@ -735,7 +762,15 @@ fn put_keepttl_with_ttl_option_returns_400() {
 fn put_return_old_on_existing_key_returns_old_value() {
     let srv = TestServer::start();
     srv.put("swap-k", b"old");
-    let res = srv.put_opts(0, "swap-k", b"new", PutOptions { return_old: true, ..Default::default() });
+    let res = srv.put_opts(
+        0,
+        "swap-k",
+        b"new",
+        PutOptions {
+            return_old: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(res.status, 200);
     assert_eq!(res.body, b"old");
     assert_eq!(srv.get("swap-k").body, b"new");
@@ -744,7 +779,15 @@ fn put_return_old_on_existing_key_returns_old_value() {
 #[test]
 fn put_return_old_on_missing_key_returns_204() {
     let srv = TestServer::start();
-    let res = srv.put_opts(0, "swap-new", b"v", PutOptions { return_old: true, ..Default::default() });
+    let res = srv.put_opts(
+        0,
+        "swap-new",
+        b"v",
+        PutOptions {
+            return_old: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(res.status, 204, "no old value → 204");
     assert_eq!(srv.get("swap-new").body, b"v");
 }

@@ -1,5 +1,5 @@
+import createFetchClient, { type Client } from "openapi-fetch";
 import { createHttpKvClient } from "./http.js";
-import { createRespKvClient } from "./resp.js";
 import type {
   KvBatchOp,
   KvBatchResults,
@@ -11,7 +11,12 @@ import type {
   KvSetOptions,
   KvWatchEvent,
   KvWatchOptions,
-} from "./types.js";
+} from "./kv-types.js";
+import { createRespKvClient } from "./resp.js";
+import type { components, paths } from "./types.js";
+
+export type { components, paths };
+export type { operations } from "./types.js";
 
 export interface KvCommandEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
@@ -88,7 +93,10 @@ interface KvBaseClientOptions {
 
 /** Options for the HTTP backend (`http://` or `https://` URLs). */
 export interface KvHttpClientOptions extends KvBaseClientOptions {
-  /** Namespace name. Default: `"default"`. */
+  /**
+   * Namespace name, e.g. `"default"`, `"db1"` … `"db15"`. Default: `"default"`.
+   * Maps to the `?ns=` wire param — `"default"` → 0, `"db1"` → 1, etc.
+   */
   namespace?: string;
   /**
    * Custom `fetch` implementation for connection pooling or test mocking.
@@ -111,6 +119,24 @@ export interface KvRespClientOptions extends KvBaseClientOptions {
 
 /** Union of HTTP and RESP options. Backend is selected from the URL scheme. */
 export type KvClientOptions = KvHttpClientOptions | KvRespClientOptions;
+
+/** Options for {@link createClient}. */
+export interface KvRawClientOptions {
+  /** Base URL of the KV HTTP server, e.g. `http://kv:4869`. Trailing slash is stripped. */
+  baseUrl: string;
+}
+
+/**
+ * Creates a fully-typed raw HTTP client for the beyond/kv REST API.
+ *
+ * Built on `openapi-fetch` — every path, method, query parameter, and response
+ * type is inferred directly from the generated OpenAPI spec.
+ */
+export function createClient(opts: KvRawClientOptions): Client<paths> {
+  return createFetchClient<paths>({
+    baseUrl: opts.baseUrl.replace(/\/+$/, ""),
+  });
+}
 
 /** Creates a KV client. Backend is selected automatically from the URL scheme. */
 export function createKvClient(opts: KvClientOptions): KvClient {

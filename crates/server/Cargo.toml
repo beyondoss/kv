@@ -28,9 +28,11 @@ monoio.workspace = true
 monoio-codec.workspace = true
 monoio-http.workspace = true
 rustc-hash.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+utoipa.workspace = true
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

@@ -12,22 +12,30 @@ import type {
   KvSetOptions,
   KvWatchEvent,
   KvWatchOptions,
-} from "./types.js";
-import { makeEntry } from "./types.js";
+} from "./kv-types.js";
+import { makeEntry } from "./kv-types.js";
+import type { components } from "./types.js";
+
+function nsToIndex(ns: string): number {
+  if (ns === "default") return 0;
+  const m = /^db(\d+)$/.exec(ns);
+  return m != null ? Math.min(parseInt(m[1]!, 10), 15) : 0;
+}
 
 export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
   const base = opts.url.replace(/\/+$/, "");
-  const ns = opts.namespace ?? "default";
+  const nsIdx = nsToIndex(opts.namespace ?? "default");
   const retries = opts.retries ?? 2;
   const { timeout, onCommand, onResponse, onMetadataParseError } = opts;
   const fetchFn = opts.fetch ?? globalThis.fetch;
 
   function valueUrl(key: string): string {
-    return `${base}/namespaces/${ns}/values/${encodeURIComponent(key)}`;
+    return `${base}/v1/kv/${encodeURIComponent(key)}?ns=${nsIdx}`;
   }
 
   function keysUrl(params?: KvListOptions): string {
-    const url = new URL(`${base}/namespaces/${ns}/keys`);
+    const url = new URL(`${base}/v1/kv`);
+    url.searchParams.set("ns", String(nsIdx));
     if (params?.prefix) url.searchParams.set("prefix", params.prefix);
     if (params?.cursor) url.searchParams.set("cursor", params.cursor);
     if (params?.limit != null) {
@@ -77,7 +85,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     let code = "internal_error";
     let message = res.statusText;
     try {
-      const body = (await res.json()) as { error?: string; message?: string };
+      const body = (await res.json()) as components["schemas"]["ErrorResponse"];
       if (body.error) code = body.error;
       if (body.message) message = body.message;
     } catch { /* ignore */ }
@@ -128,10 +136,11 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       headers["if-match"] = String(setOpts.ifMatch);
     }
 
+    // valueUrl already contains `?ns=N`, so additional flags use `&`.
     const url = setOpts?.ifAbsent
-      ? `${valueUrl(key)}?nx=1`
+      ? `${valueUrl(key)}&nx=1`
       : setOpts?.ifPresent
-      ? `${valueUrl(key)}?xx=1`
+      ? `${valueUrl(key)}&xx=1`
       : valueUrl(key);
 
     const body: BodyInit = typeof value === "string"
@@ -143,12 +152,12 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
   }
 
   async function incr(key: string, delta: number = 1): Promise<number> {
-    const url = delta === 1
-      ? `${valueUrl(key)}/incr`
-      : `${valueUrl(key)}/incr?delta=${delta}`;
+    const url = `${base}/v1/kv/${encodeURIComponent(key)}/incr?ns=${nsIdx}${
+      delta !== 1 ? `&delta=${delta}` : ""
+    }`;
     const res = await request("INCR", 1, url, { method: "POST" });
     if (!res.ok) throw await parseError(res);
-    const body = (await res.json()) as { value: number };
+    const body = (await res.json()) as components["schemas"]["IncrResponse"];
     return body.value;
   }
 
@@ -179,8 +188,8 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     async list(listOpts?: KvListOptions): Promise<KvListResult> {
       const res = await request("SCAN", 1, keysUrl(listOpts), {});
       if (!res.ok) throw await parseError(res);
-      const body = (await res.json()) as { keys: KvListKey[]; cursor?: string };
-      const result: KvListResult = { keys: body.keys };
+      const body = (await res.json()) as components["schemas"]["ListResponse"];
+      const result: KvListResult = { keys: body.keys as KvListKey[] };
       if (body.cursor) result.nextCursor = body.cursor;
       return result;
     },
@@ -220,14 +229,14 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       key: string,
       watchOpts?: KvWatchOptions,
     ): AsyncGenerator<KvWatchEvent> {
-      return watchSse(base, ns, key, watchOpts, fetchFn);
+      return watchSse(base, nsIdx, key, watchOpts, fetchFn);
     },
   };
 }
 
 async function* watchSse(
   base: string,
-  ns: string,
+  nsIdx: number,
   key: string,
   opts: KvWatchOptions | undefined,
   fetchFn: typeof globalThis.fetch,
@@ -240,9 +249,10 @@ async function* watchSse(
 
     const url = new URL(
       opts?.prefix
-        ? `${base}/namespaces/${ns}/watch`
-        : `${base}/namespaces/${ns}/watch/${encodeURIComponent(key)}`,
+        ? `${base}/v1/watch`
+        : `${base}/v1/watch/${encodeURIComponent(key)}`,
     );
+    url.searchParams.set("ns", String(nsIdx));
     if (opts?.prefix) url.searchParams.set("prefix", key);
     if (lastRevision > 0) url.searchParams.set("since", String(lastRevision));
 

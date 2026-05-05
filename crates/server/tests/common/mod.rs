@@ -169,11 +169,7 @@ impl TestServer {
     }
 
     pub fn value_url(&self, ns: u8, key: &str) -> String {
-        format!(
-            "{}/v1/kv/{}?ns={ns}",
-            self.base(),
-            urlencoding::encode(key)
-        )
+        format!("{}/v1/kv/{}?ns={ns}", self.base(), urlencoding::encode(key))
     }
 
     pub fn keys_url(&self, ns: u8) -> String {

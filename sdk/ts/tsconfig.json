@@ -3,7 +3,7 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "Bundler",
-    "lib": ["ESNext", "DOM"],
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -17,8 +17,7 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "skipLibCheck": true,
-    "types": ["node"]
+    "skipLibCheck": true
   },
   "include": ["src"],
   "exclude": ["dist", "node_modules"]

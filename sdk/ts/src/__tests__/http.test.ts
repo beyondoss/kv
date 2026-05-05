@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { KvClient } from "../client.js";
 import { KvError, KvNotFoundError } from "../errors.js";
-import type { KvWatchEvent } from "../types.js";
-import type { KvWatchOptions } from "../types.js";
+import type { KvWatchEvent } from "../kv-types.js";
+import type { KvWatchOptions } from "../kv-types.js";
 import {
   dec,
   enc,

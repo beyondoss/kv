@@ -21,15 +21,34 @@ run = "cargo test --test cross_shard --test http --test resp"
 [tasks."test:unit"]
 run = "cargo test --lib"
 
-[tasks."test:sdk:ts"]
-description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
-depends = ["build"]
+[tasks."sdk:ts:install"]
+run = "npm ci"
 dir = "sdk/ts"
+
+[tasks."sdk:ts:typecheck"]
+run = "npm run typecheck"
+dir = "sdk/ts"
+depends = ["sdk:ts:install"]
+
+[tasks."sdk:ts:test"]
+description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
 run = "npm test"
+dir = "sdk/ts"
+depends = ["sdk:ts:install", "build"]
 
 [tasks."test:all"]
 description = "Run unit, integration (Rust), and TypeScript SDK e2e tests"
-depends = ["test:unit", "test", "test:sdk:ts"]
+depends = ["test:unit", "test", "sdk:ts:test"]
+
+[tasks."openapi:generate"]
+description = "Generate openapi/v1.json from annotated routes"
+run = "cargo run -p beyond-kv -- generate-openapi"
+
+[tasks."sdk:generate-types"]
+description = "Generate TypeScript types from the OpenAPI spec"
+depends = ["openapi:generate"]
+dir = "sdk"
+run = "cd ts && node scripts/generate-types.mjs"
 
 [tasks."bench"]
 run = "cargo bench -p beyond-kv-engine --bench engine"

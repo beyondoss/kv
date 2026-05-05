@@ -14,8 +14,8 @@ import type {
   KvSetOptions,
   KvWatchEvent,
   KvWatchOptions,
-} from "./types.js";
-import { makeEntry } from "./types.js";
+} from "./kv-types.js";
+import { makeEntry } from "./kv-types.js";
 
 export function createRespKvClient(opts: KvRespClientOptions): KvClient {
   const redis = new Redis(opts.url, {
@@ -26,8 +26,8 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     lazyConnect: false,
   });
 
-  redis.defineCommand("revision", { numberOfKeys: 1 });
-  redis.defineCommand("setrev", { numberOfKeys: 1 });
+  redis.defineCommand("revision", { lua: "", numberOfKeys: 1 });
+  redis.defineCommand("setrev", { lua: "", numberOfKeys: 1 });
 
   const { onCommand, onResponse } = opts;
 

@@ -1,15 +1,19 @@
 export {
+  type components,
+  createClient,
   createKvClient,
   type KvClient,
   type KvClientOptions,
   type KvCommandEvent,
   type KvHttpClientOptions,
+  type KvRawClientOptions,
   type KvRespClientOptions,
   type KvResponseEvent,
+  type operations,
+  type paths,
 } from "./client.js";
 export { KvError, KvNotFoundError } from "./errors.js";
 export { createHttpKvClient } from "./http.js";
-export { createRespKvClient } from "./resp.js";
 export type {
   KvBatchOp,
   KvBatchResults,
@@ -22,4 +26,5 @@ export type {
   KvSetOptions,
   KvWatchEvent,
   KvWatchOptions,
-} from "./types.js";
+} from "./kv-types.js";
+export { createRespKvClient } from "./resp.js";

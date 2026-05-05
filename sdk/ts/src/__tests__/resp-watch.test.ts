@@ -10,7 +10,7 @@
 import * as net from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createKvClient, type KvClient } from "../client.js";
-import type { KvWatchEvent } from "../types.js";
+import type { KvWatchEvent } from "../kv-types.js";
 
 type SetEvent = Extract<KvWatchEvent, { type: "set" }>;
 type DelEvent = Extract<KvWatchEvent, { type: "del" }>;

@@ -1,6 +1,8 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use clap::Parser as _;
+
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -111,8 +113,37 @@ fn accept_loop(
     }
 }
 
+#[derive(clap::Parser)]
+#[command(name = "beyond-kv", about = "Beyond KV server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run the KV server.
+    Serve(Box<beyond_kv::config::Config>),
+    /// Write openapi/v1.json from the annotated routes and exit.
+    GenerateOpenapi,
+}
+
+fn generate_openapi() -> anyhow::Result<()> {
+    use utoipa::OpenApi as _;
+    let doc = beyond_kv::http::ApiDoc::openapi();
+    let json = serde_json::to_string_pretty(&doc)?;
+    std::fs::create_dir_all("openapi")?;
+    std::fs::write("openapi/v1.json", json)?;
+    println!("wrote openapi/v1.json");
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    let cfg = beyond_kv::config::Config::parse();
+    let cli = Cli::parse();
+    let cfg = match cli.command {
+        Command::GenerateOpenapi => return generate_openapi(),
+        Command::Serve(cfg) => *cfg,
+    };
     cfg.validate()?;
 
     tracing_subscriber::fmt()
