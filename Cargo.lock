@@ -185,6 +185,7 @@ dependencies = [
  "divan",
  "futures-channel",
  "futures-util",
+ "memchr",
  "monoio",
  "rustc-hash",
  "serde",

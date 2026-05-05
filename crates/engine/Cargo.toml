@@ -10,6 +10,7 @@ bytes.workspace = true
 crc-fast.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
+memchr.workspace = true
 monoio.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true

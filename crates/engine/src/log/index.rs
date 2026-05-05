@@ -161,8 +161,9 @@ impl NsIndex {
             Some(key) => Bound::Excluded(key),
         };
 
+        let has_ttl = !self.ttl.is_empty();
         for (k, _v) in self.map.range::<[u8], _>((start, Bound::Unbounded)) {
-            if self.ttl.get(k).copied().map_or(false, |ms| ms <= now_ms) {
+            if has_ttl && self.ttl.get(k).copied().map_or(false, |ms| ms <= now_ms) {
                 continue;
             }
             if !filter(k) {

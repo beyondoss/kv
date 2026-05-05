@@ -176,20 +176,62 @@ fn bulk(v: &beyond_resp::Value) -> Result<Bytes, ProtoError> {
     }
 }
 
+/// Parse ASCII decimal bytes to u64, no UTF-8 round-trip.
+#[inline]
+fn atoi_u64(b: &[u8]) -> Option<u64> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &byte in b {
+        let d = byte.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(d as u64)?;
+    }
+    Some(n)
+}
+
+/// Parse ASCII decimal bytes (with optional leading sign) to i64.
+#[inline]
+fn atoi_i64(b: &[u8]) -> Option<i64> {
+    let (neg, digits) = match b.first()? {
+        b'-' => (true, &b[1..]),
+        b'+' => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    // Parse as u64 first so the sign branch stays out of the hot loop.
+    let mut n: u64 = 0;
+    for &byte in digits {
+        let d = byte.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(d as u64)?;
+    }
+    if neg {
+        // i64::MIN magnitude is i64::MAX + 1; allow that without overflow.
+        if n > i64::MAX as u64 + 1 {
+            return None;
+        }
+        Some(n.wrapping_neg() as i64)
+    } else {
+        i64::try_from(n).ok()
+    }
+}
+
 fn parse_u64(v: &beyond_resp::Value) -> Result<u64, ProtoError> {
     let b = bulk(v)?;
-    std::str::from_utf8(&b)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ProtoError::InvalidInteger { raw: b })
+    atoi_u64(&b).ok_or_else(|| ProtoError::InvalidInteger { raw: b })
 }
 
 fn parse_i64(v: &beyond_resp::Value) -> Result<i64, ProtoError> {
     let b = bulk(v)?;
-    std::str::from_utf8(&b)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ProtoError::InvalidInteger { raw: b })
+    atoi_i64(&b).ok_or_else(|| ProtoError::InvalidInteger { raw: b })
 }
 
 impl Command {
@@ -208,9 +250,8 @@ impl Command {
         let mut buf = [0u8; 16];
         let name: &[u8] = if name_bytes.len() <= 16 {
             let n = name_bytes.len();
-            for (i, b) in name_bytes.iter().enumerate() {
-                buf[i] = b.to_ascii_uppercase();
-            }
+            buf[..n].copy_from_slice(&name_bytes);
+            buf[..n].make_ascii_uppercase();
             &buf[..n]
         } else {
             return Err(ProtoError::UnknownCommand { cmd: name_bytes });
@@ -320,10 +361,10 @@ impl Command {
                     let opt = bulk(&args[i])?;
                     let mut opt_upper = [0u8; 5];
                     let opt_up: &[u8] = if opt.len() <= 5 {
-                        for (j, b) in opt.iter().enumerate() {
-                            opt_upper[j] = b.to_ascii_uppercase();
-                        }
-                        &opt_upper[..opt.len()]
+                        let n = opt.len();
+                        opt_upper[..n].copy_from_slice(&opt);
+                        opt_upper[..n].make_ascii_uppercase();
+                        &opt_upper[..n]
                     } else {
                         return Err(ProtoError::Syntax { token: opt });
                     };
@@ -432,9 +473,7 @@ impl Command {
             b"HELLO" => {
                 let version = if args.len() >= 2 {
                     let raw = bulk(&args[1])?;
-                    let v: u64 = std::str::from_utf8(&raw)
-                        .ok()
-                        .and_then(|s| s.parse().ok())
+                    let v = atoi_u64(&raw)
                         .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                     let ver = u8::try_from(v).map_err(|_| ProtoError::InvalidInteger { raw })?;
                     Some(ver)
@@ -480,10 +519,10 @@ impl Command {
                     let maybe_since = bulk(&args[args.len() - 2])?;
                     let mut buf = [0u8; 5];
                     if maybe_since.len() <= 5 {
-                        for (i, b) in maybe_since.iter().enumerate() {
-                            buf[i] = b.to_ascii_uppercase();
-                        }
-                        if &buf[..maybe_since.len()] == b"SINCE" {
+                        let n = maybe_since.len();
+                        buf[..n].copy_from_slice(&maybe_since);
+                        buf[..n].make_ascii_uppercase();
+                        if &buf[..n] == b"SINCE" {
                             since = Some(parse_u64(&args[args.len() - 1])?);
                             key_end = args.len() - 2;
                         }
@@ -505,10 +544,10 @@ impl Command {
                     let maybe_since = bulk(&args[2])?;
                     let mut buf = [0u8; 5];
                     if maybe_since.len() <= 5 {
-                        for (i, b) in maybe_since.iter().enumerate() {
-                            buf[i] = b.to_ascii_uppercase();
-                        }
-                        if &buf[..maybe_since.len()] == b"SINCE" {
+                        let n = maybe_since.len();
+                        buf[..n].copy_from_slice(&maybe_since);
+                        buf[..n].make_ascii_uppercase();
+                        if &buf[..n] == b"SINCE" {
                             since = Some(parse_u64(&args[3])?);
                         }
                     }
@@ -548,10 +587,10 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         // Buffer sized for the longest option: KEEPTTL (7 bytes)
         let mut buf = [0u8; 7];
         let opt_up: &[u8] = if opt.len() <= 7 {
-            for (j, b) in opt.iter().enumerate() {
-                buf[j] = b.to_ascii_uppercase();
-            }
-            &buf[..opt.len()]
+            let n = opt.len();
+            buf[..n].copy_from_slice(&opt);
+            buf[..n].make_ascii_uppercase();
+            &buf[..n]
         } else {
             return Err(ProtoError::Syntax { token: opt });
         };
@@ -562,9 +601,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "SET" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });
@@ -577,9 +614,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "SET" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });
@@ -641,10 +676,10 @@ fn parse_setrev(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         // Buffer sized for the longest option: EXAT/PXAT (4 bytes)
         let mut buf = [0u8; 4];
         let opt_up: &[u8] = if opt.len() <= 4 {
-            for (j, b) in opt.iter().enumerate() {
-                buf[j] = b.to_ascii_uppercase();
-            }
-            &buf[..opt.len()]
+            let n = opt.len();
+            buf[..n].copy_from_slice(&opt);
+            buf[..n].make_ascii_uppercase();
+            &buf[..n]
         } else {
             return Err(ProtoError::Syntax { token: opt });
         };
@@ -655,9 +690,7 @@ fn parse_setrev(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "SETREV" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });
@@ -670,9 +703,7 @@ fn parse_setrev(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "SETREV" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });
@@ -717,10 +748,10 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
         // Buffer sized for the longest option: PERSIST (7 bytes)
         let mut buf = [0u8; 7];
         let opt_up: &[u8] = if opt.len() <= 7 {
-            for (j, b) in opt.iter().enumerate() {
-                buf[j] = b.to_ascii_uppercase();
-            }
-            &buf[..opt.len()]
+            let n = opt.len();
+            buf[..n].copy_from_slice(&opt);
+            buf[..n].make_ascii_uppercase();
+            &buf[..n]
         } else {
             return Err(ProtoError::Syntax { token: opt });
         };
@@ -731,9 +762,7 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "GETEX" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });
@@ -746,9 +775,7 @@ fn parse_getex(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                     return Err(ProtoError::WrongArity { cmd: "GETEX" });
                 }
                 let raw = bulk(&args[i])?;
-                let v: u64 = std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                let v: u64 = atoi_u64(&raw)
                     .ok_or_else(|| ProtoError::InvalidInteger { raw: raw.clone() })?;
                 if v == 0 {
                     return Err(ProtoError::InvalidExpiry { raw });

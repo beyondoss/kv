@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_channel::mpsc::Receiver;
 use futures_util::future::join_all;
+use memchr::memchr3;
 use rustc_hash::FxHashMap;
 use tracing::{info, warn};
 
@@ -1190,10 +1191,31 @@ impl ShardStore {
 /// `[abc]` (character class), `[^abc]`/`[!abc]` (negated class), `[a-z]` (range).
 /// A `[` with no closing `]` is treated as a literal byte.
 pub(crate) fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
-    let mut pi = 0usize;
-    let mut si = 0usize;
+    // Fast path: locate the first glob metacharacter with a SIMD byte scan.
+    // Everything before it is a literal prefix that must match s exactly.
+    let first_meta = memchr3(b'*', b'?', b'[', pattern);
+
+    let (mut pi, mut si) = match first_meta {
+        None => {
+            // No metacharacters: plain equality check (memcmp, SIMD on most targets).
+            return pattern == s;
+        }
+        Some(0) => (0, 0),
+        Some(n) => {
+            // Literal prefix of length n — reject quickly on mismatch.
+            if s.len() < n || s[..n] != pattern[..n] {
+                return false;
+            }
+            // Common case: "prefix*" — prefix matched, * accepts any suffix.
+            if n + 1 == pattern.len() && pattern[n] == b'*' {
+                return true;
+            }
+            (n, n)
+        }
+    };
+
     let mut star_pi = usize::MAX;
-    let mut star_si = 0usize;
+    let mut star_si = si;
 
     while si < s.len() {
         if pi < pattern.len() && pattern[pi] == b'[' {
