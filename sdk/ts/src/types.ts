@@ -1,5 +1,11 @@
+const decoder = new TextDecoder();
+
 export interface KvEntry {
   value: Uint8Array;
+  /** Decode the value as a UTF-8 string. */
+  text(): string;
+  /** Parse the value as JSON. */
+  json<T = unknown>(): T;
   /** Remaining TTL in seconds. Absent if the key has no expiry. */
   ttl?: number;
   /**
@@ -14,6 +20,23 @@ export interface KvEntry {
   revision: number;
 }
 
+export function makeEntry(raw: {
+  value: Uint8Array;
+  ttl?: number;
+  metadata?: unknown;
+  revision: number;
+}): KvEntry {
+  return {
+    ...raw,
+    text() {
+      return decoder.decode(this.value);
+    },
+    json<T = unknown>() {
+      return JSON.parse(this.text()) as T;
+    },
+  };
+}
+
 export interface KvSetOptions {
   /** TTL in seconds. */
   ttl?: number;
@@ -23,9 +46,9 @@ export interface KvSetOptions {
    */
   metadata?: unknown;
   /** Set only if the key does not already exist. Throws `KvError` (409) if it does. */
-  nx?: boolean;
+  ifAbsent?: boolean;
   /** Set only if the key already exists. Throws `KvError` (409) if it does not. */
-  xx?: boolean;
+  ifPresent?: boolean;
   /**
    * Compare-and-swap: only set if the current revision matches this value.
    * Throws `KvError` (409) on mismatch.
@@ -44,8 +67,7 @@ export interface KvListOptions {
   prefix?: string;
   /**
    * Opaque pagination cursor from a previous `list()` response. Pass the
-   * value verbatim — do not construct or modify it. `"0"` is the implicit
-   * start cursor.
+   * value verbatim — do not construct or modify it.
    */
   cursor?: string;
   limit?: number;
@@ -55,31 +77,28 @@ export interface KvListResult {
   /** Keys returned for this page. Call `get()` to fetch values. */
   keys: KvListKey[];
   /**
-   * Opaque cursor for the next `list()` call. Absent when `complete` is `true`.
+   * Opaque cursor to pass to the next `list()` call. Absent when the scan
+   * has reached the end of the keyspace.
    */
-  cursor?: string;
-  /** `true` when the scan has reached the end of the keyspace. */
-  complete: boolean;
+  nextCursor?: string;
 }
 
 export interface KvListKey {
   name: string;
 }
 
-export type KvWatchEventType = "set" | "del" | "ready";
-
-export interface KvWatchEvent {
-  type: KvWatchEventType;
-  /** Key that changed. Absent on `"ready"` events. */
-  key?: string;
-  /** New value, base64-decoded. Present on `"set"` events. */
-  value?: Uint8Array;
-  metadata?: unknown;
-  /** Remaining TTL in seconds. Present on `"set"` events when the key has a TTL. */
-  ttl?: number;
-  /** Revision (server timestamp ms) of the write. 0 on `"ready"` events. */
-  revision: number;
-}
+/** A watch event emitted by `KvClient.watch()`. */
+export type KvWatchEvent =
+  | { type: "ready" }
+  | {
+    type: "set";
+    key: string;
+    value: Uint8Array;
+    metadata?: unknown;
+    ttl?: number;
+    revision: number;
+  }
+  | { type: "del"; key: string; revision: number };
 
 export interface KvWatchOptions {
   /** If true, treat `key` as a prefix and watch all matching keys. */

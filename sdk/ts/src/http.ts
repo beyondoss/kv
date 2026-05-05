@@ -1,10 +1,11 @@
-import type { KvClient, KvClientOptions } from "./client.js";
+import type { KvClient, KvHttpClientOptions } from "./client.js";
 import { KvError, KvNotFoundError } from "./errors.js";
 import type {
   KvBatchOp,
   KvBatchResults,
   KvDeleteOptions,
   KvEntry,
+  KvListKey,
   KvListOptions,
   KvListResult,
   KvMSetEntry,
@@ -12,8 +13,9 @@ import type {
   KvWatchEvent,
   KvWatchOptions,
 } from "./types.js";
+import { makeEntry } from "./types.js";
 
-export function createHttpKvClient(opts: KvClientOptions): KvClient {
+export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
   const base = opts.url.replace(/\/+$/, "");
   const ns = opts.namespace ?? "default";
   const retries = opts.retries ?? 2;
@@ -92,19 +94,24 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
     const revHeader = res.headers.get("x-kv-revision");
     const metaHeader = res.headers.get("x-kv-metadata");
 
-    const entry: KvEntry = {
+    const raw: {
+      value: Uint8Array;
+      ttl?: number;
+      metadata?: unknown;
+      revision: number;
+    } = {
       value,
       revision: revHeader != null ? Number(revHeader) : 0,
     };
-    if (ttlHeader != null) entry.ttl = Number(ttlHeader);
+    if (ttlHeader != null) raw.ttl = Number(ttlHeader);
     if (metaHeader != null) {
       try {
-        entry.metadata = JSON.parse(metaHeader) as unknown;
+        raw.metadata = JSON.parse(metaHeader) as unknown;
       } catch (err) {
         onMetadataParseError?.(key, metaHeader, err);
       }
     }
-    return entry;
+    return makeEntry(raw);
   }
 
   async function set(
@@ -121,9 +128,9 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
       headers["if-match"] = String(setOpts.ifMatch);
     }
 
-    const url = setOpts?.nx
+    const url = setOpts?.ifAbsent
       ? `${valueUrl(key)}?nx=1`
-      : setOpts?.xx
+      : setOpts?.ifPresent
       ? `${valueUrl(key)}?xx=1`
       : valueUrl(key);
 
@@ -172,7 +179,10 @@ export function createHttpKvClient(opts: KvClientOptions): KvClient {
     async list(listOpts?: KvListOptions): Promise<KvListResult> {
       const res = await request("SCAN", 1, keysUrl(listOpts), {});
       if (!res.ok) throw await parseError(res);
-      return (await res.json()) as KvListResult;
+      const body = (await res.json()) as { keys: KvListKey[]; cursor?: string };
+      const result: KvListResult = { keys: body.keys };
+      if (body.cursor) result.nextCursor = body.cursor;
+      return result;
     },
 
     async mget(keys: string[]): Promise<(KvEntry | null)[]> {
@@ -270,7 +280,9 @@ async function* watchSse(
           if (!data) continue;
           const event = parseSseEvent(data);
           if (event != null) {
-            if (event.revision > 0) lastRevision = event.revision;
+            if (event.type !== "ready" && event.revision > 0) {
+              lastRevision = event.revision;
+            }
             yield event;
           }
         }
@@ -294,14 +306,14 @@ function parseSseEvent(data: string): KvWatchEvent | null {
     const obj = JSON.parse(data) as Record<string, unknown>;
     const type = obj["type"] as string;
     if (type === "ready") {
-      return { type: "ready", revision: 0 };
+      return { type: "ready" };
     }
     if (type === "set") {
       const raw = obj["value"];
       const value = typeof raw === "string"
         ? decodeBase64(raw)
         : new Uint8Array(0);
-      const event: KvWatchEvent = {
+      const event: Extract<KvWatchEvent, { type: "set" }> = {
         type: "set",
         key: String(obj["key"]),
         value,

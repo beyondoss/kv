@@ -15,7 +15,7 @@ const kv = createKvClient({ url: "redis://localhost:6379" });
 
 await kv.set("user:123", "Jane Smith");
 const entry = await kv.get("user:123");
-const value = new TextDecoder().decode(entry!.value);
+console.log(entry?.text()); // "Jane Smith"
 
 await kv.close();
 ```
@@ -48,13 +48,25 @@ const kv = createKvClient({
 });
 ```
 
-**RESP-only options:**
+If you know your backend ahead of time, use the typed factories directly — they only expose options that apply to that backend:
+
+```ts
+import { createHttpKvClient, createRespKvClient } from "@beyond.dev/kv";
+
+const http = createHttpKvClient({
+  url: "http://localhost:4869",
+  namespace: "prod",
+});
+const resp = createRespKvClient({ url: "redis://localhost:6379", db: 2 });
+```
+
+**RESP-only options (`KvRespClientOptions`):**
 
 | Option | Type     | Default | Description                                |
 | ------ | -------- | ------- | ------------------------------------------ |
 | `db`   | `number` | `0`     | Database index (0–15), maps to a namespace |
 
-**HTTP-only options:**
+**HTTP-only options (`KvHttpClientOptions`):**
 
 | Option      | Type           | Default            | Description                 |
 | ----------- | -------------- | ------------------ | --------------------------- |
@@ -68,6 +80,11 @@ const kv = createKvClient({
 ```ts
 const entry = await kv.get("my-key");
 // entry is KvEntry | null
+
+if (entry) {
+  console.log(entry.text()); // decode as UTF-8
+  console.log(entry.json<MyType>()); // parse as JSON
+}
 ```
 
 ### `kv.getOrThrow(key)`
@@ -75,6 +92,7 @@ const entry = await kv.get("my-key");
 ```ts
 const entry = await kv.getOrThrow("my-key");
 // throws KvNotFoundError if missing
+console.log(entry.text());
 ```
 
 ### `kv.set(key, value, opts?)`
@@ -83,17 +101,19 @@ const entry = await kv.getOrThrow("my-key");
 await kv.set("my-key", "value");
 await kv.set("my-key", new Uint8Array([1, 2, 3]));
 await kv.set("my-key", "value", { ttl: 60 }); // expires in 60s
-await kv.set("my-key", "value", { nx: true }); // only if missing
-await kv.set("my-key", "value", { xx: true }); // only if present
+await kv.set("my-key", "value", { ifAbsent: true }); // only if missing
+await kv.set("my-key", "value", { ifPresent: true }); // only if present
+await kv.set("my-key", "value", { ifMatch: entry.revision }); // compare-and-swap
 await kv.set("my-key", "value", { metadata: { v: 1 } }); // HTTP backend only
 ```
 
-Returns `void`. Throws `KvError` with status `409` if `nx` or `xx` conditions aren't met.
+Returns `void`. Throws `KvError` with status `409` if `ifAbsent`, `ifPresent`, or `ifMatch` conditions aren't met.
 
 ### `kv.delete(key)`
 
 ```ts
 await kv.delete("my-key");
+await kv.delete("my-key", { ifMatch: entry.revision }); // compare-and-delete
 ```
 
 ### `kv.mget(keys)`
@@ -119,14 +139,39 @@ Only `ttl` is supported in batch set options.
 ```ts
 let cursor: string | undefined;
 
-while (true) {
+do {
   const page = await kv.list({ prefix: "user:", cursor, limit: 100 });
   for (const { name } of page.keys) {
     console.log(name);
   }
-  if (page.complete) break;
-  cursor = page.cursor;
+  cursor = page.nextCursor;
+} while (cursor !== undefined);
+```
+
+### `kv.watch(key, opts?)`
+
+```ts
+for await (const event of kv.watch("config", { signal: ac.signal })) {
+  if (event.type === "ready") {
+    console.log("connected, initial state delivered");
+  } else if (event.type === "set") {
+    console.log(`${event.key} = ${event.text()}`); // event.value is Uint8Array
+  } else if (event.type === "del") {
+    console.log(`${event.key} deleted`);
+  }
 }
+```
+
+Watch a prefix:
+
+```ts
+for await (const event of kv.watch("cfg:", { prefix: true })) { ... }
+```
+
+Resume after disconnect:
+
+```ts
+for await (const event of kv.watch("cfg", { since: lastRevision })) { ... }
 ```
 
 ### `kv.close()`
@@ -145,9 +190,12 @@ Closes the underlying connection. Call when done.
 
 ```ts
 interface KvEntry {
-  value: Uint8Array; // always binary — decode with TextDecoder if needed
+  value: Uint8Array; // raw bytes
+  text(): string; // decode as UTF-8
+  json<T>(): T; // parse as JSON
   ttl?: number; // remaining TTL in seconds
   metadata?: unknown; // arbitrary JSON — HTTP backend only
+  revision: number; // monotonically increasing write timestamp (ms)
 }
 ```
 
@@ -157,8 +205,9 @@ interface KvEntry {
 interface KvSetOptions {
   ttl?: number;
   metadata?: unknown; // HTTP backend only
-  nx?: boolean; // set only if key doesn't exist
-  xx?: boolean; // set only if key exists
+  ifAbsent?: boolean; // set only if key doesn't exist
+  ifPresent?: boolean; // set only if key exists
+  ifMatch?: number; // compare-and-swap: set only if revision matches
 }
 ```
 
@@ -173,9 +222,24 @@ interface KvListOptions {
 
 interface KvListResult {
   keys: { name: string }[];
-  cursor?: string;
-  complete: boolean;
+  nextCursor?: string; // absent when scan is complete
 }
+```
+
+### `KvWatchEvent`
+
+```ts
+type KvWatchEvent =
+  | { type: "ready" }
+  | {
+    type: "set";
+    key: string;
+    value: Uint8Array;
+    ttl?: number;
+    metadata?: unknown;
+    revision: number;
+  }
+  | { type: "del"; key: string; revision: number };
 ```
 
 ---
@@ -224,9 +288,7 @@ import { createServerKvClient } from "@beyond.dev/kv/next";
 export async function GET() {
   const kv = createServerKvClient();
   const entry = await kv.get("config");
-  return Response.json({
-    value: entry ? new TextDecoder().decode(entry.value) : null,
-  });
+  return Response.json({ value: entry?.text() ?? null });
 }
 ```
 

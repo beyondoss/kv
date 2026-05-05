@@ -105,36 +105,38 @@ describe("HTTP backend — getOrThrow", () => {
   });
 });
 
-describe("HTTP backend — NX / XX", () => {
-  it("nx succeeds on a missing key", async () => {
+describe("HTTP backend — ifAbsent / ifPresent", () => {
+  it("ifAbsent succeeds on a missing key", async () => {
     const kv = httpClient();
-    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves
+    await expect(kv.set(uniqueKey(), "v", { ifAbsent: true })).resolves
       .toBeUndefined();
   });
 
-  it("nx throws KvError(409) when the key already exists", async () => {
+  it("ifAbsent throws KvError(409) when the key already exists", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "original");
-    await expect(kv.set(key, "new", { nx: true })).rejects.toSatisfy(
+    await expect(kv.set(key, "new", { ifAbsent: true })).rejects.toSatisfy(
       (e) => e instanceof KvError && e.status === 409,
     );
     expect(dec((await kv.get(key))!.value)).toBe("original");
   });
 
-  it("xx succeeds when the key exists", async () => {
+  it("ifPresent succeeds when the key exists", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "old");
-    await expect(kv.set(key, "new", { xx: true })).resolves.toBeUndefined();
+    await expect(kv.set(key, "new", { ifPresent: true })).resolves
+      .toBeUndefined();
     expect(dec((await kv.get(key))!.value)).toBe("new");
   });
 
-  it("xx throws KvError(409) when the key does not exist", async () => {
+  it("ifPresent throws KvError(409) when the key does not exist", async () => {
     const kv = httpClient();
-    await expect(kv.set(uniqueKey(), "v", { xx: true })).rejects.toSatisfy(
-      (e) => e instanceof KvError && e.status === 409,
-    );
+    await expect(kv.set(uniqueKey(), "v", { ifPresent: true })).rejects
+      .toSatisfy(
+        (e) => e instanceof KvError && e.status === 409,
+      );
   });
 });
 
@@ -143,7 +145,7 @@ describe("HTTP backend — list", () => {
     const kv = httpClient();
     const result = await kv.list();
     expect(result.keys).toHaveLength(0);
-    expect(result.complete).toBe(true);
+    expect(result.nextCursor).toBeUndefined();
   });
 
   it("returns all keys inserted into the namespace", async () => {
@@ -156,7 +158,7 @@ describe("HTTP backend — list", () => {
     for (const key of keys) {
       expect(names).toContain(key);
     }
-    expect(result.complete).toBe(true);
+    expect(result.nextCursor).toBeUndefined();
   });
 
   it("filters by prefix", async () => {
@@ -180,18 +182,16 @@ describe("HTTP backend — list", () => {
 
     const seen: string[] = [];
     let cursor: string | undefined;
-    let complete = false;
 
-    while (!complete) {
+    do {
       const page = await kv.list({
         prefix,
         limit: 2,
         ...(cursor !== undefined ? { cursor } : {}),
       });
       seen.push(...page.keys.map((k) => k.name));
-      complete = page.complete;
-      cursor = page.cursor;
-    }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
 
     expect(seen.sort()).toEqual(allKeys.sort());
   });
@@ -448,8 +448,11 @@ async function watchCollect(
   return events;
 }
 
-function nonReady(events: KvWatchEvent[]): KvWatchEvent[] {
-  return events.filter((e) => e.type !== "ready");
+type MutationEvent = Extract<KvWatchEvent, { type: "set" | "del" }>;
+type SetEvent = Extract<KvWatchEvent, { type: "set" }>;
+
+function nonReady(events: KvWatchEvent[]): MutationEvent[] {
+  return events.filter((e): e is MutationEvent => e.type !== "ready");
 }
 
 // ── watch tests ───────────────────────────────────────────────────────────────
@@ -478,9 +481,11 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => nonReady(evs).length >= 1,
       async () => kv.set(key, "hello"),
     );
-    const setEvent = events.find((e) => e.type === "set");
+    const setEvent = events.find((e) => e.type === "set") as
+      | SetEvent
+      | undefined;
     expect(setEvent).toBeDefined();
-    expect(dec(setEvent!.value!)).toBe("hello");
+    expect(dec(setEvent!.value)).toBe("hello");
     expect(setEvent!.key).toBe(key);
     expect(setEvent!.revision).toBeGreaterThan(0);
   });
@@ -498,9 +503,11 @@ describe("HTTP backend — watch (exact key)", () => {
       async () => {},
     );
     // The initial set event should arrive before ready
-    const setEvent = events.find((e) => e.type === "set");
+    const setEvent = events.find((e) => e.type === "set") as
+      | SetEvent
+      | undefined;
     expect(setEvent).toBeDefined();
-    expect(dec(setEvent!.value!)).toBe("preexisting");
+    expect(dec(setEvent!.value)).toBe("preexisting");
   });
 
   it("delivers a del event when the key is deleted", async () => {
@@ -515,7 +522,9 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => nonReady(evs).some((e) => e.type === "del"),
       async () => kv.delete(key),
     );
-    const delEvent = events.find((e) => e.type === "del");
+    const delEvent = events.find((
+      e,
+    ): e is Extract<KvWatchEvent, { type: "del" }> => e.type === "del");
     expect(delEvent).toBeDefined();
     expect(delEvent!.key).toBe(key);
     expect(delEvent!.revision).toBeGreaterThan(0);
@@ -538,9 +547,9 @@ describe("HTTP backend — watch (exact key)", () => {
     const mutations = nonReady(events);
     expect(mutations).toHaveLength(3);
     expect(mutations[0]!.type).toBe("set");
-    expect(dec(mutations[0]!.value!)).toBe("v1");
+    expect(dec((mutations[0]! as SetEvent).value)).toBe("v1");
     expect(mutations[1]!.type).toBe("set");
-    expect(dec(mutations[1]!.value!)).toBe("v2");
+    expect(dec((mutations[1]! as SetEvent).value)).toBe("v2");
     expect(mutations[2]!.type).toBe("del");
   });
 
@@ -592,7 +601,7 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => nonReady(evs).length >= 1,
       async () => kv.set(key, "first"),
     );
-    const firstRev = nonReady(firstEvents)[0]!.revision;
+    const firstRev = (nonReady(firstEvents)[0] as SetEvent).revision;
 
     // Write a second value while "disconnected" (no active watch)
     await kv.set(key, "second");
@@ -605,9 +614,11 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => evs.some((e) => e.type === "ready"),
       async () => {},
     );
-    const replayed = replayEvents.filter((e) => e.type === "set");
+    const replayed = replayEvents.filter((e): e is SetEvent =>
+      e.type === "set"
+    );
     expect(replayed.length).toBeGreaterThanOrEqual(1);
-    const lastValue = dec(replayed[replayed.length - 1]!.value!);
+    const lastValue = dec(replayed[replayed.length - 1]!.value);
     expect(lastValue).toBe("second");
   });
 });
@@ -631,7 +642,7 @@ describe("HTTP backend — watch (prefix)", () => {
     );
     const mutations = nonReady(events);
     expect(mutations).toHaveLength(2);
-    expect(mutations.map((e) => e.key).sort()).toEqual([k1, k2].sort());
+    expect(mutations.map((e) => e.key).sort()).toEqual([k1, k2].sort()); // MutationEvent always has key
   });
 
   it("does not emit events for keys outside the prefix", async () => {
@@ -650,7 +661,7 @@ describe("HTTP backend — watch (prefix)", () => {
         await kv.set(inside, "appears");
       },
     );
-    const keys = nonReady(events).map((e) => e.key);
+    const keys = nonReady(events).map((e) => e.key); // MutationEvent always has key
     expect(keys).not.toContain(outside);
     expect(keys).toContain(inside);
   });

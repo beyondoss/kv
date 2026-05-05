@@ -1,7 +1,7 @@
 import Redis from "ioredis";
 import * as net from "node:net";
 
-import type { KvClient, KvClientOptions } from "./client.js";
+import type { KvClient, KvRespClientOptions } from "./client.js";
 import { KvError, KvNotFoundError } from "./errors.js";
 import type {
   KvBatchOp,
@@ -15,8 +15,9 @@ import type {
   KvWatchEvent,
   KvWatchOptions,
 } from "./types.js";
+import { makeEntry } from "./types.js";
 
-export function createRespKvClient(opts: KvClientOptions): KvClient {
+export function createRespKvClient(opts: KvRespClientOptions): KvClient {
   const redis = new Redis(opts.url, {
     db: opts.db ?? 0,
     commandTimeout: opts.timeout,
@@ -63,12 +64,11 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         ];
 
       if (valueBuf === null) return null;
-      const entry: KvEntry = {
+      return makeEntry({
         value: new Uint8Array(valueBuf),
         revision: revision > 0 ? revision : 0,
-      };
-      if (ttlSecs >= 0) entry.ttl = ttlSecs;
-      return entry;
+        ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+      });
     });
   }
 
@@ -82,8 +82,8 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
         ? Buffer.from(value)
         : Buffer.from(value);
       const ttl = setOpts?.ttl;
-      const nx = setOpts?.nx ?? false;
-      const xx = setOpts?.xx ?? false;
+      const ifAbsent = setOpts?.ifAbsent ?? false;
+      const ifPresent = setOpts?.ifPresent ?? false;
       const ifMatch = setOpts?.ifMatch;
 
       if (ifMatch != null) {
@@ -103,23 +103,23 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
       }
 
       let result: "OK" | null;
-      if (ttl != null && nx) {
+      if (ttl != null && ifAbsent) {
         result = await redis.set(key, buf, "EX", ttl, "NX");
-      } else if (ttl != null && xx) {
+      } else if (ttl != null && ifPresent) {
         result = await redis.set(key, buf, "EX", ttl, "XX");
       } else if (ttl != null) {
         result = await redis.set(key, buf, "EX", ttl);
-      } else if (nx) {
+      } else if (ifAbsent) {
         result = await redis.set(key, buf, "NX");
-      } else if (xx) {
+      } else if (ifPresent) {
         result = await redis.set(key, buf, "XX");
       } else {
         result = await redis.set(key, buf);
       }
 
       if (result === null) {
-        if (nx) throw new KvError("conflict", "key already exists", 409);
-        if (xx) throw new KvError("conflict", "key does not exist", 409);
+        if (ifAbsent) throw new KvError("conflict", "key already exists", 409);
+        if (ifPresent) throw new KvError("conflict", "key does not exist", 409);
       }
     });
   }
@@ -147,7 +147,7 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
       return track("SCAN", 1, async () => {
         const cursor = listOpts?.cursor ?? "0";
         const count = listOpts?.limit ?? 100;
-        const [nextCursor, keys] = listOpts?.prefix
+        const [scanCursor, keys] = listOpts?.prefix
           ? await redis.scan(
             cursor,
             "MATCH",
@@ -157,12 +157,9 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
           )
           : await redis.scan(cursor, "COUNT", count);
 
-        const done = nextCursor === "0";
-        const result: KvListResult = {
-          keys: keys.map((name) => ({ name })),
-          complete: done,
-        };
-        if (!done) result.cursor = nextCursor;
+        const done = scanCursor === "0";
+        const result: KvListResult = { keys: keys.map((name) => ({ name })) };
+        if (!done) result.nextCursor = scanCursor;
         return result;
       });
     },
@@ -190,12 +187,11 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
           if (valueBuf === null) {
             out.push(null);
           } else {
-            const entry: KvEntry = {
+            out.push(makeEntry({
               value: new Uint8Array(valueBuf),
               revision: revision > 0 ? revision : 0,
-            };
-            if (ttlSecs >= 0) entry.ttl = ttlSecs;
-            out.push(entry);
+              ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+            }));
           }
         }
         return out;
@@ -261,15 +257,15 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
               ];
               if (op.opts.ttl != null) args.push("EX", String(op.opts.ttl));
               (pipeline as any).setrev(...args);
-            } else if (op.opts?.ttl != null && op.opts.nx) {
+            } else if (op.opts?.ttl != null && op.opts.ifAbsent) {
               pipeline.set(op.key, buf, "EX", op.opts.ttl, "NX");
-            } else if (op.opts?.ttl != null && op.opts.xx) {
+            } else if (op.opts?.ttl != null && op.opts.ifPresent) {
               pipeline.set(op.key, buf, "EX", op.opts.ttl, "XX");
             } else if (op.opts?.ttl != null) {
               pipeline.set(op.key, buf, "EX", op.opts.ttl);
-            } else if (op.opts?.nx) {
+            } else if (op.opts?.ifAbsent) {
               pipeline.set(op.key, buf, "NX");
-            } else if (op.opts?.xx) {
+            } else if (op.opts?.ifPresent) {
               pipeline.set(op.key, buf, "XX");
             } else {
               pipeline.set(op.key, buf);
@@ -293,22 +289,21 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
             if (valueBuf === null) return null;
             const revision = results[off + 1]![1] as number;
             const ttlSecs = results[off + 2]![1] as number;
-            const entry: KvEntry = {
+            return makeEntry({
               value: new Uint8Array(valueBuf),
               revision: revision > 0 ? revision : 0,
-            };
-            if (ttlSecs >= 0) entry.ttl = ttlSecs;
-            return entry;
+              ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+            });
           } else if (op.op === "set") {
             const [err] = results[off]!;
             if (err) {
               if (isConflictError(err)) {
                 throw new KvError("conflict", "revision mismatch", 409);
               }
-              if (op.opts?.nx) {
+              if (op.opts?.ifAbsent) {
                 throw new KvError("conflict", "key already exists", 409);
               }
-              if (op.opts?.xx) {
+              if (op.opts?.ifPresent) {
                 throw new KvError("conflict", "key does not exist", 409);
               }
               throw err;
@@ -360,7 +355,9 @@ export function createRespKvClient(opts: KvClientOptions): KvClient {
             const frame = await conn.recvPush(signal);
             const event = pushToEvent(frame);
             if (event == null) continue;
-            if (event.revision > 0) lastRevision = event.revision;
+            if (event.type !== "ready" && event.revision > 0) {
+              lastRevision = event.revision;
+            }
             yield event;
           }
         } catch {
@@ -627,7 +624,7 @@ function pushToEvent(frame: { push: RespValue[] }): KvWatchEvent | null {
   if (ns !== "watch") return null;
   const kind = respToString(arr[1]!);
   if (kind === "ready") {
-    return { type: "ready", revision: 0 };
+    return { type: "ready" };
   }
   if (kind === "set") {
     if (arr.length < 5) return null;

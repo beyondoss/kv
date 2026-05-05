@@ -85,44 +85,45 @@ describe("RESP backend — getOrThrow", () => {
   });
 });
 
-describe("RESP backend — NX / XX", () => {
-  it("nx succeeds on a missing key", async () => {
-    await expect(kv.set(uniqueKey(), "v", { nx: true })).resolves
+describe("RESP backend — ifAbsent / ifPresent", () => {
+  it("ifAbsent succeeds on a missing key", async () => {
+    await expect(kv.set(uniqueKey(), "v", { ifAbsent: true })).resolves
       .toBeUndefined();
   });
 
-  it("nx throws KvError(409) when the key already exists", async () => {
+  it("ifAbsent throws KvError(409) when the key already exists", async () => {
     const key = uniqueKey();
     await kv.set(key, "original");
-    await expect(kv.set(key, "new", { nx: true })).rejects.toSatisfy(
+    await expect(kv.set(key, "new", { ifAbsent: true })).rejects.toSatisfy(
       (e) => e instanceof KvError && e.status === 409,
     );
     expect(dec((await kv.get(key))!.value)).toBe("original");
   });
 
-  it("nx with ttl succeeds on a missing key", async () => {
+  it("ifAbsent with ttl succeeds on a missing key", async () => {
     const key = uniqueKey();
-    await kv.set(key, "v", { nx: true, ttl: 60 });
+    await kv.set(key, "v", { ifAbsent: true, ttl: 60 });
     expect((await kv.get(key))?.ttl).toBeGreaterThan(0);
   });
 
-  it("xx succeeds when the key exists", async () => {
+  it("ifPresent succeeds when the key exists", async () => {
     const key = uniqueKey();
     await kv.set(key, "old");
-    await kv.set(key, "new", { xx: true });
+    await kv.set(key, "new", { ifPresent: true });
     expect(dec((await kv.get(key))!.value)).toBe("new");
   });
 
-  it("xx throws KvError(409) when the key does not exist", async () => {
-    await expect(kv.set(uniqueKey(), "v", { xx: true })).rejects.toSatisfy(
-      (e) => e instanceof KvError && e.status === 409,
-    );
+  it("ifPresent throws KvError(409) when the key does not exist", async () => {
+    await expect(kv.set(uniqueKey(), "v", { ifPresent: true })).rejects
+      .toSatisfy(
+        (e) => e instanceof KvError && e.status === 409,
+      );
   });
 
-  it("xx with ttl succeeds when the key exists", async () => {
+  it("ifPresent with ttl succeeds when the key exists", async () => {
     const key = uniqueKey();
     await kv.set(key, "old");
-    await kv.set(key, "new", { xx: true, ttl: 60 });
+    await kv.set(key, "new", { ifPresent: true, ttl: 60 });
     const entry = await kv.get(key);
     expect(dec(entry!.value)).toBe("new");
     expect(entry!.ttl).toBeGreaterThan(0);
@@ -133,7 +134,7 @@ describe("RESP backend — list / scan", () => {
   it("returns an empty result when no keys match prefix", async () => {
     const result = await kv.list({ prefix: `empty:${crypto.randomUUID()}` });
     expect(result.keys).toHaveLength(0);
-    expect(result.complete).toBe(true);
+    expect(result.nextCursor).toBeUndefined();
   });
 
   it("filters by prefix", async () => {
@@ -154,18 +155,16 @@ describe("RESP backend — list / scan", () => {
 
     const seen: string[] = [];
     let cursor: string | undefined;
-    let complete = false;
 
-    while (!complete) {
+    do {
       const page = await kv.list({
         prefix,
         limit: 2,
         ...(cursor !== undefined ? { cursor } : {}),
       });
       seen.push(...page.keys.map((k) => k.name));
-      complete = page.complete;
-      cursor = page.cursor;
-    }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
 
     expect(seen.sort()).toEqual(allKeys.sort());
   });
@@ -257,12 +256,11 @@ describe("RESP backend — database isolation", () => {
     expect(dec((await kv0.get(key))!.value)).toBe("in-db0");
   });
 
-  it("list on an empty db returns complete=true with no keys", async () => {
+  it("list on an empty db returns no keys and no nextCursor", async () => {
     // Db 14 is used only in this test so it is guaranteed to be empty.
     const result = await kv14.list({ prefix: `empty:${crypto.randomUUID()}` });
     expect(result.keys).toHaveLength(0);
-    expect(result.complete).toBe(true);
-    expect(result.cursor).toBeUndefined();
+    expect(result.nextCursor).toBeUndefined();
   });
 });
 

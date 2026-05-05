@@ -66,39 +66,13 @@ export interface KvClient {
   close(): Promise<void>;
 }
 
-export interface KvClientOptions {
+interface KvBaseClientOptions {
   /**
    * Server URL. Scheme determines the backend:
    * - `redis://` or `rediss://` → RESP (recommended)
    * - `http://` or `https://` → HTTP
    */
   url: string;
-
-  // ── RESP options ────────────────────────────────────────────────────────────
-  /**
-   * Database number (0–15) mapping to a beyond-kv namespace.
-   * 0 → `default`, 1 → `db1`, …, 15 → `db15`. Default: 0.
-   * RESP backend only.
-   */
-  db?: number;
-
-  // ── HTTP options ────────────────────────────────────────────────────────────
-  /**
-   * Namespace name. Default: `"default"`. HTTP backend only.
-   */
-  namespace?: string;
-  /**
-   * Custom `fetch` implementation for connection pooling or test mocking.
-   * HTTP backend only.
-   */
-  fetch?: typeof globalThis.fetch;
-  /**
-   * Called when an `x-kv-metadata` response header cannot be parsed as JSON.
-   * HTTP backend only.
-   */
-  onMetadataParseError?: (key: string, raw: string, err: unknown) => void;
-
-  // ── Shared options ──────────────────────────────────────────────────────────
   /** Per-command timeout in milliseconds. */
   timeout?: number;
   /**
@@ -112,11 +86,37 @@ export interface KvClientOptions {
   onResponse?: (event: KvResponseEvent) => void;
 }
 
+/** Options for the HTTP backend (`http://` or `https://` URLs). */
+export interface KvHttpClientOptions extends KvBaseClientOptions {
+  /** Namespace name. Default: `"default"`. */
+  namespace?: string;
+  /**
+   * Custom `fetch` implementation for connection pooling or test mocking.
+   */
+  fetch?: typeof globalThis.fetch;
+  /**
+   * Called when an `x-kv-metadata` response header cannot be parsed as JSON.
+   */
+  onMetadataParseError?: (key: string, raw: string, err: unknown) => void;
+}
+
+/** Options for the RESP backend (`redis://` or `rediss://` URLs). */
+export interface KvRespClientOptions extends KvBaseClientOptions {
+  /**
+   * Database number (0–15) mapping to a beyond-kv namespace.
+   * 0 → `default`, 1 → `db1`, …, 15 → `db15`. Default: 0.
+   */
+  db?: number;
+}
+
+/** Union of HTTP and RESP options. Backend is selected from the URL scheme. */
+export type KvClientOptions = KvHttpClientOptions | KvRespClientOptions;
+
 /** Creates a KV client. Backend is selected automatically from the URL scheme. */
 export function createKvClient(opts: KvClientOptions): KvClient {
   const { protocol } = new URL(opts.url);
   if (protocol === "redis:" || protocol === "rediss:") {
-    return createRespKvClient(opts);
+    return createRespKvClient(opts as KvRespClientOptions);
   }
-  return createHttpKvClient(opts);
+  return createHttpKvClient(opts as KvHttpClientOptions);
 }

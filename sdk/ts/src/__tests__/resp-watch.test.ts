@@ -11,6 +11,9 @@ import * as net from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createKvClient, type KvClient } from "../client.js";
 import type { KvWatchEvent } from "../types.js";
+
+type SetEvent = Extract<KvWatchEvent, { type: "set" }>;
+type DelEvent = Extract<KvWatchEvent, { type: "del" }>;
 import { getRespUrl, uniqueKey } from "./harness.js";
 
 // ── minimal RESP3 codec ───────────────────────────────────────────────────────
@@ -424,7 +427,6 @@ describe("RESP backend — kv.watch() SDK", () => {
     const events = await take(gen, 1);
     expect(events).toHaveLength(1);
     expect(events[0]!.type).toBe("ready");
-    expect(events[0]!.revision).toBe(0);
     ctrl.abort();
     await gen.return(undefined);
   });
@@ -437,10 +439,11 @@ describe("RESP backend — kv.watch() SDK", () => {
     const gen = kv.watch(key, { signal: ctrl.signal });
     const events = await take(gen, 2);
     expect(events).toHaveLength(2);
-    expect(events[0]!.type).toBe("set");
-    expect(events[0]!.key).toBe(key);
-    expect(decUtf8(events[0]!.value)).toBe("hello");
-    expect(events[0]!.revision).toBeGreaterThan(0);
+    const setEv0 = events[0] as SetEvent;
+    expect(setEv0.type).toBe("set");
+    expect(setEv0.key).toBe(key);
+    expect(decUtf8(setEv0.value)).toBe("hello");
+    expect(setEv0.revision).toBeGreaterThan(0);
     expect(events[1]!.type).toBe("ready");
 
     ctrl.abort();
@@ -460,10 +463,11 @@ describe("RESP backend — kv.watch() SDK", () => {
     const collect = take(gen, 1);
     await kv.set(key, "world");
     const events = await collect;
-    expect(events[0]!.type).toBe("set");
-    expect(events[0]!.key).toBe(key);
-    expect(decUtf8(events[0]!.value)).toBe("world");
-    expect(events[0]!.revision).toBeGreaterThan(0);
+    const setEv = events[0] as SetEvent;
+    expect(setEv.type).toBe("set");
+    expect(setEv.key).toBe(key);
+    expect(decUtf8(setEv.value)).toBe("world");
+    expect(setEv.revision).toBeGreaterThan(0);
 
     ctrl.abort();
     await gen.return(undefined);
@@ -482,9 +486,10 @@ describe("RESP backend — kv.watch() SDK", () => {
     const collect = take(gen, 1);
     await kv.delete(key);
     const events = await collect;
-    expect(events[0]!.type).toBe("del");
-    expect(events[0]!.key).toBe(key);
-    expect(events[0]!.revision).toBeGreaterThan(0);
+    const delEv = events[0] as DelEvent;
+    expect(delEv.type).toBe("del");
+    expect(delEv.key).toBe(key);
+    expect(delEv.revision).toBeGreaterThan(0);
 
     ctrl.abort();
     await gen.return(undefined);
@@ -504,9 +509,10 @@ describe("RESP backend — kv.watch() SDK", () => {
     await kv.set(noMatch, "x"); // should be filtered server-side
     await kv.set(match, "y"); // should arrive
     const events = await collect;
-    expect(events[0]!.type).toBe("set");
-    expect(events[0]!.key).toBe(match);
-    expect(decUtf8(events[0]!.value)).toBe("y");
+    const setEv = events[0] as SetEvent;
+    expect(setEv.type).toBe("set");
+    expect(setEv.key).toBe(match);
+    expect(decUtf8(setEv.value)).toBe("y");
 
     ctrl.abort();
     await gen.return(undefined);
@@ -545,8 +551,9 @@ describe("RESP backend — kv.watch() SDK", () => {
     const collectV1 = take(gen1, 1);
     await kv.set(key, "v1");
     const v1Events = await collectV1;
-    expect(v1Events[0]!.type).toBe("set");
-    const revAfterV1 = v1Events[0]!.revision;
+    const v1Ev = v1Events[0] as SetEvent;
+    expect(v1Ev.type).toBe("set");
+    const revAfterV1 = v1Ev.revision;
     expect(revAfterV1).toBeGreaterThan(0);
 
     ctrl1.abort();
@@ -565,7 +572,7 @@ describe("RESP backend — kv.watch() SDK", () => {
 
     const events = await take(gen2, 3);
     expect(events[0]!.type).toBe("set");
-    expect(decUtf8(events[0]!.value)).toBe("v2");
+    expect(decUtf8((events[0] as SetEvent).value)).toBe("v2");
     expect(events[1]!.type).toBe("del");
     expect(events[2]!.type).toBe("ready");
 
