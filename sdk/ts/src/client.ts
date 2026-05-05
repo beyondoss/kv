@@ -17,8 +17,8 @@ import { createRespKvClient } from "./resp.js";
 import type { components, paths } from "./types.js";
 
 export type { components, paths };
-export type { operations } from "./types.js";
 export type { KvCasOptions } from "./kv-types.js";
+export type { operations } from "./types.js";
 
 export interface KvCommandEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
