@@ -10,3 +10,4 @@ dist/
 node_modules/
 bench/out/
 .mcp.json
+.claude
