@@ -11,7 +11,15 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    get: operations["handle_list"];
+    /**
+     * List keys in a namespace, optionally filtered by prefix. Results are returned in
+     *     lexicographic order. Pagination is cursor-based: when `complete` is `false`, pass the
+     *     returned `cursor` value as the `cursor` query parameter on the next request to fetch
+     *     the subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.
+     *     Across multiple shards, the cursor encodes per-shard positions so fan-out is handled
+     *     transparently by the server.
+     */
+    get: operations["list_keys"];
     put?: never;
     post?: never;
     delete?: never;
@@ -27,10 +35,41 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    get: operations["handle_get"];
-    put: operations["handle_put"];
+    /**
+     * Fetch the raw bytes stored at `key`. The value is returned as `application/octet-stream`.
+     *     Response headers carry key metadata: `X-KV-TTL` is the remaining TTL in whole seconds
+     *     (absent when the key has no expiry), `X-KV-Revision` is the current revision counter
+     *     (absent if the key was never written via `If-Match`), and `X-KV-Metadata` is the
+     *     JSON blob attached to the key (absent if none was stored).
+     */
+    get: operations["get_value"];
+    /**
+     * Store raw bytes at `key`. The request body is the value (`application/octet-stream`).
+     * @description **Conditional writes** — at most one condition may be active per request:
+     *     - `nx=1` — write only if the key does **not** exist; returns 409 if it does.
+     *     - `xx=1` — write only if the key **already exists**; returns 409 if it does not.
+     *     - `If-Match: <rev>` — write only if the stored revision equals `<rev>`; returns 409
+     *       on mismatch. On success, the new revision is returned in `X-KV-Revision`.
+     *
+     *     **TTL** — set `ttl=<seconds>` (query) or `X-KV-TTL: <seconds>` (header; takes
+     *     precedence). Use `X-KV-KeepTTL: 1` to preserve an existing expiry when overwriting a
+     *     key; mutually exclusive with any TTL option.
+     *
+     *     **Atomic read-modify** — `X-KV-Return-Old: 1` returns the previous value (200) in a
+     *     single atomic swap; 204 when the key did not exist. Mutually exclusive with all
+     *     conditional-write options.
+     *
+     *     **Metadata** — `X-KV-Metadata: <json>` attaches an arbitrary JSON value to the key
+     *     (max 64 KiB serialized). Retrievable on GET via `X-KV-Metadata`.
+     */
+    put: operations["put_value"];
     post?: never;
-    delete: operations["handle_delete"];
+    /**
+     * Delete `key` from the store. Idempotent — returns 204 whether or not the key existed.
+     *     Supply `If-Match: <rev>` for a conditional delete: returns 409 if the stored revision
+     *     does not match, leaving the key untouched.
+     */
+    delete: operations["delete_value"];
     options?: never;
     head?: never;
     patch?: never;
@@ -45,7 +84,13 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    post: operations["handle_incr"];
+    /**
+     * Atomically increment a 64-bit signed integer counter stored at `key` by `delta`
+     *     (default 1). If the key does not exist it is initialised to 0 before incrementing.
+     *     Returns the new value. Returns 400 if the stored bytes cannot be interpreted as a
+     *     decimal integer, or if the operation would overflow i64.
+     */
+    post: operations["increment_value"];
     delete?: never;
     options?: never;
     head?: never;
@@ -57,19 +102,37 @@ export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
     ErrorResponse: {
+      /**
+       * @description Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,
+       *     `invalid_namespace`, `engine_error`).
+       */
       error: string;
+      /** @description Human-readable description of what went wrong. */
       message: string;
     };
     IncrResponse: {
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description New counter value after applying the delta.
+       */
       value: number;
     };
     KeyItem: {
+      /** @description Key name (percent-decoded). */
       name: string;
     };
     ListResponse: {
+      /**
+       * @description `true` when all matching keys have been returned and there are no further pages.
+       *     `false` means a `cursor` is present and more results may be fetched.
+       */
       complete: boolean;
+      /**
+       * @description Opaque pagination cursor. Pass as the `cursor` query parameter on the next request
+       *     to fetch the subsequent page. Absent when `complete` is `true`.
+       */
       cursor?: string | null;
+      /** @description Matching keys in lexicographic order. */
       keys: components["schemas"]["KeyItem"][];
     };
   };
@@ -81,16 +144,16 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
-  handle_list: {
+  list_keys: {
     parameters: {
       query?: {
-        /** @description Namespace 0-15, default 0 */
+        /** @description Namespace (0–15). Defaults to 0. */
         ns?: number;
-        /** @description Filter keys by prefix */
+        /** @description Return only keys that begin with this string. Percent-encoded. Omit to return all keys. */
         prefix?: string;
-        /** @description Pagination cursor from a previous response */
+        /** @description Opaque pagination cursor from a previous `ListResponse`. Omit or pass `0` to start from the beginning. */
         cursor?: string;
-        /** @description Max keys to return (default 100, max 1000) */
+        /** @description Maximum keys to return per page (1–1000). Defaults to 100. */
         limit?: number;
       };
       header?: never;
@@ -99,7 +162,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description Page of keys */
+      /** @description Page of matching keys in lexicographic order. */
       200: {
         headers: {
           [name: string]: unknown;
@@ -110,31 +173,37 @@ export interface operations {
       };
     };
   };
-  handle_get: {
+  get_value: {
     parameters: {
       query?: {
-        /** @description Namespace 0-15, default 0 */
+        /** @description Namespace (0–15). Namespaces are independent keyspaces. Defaults to 0. */
         ns?: number;
       };
       header?: never;
       path: {
-        /** @description Key to retrieve */
+        /** @description Key to retrieve. Percent-encoded; all bytes are valid except `\0`. */
         key: string;
       };
       cookie?: never;
     };
     requestBody?: never;
     responses: {
-      /** @description Value bytes */
+      /** @description Key found. Value bytes in body. */
       200: {
         headers: {
+          /** @description JSON metadata blob attached to the key. Absent if none was stored. */
+          "X-KV-Metadata"?: string;
+          /** @description Current revision counter. Absent if the key was never written via `If-Match`. */
+          "X-KV-Revision"?: number;
+          /** @description Remaining TTL in whole seconds. Absent if the key has no expiry. */
+          "X-KV-TTL"?: number;
           [name: string]: unknown;
         };
         content: {
           "application/octet-stream": unknown;
         };
       };
-      /** @description Key not found */
+      /** @description Key does not exist in this namespace. */
       404: {
         headers: {
           [name: string]: unknown;
@@ -145,39 +214,44 @@ export interface operations {
       };
     };
   };
-  handle_put: {
+  put_value: {
     parameters: {
       query?: {
-        /** @description Namespace 0-15, default 0 */
+        /** @description Namespace (0–15). Defaults to 0. */
         ns?: number;
-        /** @description Set only if key does not exist (nx=1) */
+        /** @description Set `nx=1` to write only if the key does **not** exist. Mutually exclusive with `xx` and `If-Match`. */
         nx?: number;
-        /** @description Set only if key already exists (xx=1) */
+        /** @description Set `xx=1` to write only if the key **already exists**. Mutually exclusive with `nx` and `If-Match`. */
         xx?: number;
-        /** @description TTL seconds (overridden by X-KV-TTL header) */
+        /** @description Key expiry in seconds from now. Overridden by the `X-KV-TTL` header when both are present. */
         ttl?: number;
       };
       header?: {
-        /** @description Set only if current revision matches */
+        /** @description Write only if the stored revision equals this value. Returns 409 on mismatch. On success, the new revision is in `X-KV-Revision`. */
         "If-Match"?: number | null;
-        /** @description Preserve existing TTL (incompatible with TTL options) */
+        /** @description Key expiry in seconds from now. Takes precedence over the `ttl` query parameter. */
+        "X-KV-TTL"?: number | null;
+        /** @description Set to any value to preserve the existing TTL when overwriting a key. Mutually exclusive with `ttl` / `X-KV-TTL`. */
         "X-KV-KeepTTL"?: string | null;
-        /** @description Return old value atomically (incompatible with conditional writes) */
+        /** @description Set to any value to atomically swap and return the previous value. Returns 200 with the old bytes (or 204 if the key did not exist). Mutually exclusive with conditional writes and `X-KV-KeepTTL`. */
         "X-KV-Return-Old"?: string | null;
+        /** @description Arbitrary JSON value to attach to the key (max 64 KiB serialized). Readable on GET via `X-KV-Metadata`. */
+        "X-KV-Metadata"?: string | null;
       };
       path: {
-        /** @description Key to set */
+        /** @description Key to set. Percent-encoded; all bytes are valid except `\0`. */
         key: string;
       };
       cookie?: never;
     };
+    /** @description Raw bytes to store. Empty body is valid. */
     requestBody?: {
       content: {
         "application/octet-stream": unknown;
       };
     };
     responses: {
-      /** @description Old value (when X-KV-Return-Old is set and key existed) */
+      /** @description Swap succeeded. Body contains the **previous** value (`X-KV-Return-Old` path only). */
       200: {
         headers: {
           [name: string]: unknown;
@@ -186,14 +260,16 @@ export interface operations {
           "application/octet-stream": unknown;
         };
       };
-      /** @description Stored */
+      /** @description Stored. Also returned by `X-KV-Return-Old` when the key did not previously exist. */
       204: {
         headers: {
+          /** @description New revision after a successful `If-Match` write. Absent for unconditional writes. */
+          "X-KV-Revision"?: number;
           [name: string]: unknown;
         };
         content?: never;
       };
-      /** @description Conflicting options */
+      /** @description Incompatible options (e.g. `X-KV-KeepTTL` with a TTL option, or `X-KV-Return-Old` with a conditional write). */
       400: {
         headers: {
           [name: string]: unknown;
@@ -202,7 +278,7 @@ export interface operations {
           "application/json": components["schemas"]["ErrorResponse"];
         };
       };
-      /** @description Conflict (NX/XX or revision mismatch) */
+      /** @description Conditional write failed: key already exists (`nx`), does not exist (`xx`), or revision mismatch (`If-Match`). */
       409: {
         headers: {
           [name: string]: unknown;
@@ -213,32 +289,32 @@ export interface operations {
       };
     };
   };
-  handle_delete: {
+  delete_value: {
     parameters: {
       query?: {
-        /** @description Namespace 0-15, default 0 */
+        /** @description Namespace (0–15). Defaults to 0. */
         ns?: number;
       };
       header?: {
-        /** @description Delete only if current revision matches */
+        /** @description Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched. */
         "If-Match"?: number | null;
       };
       path: {
-        /** @description Key to delete */
+        /** @description Key to delete. Percent-encoded. */
         key: string;
       };
       cookie?: never;
     };
     requestBody?: never;
     responses: {
-      /** @description Deleted (or did not exist) */
+      /** @description Deleted. Also returned when the key did not exist (idempotent). */
       204: {
         headers: {
           [name: string]: unknown;
         };
         content?: never;
       };
-      /** @description Revision mismatch */
+      /** @description Revision mismatch — `If-Match` was supplied but the stored revision differs. */
       409: {
         headers: {
           [name: string]: unknown;
@@ -249,24 +325,24 @@ export interface operations {
       };
     };
   };
-  handle_incr: {
+  increment_value: {
     parameters: {
       query?: {
-        /** @description Namespace 0-15, default 0 */
+        /** @description Namespace (0–15). Defaults to 0. */
         ns?: number;
-        /** @description Increment delta (default 1) */
+        /** @description Amount to add. May be negative for decrement. Defaults to 1. */
         delta?: number;
       };
       header?: never;
       path: {
-        /** @description Counter key */
+        /** @description Counter key. Created as 0 if it does not exist. */
         key: string;
       };
       cookie?: never;
     };
     requestBody?: never;
     responses: {
-      /** @description New counter value */
+      /** @description Increment applied. Body contains the new counter value. */
       200: {
         headers: {
           [name: string]: unknown;
@@ -275,7 +351,7 @@ export interface operations {
           "application/json": components["schemas"]["IncrResponse"];
         };
       };
-      /** @description Stored value is not an integer or overflowed */
+      /** @description Stored value is not a valid decimal integer, or the result would overflow i64. */
       400: {
         headers: {
           [name: string]: unknown;

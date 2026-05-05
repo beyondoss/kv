@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "beyond/kv",
-    "description": "",
+    "description": "Low-latency key-value store with namespaces, TTL, revision-based conditional writes, atomic increment, and cursor-paginated key listing. All keys and values are raw bytes; values are transmitted as `application/octet-stream`. Namespaces (0–15) are independent keyspaces sharing the same physical store.",
     "license": {
       "name": "UNLICENSED",
       "identifier": "UNLICENSED"
@@ -12,13 +12,16 @@
   "paths": {
     "/v1/kv": {
       "get": {
-        "tags": [],
-        "operationId": "handle_list",
+        "tags": [
+          "kv"
+        ],
+        "summary": "List keys in a namespace, optionally filtered by prefix. Results are returned in\nlexicographic order. Pagination is cursor-based: when `complete` is `false`, pass the\nreturned `cursor` value as the `cursor` query parameter on the next request to fetch\nthe subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.\nAcross multiple shards, the cursor encodes per-shard positions so fan-out is handled\ntransparently by the server.",
+        "operationId": "list_keys",
         "parameters": [
           {
             "name": "ns",
             "in": "query",
-            "description": "Namespace 0-15, default 0",
+            "description": "Namespace (0–15). Defaults to 0.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -29,7 +32,7 @@
           {
             "name": "prefix",
             "in": "query",
-            "description": "Filter keys by prefix",
+            "description": "Return only keys that begin with this string. Percent-encoded. Omit to return all keys.",
             "required": false,
             "schema": {
               "type": "string"
@@ -38,7 +41,7 @@
           {
             "name": "cursor",
             "in": "query",
-            "description": "Pagination cursor from a previous response",
+            "description": "Opaque pagination cursor from a previous `ListResponse`. Omit or pass `0` to start from the beginning.",
             "required": false,
             "schema": {
               "type": "string"
@@ -47,7 +50,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Max keys to return (default 100, max 1000)",
+            "description": "Maximum keys to return per page (1–1000). Defaults to 100.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -58,7 +61,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Page of keys",
+            "description": "Page of matching keys in lexicographic order.",
             "content": {
               "application/json": {
                 "schema": {
@@ -72,13 +75,16 @@
     },
     "/v1/kv/{key}": {
       "get": {
-        "tags": [],
-        "operationId": "handle_get",
+        "tags": [
+          "kv"
+        ],
+        "summary": "Fetch the raw bytes stored at `key`. The value is returned as `application/octet-stream`.\nResponse headers carry key metadata: `X-KV-TTL` is the remaining TTL in whole seconds\n(absent when the key has no expiry), `X-KV-Revision` is the current revision counter\n(absent if the key was never written via `If-Match`), and `X-KV-Metadata` is the\nJSON blob attached to the key (absent if none was stored).",
+        "operationId": "get_value",
         "parameters": [
           {
             "name": "key",
             "in": "path",
-            "description": "Key to retrieve",
+            "description": "Key to retrieve. Percent-encoded; all bytes are valid except `\\0`.",
             "required": true,
             "schema": {
               "type": "string"
@@ -87,7 +93,7 @@
           {
             "name": "ns",
             "in": "query",
-            "description": "Namespace 0-15, default 0",
+            "description": "Namespace (0–15). Namespaces are independent keyspaces. Defaults to 0.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -98,13 +104,37 @@
         ],
         "responses": {
           "200": {
-            "description": "Value bytes",
+            "description": "Key found. Value bytes in body.",
+            "headers": {
+              "X-KV-Metadata": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "JSON metadata blob attached to the key. Absent if none was stored."
+              },
+              "X-KV-Revision": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Current revision counter. Absent if the key was never written via `If-Match`."
+              },
+              "X-KV-TTL": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Remaining TTL in whole seconds. Absent if the key has no expiry."
+              }
+            },
             "content": {
               "application/octet-stream": {}
             }
           },
           "404": {
-            "description": "Key not found",
+            "description": "Key does not exist in this namespace.",
             "content": {
               "application/json": {
                 "schema": {
@@ -116,13 +146,17 @@
         }
       },
       "put": {
-        "tags": [],
-        "operationId": "handle_put",
+        "tags": [
+          "kv"
+        ],
+        "summary": "Store raw bytes at `key`. The request body is the value (`application/octet-stream`).",
+        "description": "**Conditional writes** — at most one condition may be active per request:\n- `nx=1` — write only if the key does **not** exist; returns 409 if it does.\n- `xx=1` — write only if the key **already exists**; returns 409 if it does not.\n- `If-Match: <rev>` — write only if the stored revision equals `<rev>`; returns 409\n  on mismatch. On success, the new revision is returned in `X-KV-Revision`.\n\n**TTL** — set `ttl=<seconds>` (query) or `X-KV-TTL: <seconds>` (header; takes\nprecedence). Use `X-KV-KeepTTL: 1` to preserve an existing expiry when overwriting a\nkey; mutually exclusive with any TTL option.\n\n**Atomic read-modify** — `X-KV-Return-Old: 1` returns the previous value (200) in a\nsingle atomic swap; 204 when the key did not exist. Mutually exclusive with all\nconditional-write options.\n\n**Metadata** — `X-KV-Metadata: <json>` attaches an arbitrary JSON value to the key\n(max 64 KiB serialized). Retrievable on GET via `X-KV-Metadata`.",
+        "operationId": "put_value",
         "parameters": [
           {
             "name": "key",
             "in": "path",
-            "description": "Key to set",
+            "description": "Key to set. Percent-encoded; all bytes are valid except `\\0`.",
             "required": true,
             "schema": {
               "type": "string"
@@ -131,7 +165,7 @@
           {
             "name": "ns",
             "in": "query",
-            "description": "Namespace 0-15, default 0",
+            "description": "Namespace (0–15). Defaults to 0.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -142,7 +176,7 @@
           {
             "name": "nx",
             "in": "query",
-            "description": "Set only if key does not exist (nx=1)",
+            "description": "Set `nx=1` to write only if the key does **not** exist. Mutually exclusive with `xx` and `If-Match`.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -153,7 +187,7 @@
           {
             "name": "xx",
             "in": "query",
-            "description": "Set only if key already exists (xx=1)",
+            "description": "Set `xx=1` to write only if the key **already exists**. Mutually exclusive with `nx` and `If-Match`.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -164,7 +198,7 @@
           {
             "name": "ttl",
             "in": "query",
-            "description": "TTL seconds (overridden by X-KV-TTL header)",
+            "description": "Key expiry in seconds from now. Overridden by the `X-KV-TTL` header when both are present.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -175,7 +209,21 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Set only if current revision matches",
+            "description": "Write only if the stored revision equals this value. Returns 409 on mismatch. On success, the new revision is in `X-KV-Revision`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "X-KV-TTL",
+            "in": "header",
+            "description": "Key expiry in seconds from now. Takes precedence over the `ttl` query parameter.",
             "required": false,
             "schema": {
               "type": [
@@ -189,7 +237,7 @@
           {
             "name": "X-KV-KeepTTL",
             "in": "header",
-            "description": "Preserve existing TTL (incompatible with TTL options)",
+            "description": "Set to any value to preserve the existing TTL when overwriting a key. Mutually exclusive with `ttl` / `X-KV-TTL`.",
             "required": false,
             "schema": {
               "type": [
@@ -201,7 +249,19 @@
           {
             "name": "X-KV-Return-Old",
             "in": "header",
-            "description": "Return old value atomically (incompatible with conditional writes)",
+            "description": "Set to any value to atomically swap and return the previous value. Returns 200 with the old bytes (or 204 if the key did not exist). Mutually exclusive with conditional writes and `X-KV-KeepTTL`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "X-KV-Metadata",
+            "in": "header",
+            "description": "Arbitrary JSON value to attach to the key (max 64 KiB serialized). Readable on GET via `X-KV-Metadata`.",
             "required": false,
             "schema": {
               "type": [
@@ -212,22 +272,33 @@
           }
         ],
         "requestBody": {
+          "description": "Raw bytes to store. Empty body is valid.",
           "content": {
             "application/octet-stream": {}
           }
         },
         "responses": {
           "200": {
-            "description": "Old value (when X-KV-Return-Old is set and key existed)",
+            "description": "Swap succeeded. Body contains the **previous** value (`X-KV-Return-Old` path only).",
             "content": {
               "application/octet-stream": {}
             }
           },
           "204": {
-            "description": "Stored"
+            "description": "Stored. Also returned by `X-KV-Return-Old` when the key did not previously exist.",
+            "headers": {
+              "X-KV-Revision": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "New revision after a successful `If-Match` write. Absent for unconditional writes."
+              }
+            }
           },
           "400": {
-            "description": "Conflicting options",
+            "description": "Incompatible options (e.g. `X-KV-KeepTTL` with a TTL option, or `X-KV-Return-Old` with a conditional write).",
             "content": {
               "application/json": {
                 "schema": {
@@ -237,7 +308,7 @@
             }
           },
           "409": {
-            "description": "Conflict (NX/XX or revision mismatch)",
+            "description": "Conditional write failed: key already exists (`nx`), does not exist (`xx`), or revision mismatch (`If-Match`).",
             "content": {
               "application/json": {
                 "schema": {
@@ -249,13 +320,16 @@
         }
       },
       "delete": {
-        "tags": [],
-        "operationId": "handle_delete",
+        "tags": [
+          "kv"
+        ],
+        "summary": "Delete `key` from the store. Idempotent — returns 204 whether or not the key existed.\nSupply `If-Match: <rev>` for a conditional delete: returns 409 if the stored revision\ndoes not match, leaving the key untouched.",
+        "operationId": "delete_value",
         "parameters": [
           {
             "name": "key",
             "in": "path",
-            "description": "Key to delete",
+            "description": "Key to delete. Percent-encoded.",
             "required": true,
             "schema": {
               "type": "string"
@@ -264,7 +338,7 @@
           {
             "name": "ns",
             "in": "query",
-            "description": "Namespace 0-15, default 0",
+            "description": "Namespace (0–15). Defaults to 0.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -275,7 +349,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Delete only if current revision matches",
+            "description": "Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched.",
             "required": false,
             "schema": {
               "type": [
@@ -289,10 +363,10 @@
         ],
         "responses": {
           "204": {
-            "description": "Deleted (or did not exist)"
+            "description": "Deleted. Also returned when the key did not exist (idempotent)."
           },
           "409": {
-            "description": "Revision mismatch",
+            "description": "Revision mismatch — `If-Match` was supplied but the stored revision differs.",
             "content": {
               "application/json": {
                 "schema": {
@@ -306,13 +380,16 @@
     },
     "/v1/kv/{key}/incr": {
       "post": {
-        "tags": [],
-        "operationId": "handle_incr",
+        "tags": [
+          "kv"
+        ],
+        "summary": "Atomically increment a 64-bit signed integer counter stored at `key` by `delta`\n(default 1). If the key does not exist it is initialised to 0 before incrementing.\nReturns the new value. Returns 400 if the stored bytes cannot be interpreted as a\ndecimal integer, or if the operation would overflow i64.",
+        "operationId": "increment_value",
         "parameters": [
           {
             "name": "key",
             "in": "path",
-            "description": "Counter key",
+            "description": "Counter key. Created as 0 if it does not exist.",
             "required": true,
             "schema": {
               "type": "string"
@@ -321,7 +398,7 @@
           {
             "name": "ns",
             "in": "query",
-            "description": "Namespace 0-15, default 0",
+            "description": "Namespace (0–15). Defaults to 0.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -332,7 +409,7 @@
           {
             "name": "delta",
             "in": "query",
-            "description": "Increment delta (default 1)",
+            "description": "Amount to add. May be negative for decrement. Defaults to 1.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -342,7 +419,7 @@
         ],
         "responses": {
           "200": {
-            "description": "New counter value",
+            "description": "Increment applied. Body contains the new counter value.",
             "content": {
               "application/json": {
                 "schema": {
@@ -352,7 +429,7 @@
             }
           },
           "400": {
-            "description": "Stored value is not an integer or overflowed",
+            "description": "Stored value is not a valid decimal integer, or the result would overflow i64.",
             "content": {
               "application/json": {
                 "schema": {
@@ -375,10 +452,12 @@
         ],
         "properties": {
           "error": {
-            "type": "string"
+            "type": "string",
+            "description": "Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,\n`invalid_namespace`, `engine_error`)."
           },
           "message": {
-            "type": "string"
+            "type": "string",
+            "description": "Human-readable description of what went wrong."
           }
         }
       },
@@ -390,7 +469,8 @@
         "properties": {
           "value": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "New counter value after applying the delta."
           }
         }
       },
@@ -401,7 +481,8 @@
         ],
         "properties": {
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "Key name (percent-decoded)."
           }
         }
       },
@@ -413,22 +494,31 @@
         ],
         "properties": {
           "complete": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "`true` when all matching keys have been returned and there are no further pages.\n`false` means a `cursor` is present and more results may be fetched."
           },
           "cursor": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Opaque pagination cursor. Pass as the `cursor` query parameter on the next request\nto fetch the subsequent page. Absent when `complete` is `true`."
           },
           "keys": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/KeyItem"
-            }
+            },
+            "description": "Matching keys in lexicographic order."
           }
         }
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "kv",
+      "description": "Key-value operations: get, put, delete, increment, and list."
+    }
+  ]
 }

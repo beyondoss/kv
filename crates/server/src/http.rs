@@ -253,16 +253,29 @@ async fn route(
     not_found_json("not_found", "endpoint not found")
 }
 
+/// Fetch the raw bytes stored at `key`. The value is returned as `application/octet-stream`.
+/// Response headers carry key metadata: `X-KV-TTL` is the remaining TTL in whole seconds
+/// (absent when the key has no expiry), `X-KV-Revision` is the current revision counter
+/// (absent if the key was never written via `If-Match`), and `X-KV-Metadata` is the
+/// JSON blob attached to the key (absent if none was stored).
 #[utoipa::path(
     get,
     path = "/v1/kv/{key}",
+    operation_id = "get_value",
+    tag = "kv",
     params(
-        ("key" = String, Path, description = "Key to retrieve"),
-        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+        ("key" = String, Path, description = "Key to retrieve. Percent-encoded; all bytes are valid except `\\0`."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Namespaces are independent keyspaces. Defaults to 0."),
     ),
     responses(
-        (status = 200, description = "Value bytes", content_type = "application/octet-stream"),
-        (status = 404, body = ErrorResponse, description = "Key not found"),
+        (status = 200, description = "Key found. Value bytes in body.", content_type = "application/octet-stream",
+            headers(
+                ("X-KV-TTL" = u64, description = "Remaining TTL in whole seconds. Absent if the key has no expiry."),
+                ("X-KV-Revision" = u64, description = "Current revision counter. Absent if the key was never written via `If-Match`."),
+                ("X-KV-Metadata" = String, description = "JSON metadata blob attached to the key. Absent if none was stored."),
+            )
+        ),
+        (status = 404, body = ErrorResponse, description = "Key does not exist in this namespace."),
     )
 )]
 async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
@@ -296,25 +309,51 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
     }
 }
 
+/// Store raw bytes at `key`. The request body is the value (`application/octet-stream`).
+///
+/// **Conditional writes** — at most one condition may be active per request:
+/// - `nx=1` — write only if the key does **not** exist; returns 409 if it does.
+/// - `xx=1` — write only if the key **already exists**; returns 409 if it does not.
+/// - `If-Match: <rev>` — write only if the stored revision equals `<rev>`; returns 409
+///   on mismatch. On success, the new revision is returned in `X-KV-Revision`.
+///
+/// **TTL** — set `ttl=<seconds>` (query) or `X-KV-TTL: <seconds>` (header; takes
+/// precedence). Use `X-KV-KeepTTL: 1` to preserve an existing expiry when overwriting a
+/// key; mutually exclusive with any TTL option.
+///
+/// **Atomic read-modify** — `X-KV-Return-Old: 1` returns the previous value (200) in a
+/// single atomic swap; 204 when the key did not exist. Mutually exclusive with all
+/// conditional-write options.
+///
+/// **Metadata** — `X-KV-Metadata: <json>` attaches an arbitrary JSON value to the key
+/// (max 64 KiB serialized). Retrievable on GET via `X-KV-Metadata`.
 #[utoipa::path(
     put,
     path = "/v1/kv/{key}",
+    operation_id = "put_value",
+    tag = "kv",
     params(
-        ("key" = String, Path, description = "Key to set"),
-        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
-        ("nx" = Option<u8>, Query, description = "Set only if key does not exist (nx=1)"),
-        ("xx" = Option<u8>, Query, description = "Set only if key already exists (xx=1)"),
-        ("ttl" = Option<u64>, Query, description = "TTL seconds (overridden by X-KV-TTL header)"),
-        ("If-Match" = Option<u64>, Header, description = "Set only if current revision matches"),
-        ("X-KV-KeepTTL" = Option<String>, Header, description = "Preserve existing TTL (incompatible with TTL options)"),
-        ("X-KV-Return-Old" = Option<String>, Header, description = "Return old value atomically (incompatible with conditional writes)"),
+        ("key" = String, Path, description = "Key to set. Percent-encoded; all bytes are valid except `\\0`."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+        ("nx" = Option<u8>, Query, description = "Set `nx=1` to write only if the key does **not** exist. Mutually exclusive with `xx` and `If-Match`."),
+        ("xx" = Option<u8>, Query, description = "Set `xx=1` to write only if the key **already exists**. Mutually exclusive with `nx` and `If-Match`."),
+        ("ttl" = Option<u64>, Query, description = "Key expiry in seconds from now. Overridden by the `X-KV-TTL` header when both are present."),
+        ("If-Match" = Option<u64>, Header, description = "Write only if the stored revision equals this value. Returns 409 on mismatch. On success, the new revision is in `X-KV-Revision`."),
+        ("X-KV-TTL" = Option<u64>, Header, description = "Key expiry in seconds from now. Takes precedence over the `ttl` query parameter."),
+        ("X-KV-KeepTTL" = Option<String>, Header, description = "Set to any value to preserve the existing TTL when overwriting a key. Mutually exclusive with `ttl` / `X-KV-TTL`."),
+        ("X-KV-Return-Old" = Option<String>, Header, description = "Set to any value to atomically swap and return the previous value. Returns 200 with the old bytes (or 204 if the key did not exist). Mutually exclusive with conditional writes and `X-KV-KeepTTL`."),
+        ("X-KV-Metadata" = Option<String>, Header, description = "Arbitrary JSON value to attach to the key (max 64 KiB serialized). Readable on GET via `X-KV-Metadata`."),
     ),
-    request_body(content_type = "application/octet-stream"),
+    request_body(content_type = "application/octet-stream", description = "Raw bytes to store. Empty body is valid."),
     responses(
-        (status = 200, description = "Old value (when X-KV-Return-Old is set and key existed)", content_type = "application/octet-stream"),
-        (status = 204, description = "Stored"),
-        (status = 400, body = ErrorResponse, description = "Conflicting options"),
-        (status = 409, body = ErrorResponse, description = "Conflict (NX/XX or revision mismatch)"),
+        (status = 200, description = "Swap succeeded. Body contains the **previous** value (`X-KV-Return-Old` path only).", content_type = "application/octet-stream"),
+        (status = 204, description = "Stored. Also returned by `X-KV-Return-Old` when the key did not previously exist.",
+            headers(
+                ("X-KV-Revision" = u64, description = "New revision after a successful `If-Match` write. Absent for unconditional writes."),
+            )
+        ),
+        (status = 400, body = ErrorResponse, description = "Incompatible options (e.g. `X-KV-KeepTTL` with a TTL option, or `X-KV-Return-Old` with a conditional write)."),
+        (status = 409, body = ErrorResponse, description = "Conditional write failed: key already exists (`nx`), does not exist (`xx`), or revision mismatch (`If-Match`)."),
     )
 )]
 async fn handle_put(
@@ -420,17 +459,22 @@ async fn handle_put(
     }
 }
 
+/// Delete `key` from the store. Idempotent — returns 204 whether or not the key existed.
+/// Supply `If-Match: <rev>` for a conditional delete: returns 409 if the stored revision
+/// does not match, leaving the key untouched.
 #[utoipa::path(
     delete,
     path = "/v1/kv/{key}",
+    operation_id = "delete_value",
+    tag = "kv",
     params(
-        ("key" = String, Path, description = "Key to delete"),
-        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
-        ("If-Match" = Option<u64>, Header, description = "Delete only if current revision matches"),
+        ("key" = String, Path, description = "Key to delete. Percent-encoded."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+        ("If-Match" = Option<u64>, Header, description = "Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched."),
     ),
     responses(
-        (status = 204, description = "Deleted (or did not exist)"),
-        (status = 409, body = ErrorResponse, description = "Revision mismatch"),
+        (status = 204, description = "Deleted. Also returned when the key did not exist (idempotent)."),
+        (status = 409, body = ErrorResponse, description = "Revision mismatch — `If-Match` was supplied but the stored revision differs."),
     )
 )]
 async fn handle_delete(
@@ -462,17 +506,23 @@ async fn handle_delete(
     }
 }
 
+/// Atomically increment a 64-bit signed integer counter stored at `key` by `delta`
+/// (default 1). If the key does not exist it is initialised to 0 before incrementing.
+/// Returns the new value. Returns 400 if the stored bytes cannot be interpreted as a
+/// decimal integer, or if the operation would overflow i64.
 #[utoipa::path(
     post,
     path = "/v1/kv/{key}/incr",
+    operation_id = "increment_value",
+    tag = "kv",
     params(
-        ("key" = String, Path, description = "Counter key"),
-        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
-        ("delta" = Option<i64>, Query, description = "Increment delta (default 1)"),
+        ("key" = String, Path, description = "Counter key. Created as 0 if it does not exist."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+        ("delta" = Option<i64>, Query, description = "Amount to add. May be negative for decrement. Defaults to 1."),
     ),
     responses(
-        (status = 200, body = IncrResponse, description = "New counter value"),
-        (status = 400, body = ErrorResponse, description = "Stored value is not an integer or overflowed"),
+        (status = 200, body = IncrResponse, description = "Increment applied. Body contains the new counter value."),
+        (status = 400, body = ErrorResponse, description = "Stored value is not a valid decimal integer, or the result would overflow i64."),
     )
 )]
 async fn handle_incr(
@@ -491,17 +541,25 @@ async fn handle_incr(
 /// Distinct from the engine's `\x01` continuation cursor so we can detect which format is in use.
 const LIST_CURSOR_PREFIX: u8 = 0x02;
 
+/// List keys in a namespace, optionally filtered by prefix. Results are returned in
+/// lexicographic order. Pagination is cursor-based: when `complete` is `false`, pass the
+/// returned `cursor` value as the `cursor` query parameter on the next request to fetch
+/// the subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.
+/// Across multiple shards, the cursor encodes per-shard positions so fan-out is handled
+/// transparently by the server.
 #[utoipa::path(
     get,
     path = "/v1/kv",
+    operation_id = "list_keys",
+    tag = "kv",
     params(
-        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
-        ("prefix" = Option<String>, Query, description = "Filter keys by prefix"),
-        ("cursor" = Option<String>, Query, description = "Pagination cursor from a previous response"),
-        ("limit" = Option<u64>, Query, description = "Max keys to return (default 100, max 1000)"),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+        ("prefix" = Option<String>, Query, description = "Return only keys that begin with this string. Percent-encoded. Omit to return all keys."),
+        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous `ListResponse`. Omit or pass `0` to start from the beginning."),
+        ("limit" = Option<u64>, Query, description = "Maximum keys to return per page (1–1000). Defaults to 100."),
     ),
     responses(
-        (status = 200, body = ListResponse, description = "Page of keys"),
+        (status = 200, body = ListResponse, description = "Page of matching keys in lexicographic order."),
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -963,20 +1021,27 @@ fn parse_ns(query: &str) -> Result<&'static str, http::Response<HttpBody>> {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[allow(dead_code)]
 struct IncrResponse {
+    /// New counter value after applying the delta.
     value: i64,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[allow(dead_code)]
 struct KeyItem {
+    /// Key name (percent-decoded).
     name: String,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[allow(dead_code)]
 struct ListResponse {
+    /// Matching keys in lexicographic order.
     keys: Vec<KeyItem>,
+    /// `true` when all matching keys have been returned and there are no further pages.
+    /// `false` means a `cursor` is present and more results may be fetched.
     complete: bool,
+    /// Opaque pagination cursor. Pass as the `cursor` query parameter on the next request
+    /// to fetch the subsequent page. Absent when `complete` is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
 }
@@ -984,15 +1049,29 @@ struct ListResponse {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[allow(dead_code)]
 struct ErrorResponse {
+    /// Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,
+    /// `invalid_namespace`, `engine_error`).
     error: String,
+    /// Human-readable description of what went wrong.
     message: String,
 }
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    info(title = "beyond/kv", version = "1"),
+    info(
+        title = "beyond/kv",
+        version = "1",
+        description = "Low-latency key-value store with namespaces, TTL, revision-based \
+            conditional writes, atomic increment, and cursor-paginated key listing. \
+            All keys and values are raw bytes; values are transmitted as \
+            `application/octet-stream`. Namespaces (0–15) are independent keyspaces \
+            sharing the same physical store."
+    ),
     paths(handle_get, handle_put, handle_delete, handle_incr, handle_list),
-    components(schemas(IncrResponse, KeyItem, ListResponse, ErrorResponse))
+    components(schemas(IncrResponse, KeyItem, ListResponse, ErrorResponse)),
+    tags(
+        (name = "kv", description = "Key-value operations: get, put, delete, increment, and list."),
+    )
 )]
 pub struct ApiDoc;
 
