@@ -9,8 +9,10 @@
 //! carries `std::io::Error` which is not always cheaply cloneable across
 //! threads. The originator wraps the message back into a RESP error.
 
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 
 use beyond_kv_engine::store::ShardStore;
 use beyond_kv_engine::types::{Entry, ScanPage};
@@ -19,6 +21,7 @@ use bytes::Bytes;
 use futures_channel::mpsc::{self, Receiver, Sender};
 use futures_channel::oneshot;
 use futures_util::StreamExt;
+use monoio::io::AsyncReadRent;
 
 /// Channel capacity per shard inbox. Sized generously: backpressure on a hot
 /// foreign shard manifests as a slow `await` on the originating connection,
@@ -100,32 +103,78 @@ pub enum CrossShardRequest {
     },
 }
 
-/// Build one channel per shard. `txs[i]` routes requests to shard `i`'s `rxs[i]`.
+/// Build one channel + wakeup pipe per shard.
+///
+/// Returns `(txs, wakeup_writes, rxs, wakeup_reads)`:
+/// - `txs[i]` and `wakeup_writes[i]` go into the shared `Arc<[_]>` so any
+///   shard can send a request and interrupt shard `i`'s io_uring sleep.
+/// - `rxs[i]` and `wakeup_reads[i]` go to worker `i`'s `serve()` call.
 pub fn build_channels(
     n: usize,
 ) -> (
     Vec<Sender<CrossShardRequest>>,
+    Vec<StdUnixStream>,
     Vec<Receiver<CrossShardRequest>>,
+    Vec<StdUnixStream>,
 ) {
     let mut txs = Vec::with_capacity(n);
+    let mut wake_writes = Vec::with_capacity(n);
     let mut rxs = Vec::with_capacity(n);
+    let mut wake_reads = Vec::with_capacity(n);
     for _ in 0..n {
         let (tx, rx) = mpsc::channel(CROSS_SHARD_CHAN_BOUND);
+        let (wake_read, wake_write) =
+            StdUnixStream::pair().expect("cross-shard wakeup unix socket pair");
         txs.push(tx);
+        wake_writes.push(wake_write);
         rxs.push(rx);
+        wake_reads.push(wake_read);
     }
-    (txs, rxs)
+    (txs, wake_writes, rxs, wake_reads)
 }
 
-/// Drain this shard's inbox, spawning each request as its own task so a slow
-/// store op (e.g. cold MGET reads through io_uring) does not block the next
-/// inbound request behind it.
-pub async fn serve(store: Rc<ShardStore>, mut rx: Receiver<CrossShardRequest>) {
-    while let Some(req) = rx.next().await {
-        let store = store.clone();
-        monoio::spawn(async move {
-            handle(store, req).await;
-        });
+/// Drain this shard's cross-shard inbox using the same wakeup-pipe pattern as
+/// the accept loop. The wakeup pipe read-end is registered with io_uring so
+/// that a byte written by a remote shard actually interrupts `io_uring_enter`
+/// — bare futures wakers do NOT wake a sleeping monoio thread.
+pub async fn serve(
+    store: Rc<ShardStore>,
+    mut rx: Receiver<CrossShardRequest>,
+    wakeup_read: StdUnixStream,
+) {
+    if let Err(e) = wakeup_read.set_nonblocking(true) {
+        tracing::error!("cross-shard wakeup set_nonblocking failed: {e}");
+        return;
+    }
+    let mut wakeup = match monoio::net::UnixStream::from_std(wakeup_read) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("failed to register cross-shard wakeup stream: {e}");
+            return;
+        }
+    };
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut buf = vec![0u8; 64];
+    loop {
+        let res;
+        (res, buf) = wakeup.read(buf).await;
+        match res {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        loop {
+            match rx.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(req)) => {
+                    let store = store.clone();
+                    monoio::spawn(async move {
+                        handle(store, req).await;
+                    });
+                }
+                Poll::Ready(None) => return, // all senders dropped → shutdown
+                Poll::Pending => break,      // inbox empty, wait for next wakeup
+            }
+        }
     }
 }
 

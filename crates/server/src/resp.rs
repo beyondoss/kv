@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
@@ -26,6 +26,9 @@ pub struct ConnState {
     pub shard_idx: usize,
     pub n_shards: usize,
     pub cross_shard_txs: Option<ShardSenders>,
+    /// One write-end per shard. Written after each cross-shard `try_send` to
+    /// interrupt the target shard's `io_uring_enter` sleep.
+    pub cross_shard_wakeups: Option<Arc<[StdUnixStream]>>,
 }
 
 impl Default for ConnState {
@@ -37,6 +40,7 @@ impl Default for ConnState {
             shard_idx: 0,
             n_shards: 1,
             cross_shard_txs: None,
+            cross_shard_wakeups: None,
         }
     }
 }
@@ -51,13 +55,24 @@ pub async fn serve(
     shard_idx: usize,
     n_shards: usize,
     cross_shard_txs: ShardSenders,
+    cross_shard_wakeups: Arc<[StdUnixStream]>,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
         let store = store.clone();
         let cross_shard_txs = cross_shard_txs.clone();
+        let cross_shard_wakeups = cross_shard_wakeups.clone();
         monoio::spawn(async move {
             let _guard = guard;
-            handle_conn(s, store, idle_timeout, shard_idx, n_shards, cross_shard_txs).await;
+            handle_conn(
+                s,
+                store,
+                idle_timeout,
+                shard_idx,
+                n_shards,
+                cross_shard_txs,
+                cross_shard_wakeups,
+            )
+            .await;
         });
     })
     .await;
@@ -70,12 +85,14 @@ async fn handle_conn(
     shard_idx: usize,
     n_shards: usize,
     cross_shard_txs: ShardSenders,
+    cross_shard_wakeups: Arc<[StdUnixStream]>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
     let mut state = ConnState {
         shard_idx,
         n_shards,
         cross_shard_txs: Some(cross_shard_txs),
+        cross_shard_wakeups: Some(cross_shard_wakeups),
         ..ConnState::default()
     };
 
@@ -169,11 +186,13 @@ async fn handle_conn(
 
 async fn watch_subscribe_remote(
     txs: &[futures_channel::mpsc::Sender<CrossShardRequest>],
+    wakeups: Option<&[StdUnixStream]>,
     target: usize,
     ns: String,
     filter: OwnedKeyFilter,
     since: u64,
 ) -> Result<(Vec<WatchEvent>, Receiver<WatchEvent>), String> {
+    use std::io::Write as _;
     let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
     let req = CrossShardRequest::WatchSubscribe {
         ns,
@@ -185,6 +204,9 @@ async fn watch_subscribe_remote(
         .clone()
         .try_send(req)
         .map_err(|e| e.to_string())?;
+    if let Some(w) = wakeups.and_then(|ws| ws.get(target)) {
+        let _ = (&*w).write_all(&[1u8]);
+    }
     reply_rx.await.map_err(|e| e.to_string())?
 }
 
@@ -210,6 +232,7 @@ async fn run_key_watch_loop(
         } else if let Some(txs) = state.cross_shard_txs.as_deref() {
             watch_subscribe_remote(
                 txs,
+                state.cross_shard_wakeups.as_deref(),
                 target,
                 state.ns.clone(),
                 OwnedKeyFilter::Exact(key.clone()),
@@ -281,6 +304,7 @@ async fn run_prefix_watch_loop(
         } else if let Some(txs) = state.cross_shard_txs.as_deref() {
             watch_subscribe_remote(
                 txs,
+                state.cross_shard_wakeups.as_deref(),
                 shard,
                 state.ns.clone(),
                 OwnedKeyFilter::Prefix(prefix.clone()),

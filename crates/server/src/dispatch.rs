@@ -1,3 +1,5 @@
+use std::io::Write as _;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
@@ -324,6 +326,17 @@ fn fan_out_txs(state: &ConnState) -> Option<&[futures_channel::mpsc::Sender<Cros
     state.cross_shard_txs.as_deref()
 }
 
+/// Write a single wakeup byte to the target shard's pipe so its `io_uring_enter`
+/// sleep is interrupted. A single-byte write to a unix socket pair is atomic and
+/// effectively instant — it cannot block unless the 64 KiB kernel buffer is full,
+/// which would require thousands of unprocessed wakeups.
+#[inline]
+fn poke_wakeup(wakeups: &[StdUnixStream], shard: usize) {
+    if let Some(w) = wakeups.get(shard) {
+        let _ = (&*w).write_all(&[1u8]);
+    }
+}
+
 /// Bucket the keys by target shard, preserving each key's original index.
 /// Returns `Vec<Option<Vec<(orig_idx, key)>>>` of length `n_shards`.
 fn bucket_by_shard(keys: &[Bytes], n_shards: usize) -> Vec<Option<Vec<(usize, Bytes)>>> {
@@ -344,15 +357,20 @@ async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, S
         Some(txs) => txs,
     };
     let ns = state.ns.clone();
+    let wakeups = state.cross_shard_wakeups.as_deref();
     let futs: Vec<_> = txs
         .iter()
-        .map(|tx| {
+        .enumerate()
+        .map(|(shard, tx)| {
             let (reply_tx, reply_rx) = oneshot::channel();
             let req = CrossShardRequest::DbSize {
                 ns: ns.clone(),
                 reply: reply_tx,
             };
             let _ = tx.clone().try_send(req);
+            if let Some(w) = wakeups {
+                poke_wakeup(w, shard);
+            }
             reply_rx
         })
         .collect();
@@ -370,15 +388,20 @@ async fn dispatch_flushdb(store: &ShardStore, state: &ConnState) -> Result<(), S
         Some(txs) => txs,
     };
     let ns = state.ns.clone();
+    let wakeups = state.cross_shard_wakeups.as_deref();
     let futs: Vec<_> = txs
         .iter()
-        .map(|tx| {
+        .enumerate()
+        .map(|(shard, tx)| {
             let (reply_tx, reply_rx) = oneshot::channel();
             let req = CrossShardRequest::FlushDb {
                 ns: ns.clone(),
                 reply: reply_tx,
             };
             let _ = tx.clone().try_send(req);
+            if let Some(w) = wakeups {
+                poke_wakeup(w, shard);
+            }
             reply_rx
         })
         .collect();
@@ -416,9 +439,11 @@ async fn dispatch_keys(
         Some(txs) => txs,
     };
     let ns = state.ns.clone();
+    let wakeups = state.cross_shard_wakeups.as_deref();
     let futs: Vec<_> = txs
         .iter()
-        .map(|tx| {
+        .enumerate()
+        .map(|(shard, tx)| {
             let (reply_tx, reply_rx) = oneshot::channel();
             let req = CrossShardRequest::AllKeys {
                 ns: ns.clone(),
@@ -426,6 +451,9 @@ async fn dispatch_keys(
                 reply: reply_tx,
             };
             let _ = tx.clone().try_send(req);
+            if let Some(w) = wakeups {
+                poke_wakeup(w, shard);
+            }
             reply_rx
         })
         .collect();
@@ -485,6 +513,9 @@ async fn dispatch_scan(
             reply: reply_tx,
         };
         let _ = txs[target_shard].clone().try_send(req);
+        if let Some(w) = state.cross_shard_wakeups.as_deref() {
+            poke_wakeup(w, target_shard);
+        }
         reply_rx.await.map_err(|e| e.to_string())??
     };
 
@@ -565,6 +596,9 @@ async fn dispatch_mget(
         tx.send(req)
             .await
             .map_err(|_| format!("shard {shard} unavailable"))?;
+        if let Some(w) = state.cross_shard_wakeups.as_deref() {
+            poke_wakeup(w, shard);
+        }
         pending.push(reply_rx);
     }
 
@@ -648,6 +682,9 @@ async fn dispatch_mset(
         tx.send(req)
             .await
             .map_err(|_| format!("shard {shard} unavailable"))?;
+        if let Some(w) = state.cross_shard_wakeups.as_deref() {
+            poke_wakeup(w, shard);
+        }
         pending.push(reply_rx);
     }
 
@@ -715,6 +752,9 @@ async fn dispatch_del(
         tx.send(req)
             .await
             .map_err(|_| format!("shard {shard} unavailable"))?;
+        if let Some(w) = state.cross_shard_wakeups.as_deref() {
+            poke_wakeup(w, shard);
+        }
         pending.push(reply_rx);
     }
 
@@ -789,6 +829,9 @@ async fn dispatch_exists(
         tx.send(req)
             .await
             .map_err(|_| format!("shard {shard} unavailable"))?;
+        if let Some(w) = state.cross_shard_wakeups.as_deref() {
+            poke_wakeup(w, shard);
+        }
         pending.push(reply_rx);
     }
 

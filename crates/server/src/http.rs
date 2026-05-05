@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
@@ -37,10 +38,12 @@ pub async fn serve_routed(
     shard_idx: usize,
     n_shards: usize,
     cross_shard_txs: ShardSenders,
+    cross_shard_wakeups: Arc<[StdUnixStream]>,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "HTTP", |s, _peer, guard| {
         let store = store.clone();
         let txs = cross_shard_txs.clone();
+        let wakeups = cross_shard_wakeups.clone();
         monoio::spawn(async move {
             let _guard = guard;
             handle_conn(
@@ -51,6 +54,7 @@ pub async fn serve_routed(
                 shard_idx,
                 n_shards,
                 txs,
+                wakeups,
             )
             .await;
         });
@@ -66,6 +70,7 @@ async fn handle_conn(
     shard_idx: usize,
     n_shards: usize,
     cross_shard_txs: ShardSenders,
+    cross_shard_wakeups: Arc<[StdUnixStream]>,
 ) {
     // Split so we can keep the write half for SSE streaming later.
     let (r, mut w) = stream.into_split();
@@ -92,7 +97,16 @@ async fn handle_conn(
                 let _ = Sink::send(&mut enc, method_not_allowed()).await;
                 break;
             }
-            handle_watch_sse(&mut w, &store, wp, shard_idx, n_shards, &cross_shard_txs).await;
+            handle_watch_sse(
+                &mut w,
+                &store,
+                wp,
+                shard_idx,
+                n_shards,
+                &cross_shard_txs,
+                &cross_shard_wakeups,
+            )
+            .await;
             return;
         }
 
@@ -434,6 +448,7 @@ async fn handle_watch_sse(
     shard_idx: usize,
     n_shards: usize,
     cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
 ) {
     let headers = b"HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
@@ -471,6 +486,7 @@ async fn handle_watch_sse(
                     let _ = w.write_all(msg.to_vec()).await;
                     return;
                 }
+                let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
                 match reply_rx.await {
                     Ok(r) => r,
                     Err(e) => Err(e.to_string()),

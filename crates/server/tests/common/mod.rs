@@ -106,15 +106,20 @@ impl TestServer {
                         // array so dispatch can short-circuit (n_shards == 1
                         // already triggers the local fast path; this just keeps
                         // the API uniform).
-                        let (txs, mut rxs) = beyond_kv::cross_shard::build_channels(1);
+                        let (txs, wake_writes, mut rxs, mut wake_reads) =
+                            beyond_kv::cross_shard::build_channels(1);
                         let cross_shard_txs: Arc<[_]> = Arc::from(txs);
+                        let cross_shard_wakeups: Arc<[_]> = Arc::from(wake_writes);
                         let cross_store = store.clone();
                         let cross_rx = rxs.remove(0);
+                        let cross_wake_read = wake_reads.remove(0);
                         monoio::spawn(async move {
-                            beyond_kv::cross_shard::serve(cross_store, cross_rx).await;
+                            beyond_kv::cross_shard::serve(cross_store, cross_rx, cross_wake_read)
+                                .await;
                         });
                         let http_store = store.clone();
                         let http_txs = cross_shard_txs.clone();
+                        let http_wakeups = cross_shard_wakeups.clone();
                         monoio::spawn(async move {
                             beyond_kv::http::serve_routed(
                                 http_store,
@@ -126,6 +131,7 @@ impl TestServer {
                                 0,
                                 1,
                                 http_txs,
+                                http_wakeups,
                             )
                             .await;
                         });
@@ -138,6 +144,7 @@ impl TestServer {
                             0,
                             1,
                             cross_shard_txs,
+                            cross_shard_wakeups,
                         )
                         .await;
                     });

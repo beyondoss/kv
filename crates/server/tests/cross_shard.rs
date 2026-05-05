@@ -66,16 +66,24 @@ impl ShardedServer {
             http_inboxes.push((rx, wread));
         }
 
-        let (cross_txs, cross_rxs) = cross_shard::build_channels(N_SHARDS);
+        let (cross_txs, cross_wake_writes, cross_rxs, cross_wake_reads) =
+            cross_shard::build_channels(N_SHARDS);
         let cross_shard_txs: Arc<[_]> = Arc::from(cross_txs);
+        let cross_shard_wakeups: Arc<[_]> = Arc::from(cross_wake_writes);
 
         let iter_data: Vec<_> = (0..N_SHARDS)
             .zip(resp_inboxes)
             .zip(cross_rxs)
+            .zip(cross_wake_reads)
             .zip(http_inboxes)
             .collect();
-        for (((i, (resp_rx, resp_wake_read)), cross_rx), (http_rx, http_wake_read)) in iter_data {
+        for (
+            (((i, (resp_rx, resp_wake_read)), cross_rx), cross_wake_read),
+            (http_rx, http_wake_read),
+        ) in iter_data
+        {
             let cross_shard_txs = cross_shard_txs.clone();
+            let cross_shard_wakeups = cross_shard_wakeups.clone();
             let shard_dir = data_dir.join(format!("shard-{i}"));
             std::thread::Builder::new()
                 .name(format!("kv-test-shard-{i}"))
@@ -89,10 +97,11 @@ impl ShardedServer {
                                 Rc::new(ShardStore::open(&shard_dir, 8 << 20).await.unwrap());
                             let cross_store = store.clone();
                             monoio::spawn(async move {
-                                cross_shard::serve(cross_store, cross_rx).await;
+                                cross_shard::serve(cross_store, cross_rx, cross_wake_read).await;
                             });
                             let http_store = store.clone();
                             let http_txs = cross_shard_txs.clone();
+                            let http_wakeups = cross_shard_wakeups.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -104,6 +113,7 @@ impl ShardedServer {
                                     i,
                                     N_SHARDS,
                                     http_txs,
+                                    http_wakeups,
                                 )
                                 .await;
                             });
@@ -116,6 +126,7 @@ impl ShardedServer {
                                 i,
                                 N_SHARDS,
                                 cross_shard_txs,
+                                cross_shard_wakeups,
                             )
                             .await;
                         });

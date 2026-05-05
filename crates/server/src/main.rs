@@ -175,17 +175,26 @@ fn main() -> anyhow::Result<()> {
     // Cross-shard request channels: one inbox per shard, shared sender array.
     // Senders are cheap to clone; the `Arc<[Sender]>` lets every connection
     // route a sub-request to any shard without taking a lock.
-    let (cross_shard_tx_vec, cross_shard_rx_vec) =
+    //
+    // Each shard also gets a wakeup pipe so a remote sender can interrupt the
+    // target shard's `io_uring_enter` sleep — bare futures wakers cannot do this.
+    let (cross_shard_tx_vec, cross_shard_wake_writes, cross_shard_rx_vec, cross_shard_wake_reads) =
         beyond_kv::cross_shard::build_channels(n_threads);
     let cross_shard_txs: Arc<[_]> = Arc::from(cross_shard_tx_vec);
+    let cross_shard_wakeups: Arc<[_]> = Arc::from(cross_shard_wake_writes);
 
     let handles: Vec<_> = (0..n_threads)
         .zip(worker_inboxes)
         .zip(cross_shard_rx_vec)
+        .zip(cross_shard_wake_reads)
         .map(
-            |((i, (resp_rx, resp_wake_read, http_rx, http_wake_read)), cross_shard_rx)| {
+            |(
+                ((i, (resp_rx, resp_wake_read, http_rx, http_wake_read)), cross_shard_rx),
+                cross_shard_wake_read,
+            )| {
                 let data_dir = data_dir.clone();
                 let cross_shard_txs = cross_shard_txs.clone();
+                let cross_shard_wakeups = cross_shard_wakeups.clone();
                 std::thread::Builder::new()
                     .name(format!("kv-worker-{i}"))
                     .spawn(move || {
@@ -258,6 +267,7 @@ fn main() -> anyhow::Result<()> {
 
                             let http_store = store.clone();
                             let http_txs = cross_shard_txs.clone();
+                            let http_wakeups = cross_shard_wakeups.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -269,6 +279,7 @@ fn main() -> anyhow::Result<()> {
                                     i,
                                     n_threads,
                                     http_txs,
+                                    http_wakeups,
                                 )
                                 .await;
                             });
@@ -278,7 +289,12 @@ fn main() -> anyhow::Result<()> {
                             // other shards, runs them against the local store.
                             let cross_store = store.clone();
                             monoio::spawn(async move {
-                                beyond_kv::cross_shard::serve(cross_store, cross_shard_rx).await;
+                                beyond_kv::cross_shard::serve(
+                                    cross_store,
+                                    cross_shard_rx,
+                                    cross_shard_wake_read,
+                                )
+                                .await;
                             });
 
                             beyond_kv::resp::serve(
@@ -290,6 +306,7 @@ fn main() -> anyhow::Result<()> {
                                 i,
                                 n_threads,
                                 cross_shard_txs,
+                                cross_shard_wakeups,
                             )
                             .await;
 
