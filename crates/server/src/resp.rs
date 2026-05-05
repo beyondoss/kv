@@ -154,8 +154,10 @@ async fn handle_conn(
         if framed.send(response).await.is_err() {
             break;
         }
-        if <_ as Sink<Value>>::flush(&mut framed).await.is_err() {
-            break;
+        if framed.read_buffer().is_empty() {
+            if <_ as Sink<Value>>::flush(&mut framed).await.is_err() {
+                break;
+            }
         }
 
         if state.quit {
