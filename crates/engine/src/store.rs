@@ -71,7 +71,7 @@ impl ShardStore {
             Ok(entries) => {
                 let dirs: Vec<(String, std::path::PathBuf)> = entries
                     .flatten()
-                    .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                     .filter_map(|e| {
                         let name = e.file_name().to_string_lossy().into_owned();
                         if is_valid_ns_name(&name) {
@@ -180,6 +180,7 @@ impl ShardStore {
         Bytes::from(ck)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_cache(
         &self,
         ns: &str,
@@ -266,7 +267,7 @@ impl ShardStore {
                 Some(e) => (*e, idx.ttl(key)),
             }
         };
-        if expires_at_ms.map_or(false, |ms| ms <= now) {
+        if expires_at_ms.is_some_and(|ms| ms <= now) {
             nslog.tombstone(key).await?;
             Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
             return Ok(None);
@@ -390,7 +391,7 @@ impl ShardStore {
                 Some(e) => (*e, idx.ttl(key)),
             }
         };
-        if expires_at_ms.map_or(false, |ms| ms <= now) {
+        if expires_at_ms.is_some_and(|ms| ms <= now) {
             // Lazy delete on read.
             nslog.tombstone(key).await?;
             Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
@@ -450,7 +451,7 @@ impl ShardStore {
                     Some(e) => (*e, idx.ttl(key)),
                 }
             };
-            if ttl.map_or(false, |ms| ms <= now) {
+            if ttl.is_some_and(|ms| ms <= now) {
                 expired_keys.push(key);
                 continue;
             }
@@ -707,7 +708,7 @@ impl ShardStore {
             match lookup {
                 None => return Ok(None),
                 Some((entry, expires_at_ms)) => {
-                    if expires_at_ms.map_or(false, |ms| ms <= now) {
+                    if expires_at_ms.is_some_and(|ms| ms <= now) {
                         nslog.tombstone(key).await?;
                         return Ok(None);
                     }
@@ -938,7 +939,7 @@ impl ShardStore {
                 match idx_entry {
                     None => (None, None, WriteCondition::KeyAbsent),
                     Some((e, rev)) => {
-                        if ttl_ms.map_or(false, |ms| ms <= now) {
+                        if ttl_ms.is_some_and(|ms| ms <= now) {
                             nslog.tombstone(key).await?;
                             Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
                             (None, None, WriteCondition::KeyAbsent)
@@ -1120,7 +1121,7 @@ impl ShardStore {
             .index
             .borrow()
             .scan(resume_after, count as usize, now, |k| {
-                pat.map_or(true, |p| glob_match(p, k))
+                pat.is_none_or(|p| glob_match(p, k))
             });
 
         let next_cursor = match last_key {

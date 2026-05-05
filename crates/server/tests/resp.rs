@@ -1380,8 +1380,8 @@ impl MinResp3 {
     fn read_bulk(&mut self) -> Option<Vec<u8>> {
         use std::io::Read as _;
         let line = self.read_line();
-        if line.starts_with('$') {
-            let n: i64 = line[1..].parse().ok()?;
+        if let Some(stripped) = line.strip_prefix('$') {
+            let n: i64 = stripped.parse().ok()?;
             if n < 0 {
                 return None;
             }

@@ -73,6 +73,7 @@ fn accept_one(
 
 /// Non-blocking accept loop shared by both protocols. Exits when the shutdown
 /// flag is set or a worker channel is permanently disconnected.
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: &TcpListener,
     peek_key: fn(&TcpStream) -> Option<Vec<u8>>,
@@ -151,6 +152,7 @@ fn main() -> anyhow::Result<()> {
     let mut resp_wakeup_writers: Vec<UnixStream> = Vec::with_capacity(n_threads);
     let mut http_senders: Vec<SyncSender<(TcpStream, SocketAddr)>> = Vec::with_capacity(n_threads);
     let mut http_wakeup_writers: Vec<UnixStream> = Vec::with_capacity(n_threads);
+    #[allow(clippy::type_complexity)]
     let mut worker_inboxes: Vec<(
         mpsc::Receiver<(TcpStream, SocketAddr)>,
         UnixStream,

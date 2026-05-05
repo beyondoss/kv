@@ -13,23 +13,13 @@ pub struct Entry {
     pub revision: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SetOptions {
     pub ttl: Option<Duration>,
     pub metadata: Option<Arc<serde_json::Value>>,
     /// When true, preserve the key's existing TTL instead of clearing it.
     /// Implements Redis KEEPTTL semantics: `SET key value KEEPTTL`.
     pub keep_ttl: bool,
-}
-
-impl Default for SetOptions {
-    fn default() -> Self {
-        Self {
-            ttl: None,
-            metadata: None,
-            keep_ttl: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -95,6 +95,7 @@ pub enum CrossShardRequest {
         ns: String,
         filter: OwnedKeyFilter,
         since: u64,
+        #[allow(clippy::type_complexity)]
         reply: oneshot::Sender<Result<(Vec<WatchEvent>, Receiver<WatchEvent>), String>>,
     },
 }

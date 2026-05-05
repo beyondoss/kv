@@ -123,7 +123,7 @@ impl NsIndex {
 
     /// Returns true if `expires_at_ms` is set and is at or before `now_ms`.
     pub fn is_expired(&self, key: &[u8], now_ms: u64) -> bool {
-        self.ttl.get(key).copied().map_or(false, |ms| ms <= now_ms)
+        self.ttl.get(key).copied().is_some_and(|ms| ms <= now_ms)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &IndexEntry)> {
@@ -163,7 +163,7 @@ impl NsIndex {
 
         let has_ttl = !self.ttl.is_empty();
         for (k, _v) in self.map.range::<[u8], _>((start, Bound::Unbounded)) {
-            if has_ttl && self.ttl.get(k).copied().map_or(false, |ms| ms <= now_ms) {
+            if has_ttl && self.ttl.get(k).copied().is_some_and(|ms| ms <= now_ms) {
                 continue;
             }
             if !filter(k) {

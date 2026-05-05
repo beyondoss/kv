@@ -278,10 +278,7 @@ impl LogFile {
     pub async fn append(&self, buf: Vec<u8>) -> Result<(u64, Vec<u8>)> {
         if self.poisoned.get() {
             return Err(EngineError::Io {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "log file poisoned after prior write error",
-                ),
+                source: std::io::Error::other("log file poisoned after prior write error"),
             });
         }
         let len = buf.len() as u64;

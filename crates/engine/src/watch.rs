@@ -43,6 +43,12 @@ pub struct WatchRegistry {
     prefixes: Vec<((Bytes, Bytes), Sender<WatchEvent>)>,
 }
 
+impl Default for WatchRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WatchRegistry {
     pub fn new() -> Self {
         Self {

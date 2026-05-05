@@ -131,6 +131,10 @@ impl NamespaceLog {
         self.index.borrow().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.index.borrow().is_empty()
+    }
+
     pub fn last_revision(&self) -> u64 {
         self.last_tstamp.get()
     }
@@ -621,7 +625,7 @@ impl NamespaceLog {
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .map_or(false, |n| n.starts_with("data-"))
+                        .is_some_and(|n| n.starts_with("data-"))
                 })
                 .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),

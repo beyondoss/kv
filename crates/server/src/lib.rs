@@ -56,33 +56,28 @@ pub(crate) async fn serve_loop(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        loop {
-            match rx.try_recv() {
-                Ok((stream, peer)) => {
-                    if conn_count.get() >= max_conns {
-                        tracing::warn!(
-                            %peer,
-                            limit = max_conns,
-                            "{label} connection limit reached; dropping connection"
-                        );
-                        drop(stream);
-                        continue;
-                    }
-                    if stream.set_nonblocking(true).is_err() {
-                        tracing::error!(%peer, "{label} set_nonblocking failed");
-                        continue;
-                    }
-                    match TcpStream::from_std(stream) {
-                        Ok(s) => {
-                            tracing::debug!(%peer, "accepted {label} connection");
-                            conn_count.set(conn_count.get() + 1);
-                            let guard = ConnGuard(conn_count.clone());
-                            on_conn(s, peer, guard);
-                        }
-                        Err(e) => tracing::error!(%peer, "{label} TcpStream::from_std: {e}"),
-                    }
+        while let Ok((stream, peer)) = rx.try_recv() {
+            if conn_count.get() >= max_conns {
+                tracing::warn!(
+                    %peer,
+                    limit = max_conns,
+                    "{label} connection limit reached; dropping connection"
+                );
+                drop(stream);
+                continue;
+            }
+            if stream.set_nonblocking(true).is_err() {
+                tracing::error!(%peer, "{label} set_nonblocking failed");
+                continue;
+            }
+            match TcpStream::from_std(stream) {
+                Ok(s) => {
+                    tracing::debug!(%peer, "accepted {label} connection");
+                    conn_count.set(conn_count.get() + 1);
+                    let guard = ConnGuard(conn_count.clone());
+                    on_conn(s, peer, guard);
                 }
-                Err(_) => break,
+                Err(e) => tracing::error!(%peer, "{label} TcpStream::from_std: {e}"),
             }
         }
     }

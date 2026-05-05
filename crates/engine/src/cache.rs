@@ -62,6 +62,7 @@ impl MemCache {
 
     /// Returns `(value, expires_at_ms, metadata, revision)` if the key exists and is not expired.
     #[must_use]
+    #[allow(clippy::type_complexity)]
     pub fn get(
         &self,
         key: &[u8],
@@ -70,7 +71,7 @@ impl MemCache {
         let entries = self.entries.borrow();
         let entry = entries.get(key)?;
 
-        if entry.expires_at_ms.map_or(false, |ms| ms <= now_ms) {
+        if entry.expires_at_ms.is_some_and(|ms| ms <= now_ms) {
             let size = entry.size;
             drop(entries);
             self.entries.borrow_mut().remove(key);
@@ -242,7 +243,7 @@ impl MemCache {
         let mut freed = 0usize;
         let mut freed_count = 0usize;
         self.entries.borrow_mut().retain(|_, v| {
-            if v.expires_at_ms.map_or(false, |ms| ms <= now_ms) {
+            if v.expires_at_ms.is_some_and(|ms| ms <= now_ms) {
                 freed += v.size;
                 freed_count += 1;
                 false

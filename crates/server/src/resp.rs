@@ -41,6 +41,7 @@ impl Default for ConnState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     store: Rc<ShardStore>,
     rx: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
@@ -155,10 +156,9 @@ async fn handle_conn(
         if framed.send(response).await.is_err() {
             break;
         }
-        if framed.read_buffer().is_empty() {
-            if <_ as Sink<Value>>::flush(&mut framed).await.is_err() {
-                break;
-            }
+        if framed.read_buffer().is_empty() && <_ as Sink<Value>>::flush(&mut framed).await.is_err()
+        {
+            break;
         }
 
         if state.quit {

@@ -26,6 +26,7 @@ use monoio_http::h1::codec::decoder::RequestDecoder;
 use monoio_http::h1::codec::encoder::GenericEncoder;
 use monoio_http::h1::payload::Payload;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_routed(
     store: Rc<ShardStore>,
     rx: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
@@ -101,7 +102,7 @@ async fn handle_conn(
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
-        if content_len.map_or(false, |n| n > max_value_bytes) {
+        if content_len.is_some_and(|n| n > max_value_bytes) {
             let mut enc = GenericEncoder::new(&mut w);
             let _ = Sink::send(&mut enc, payload_too_large()).await;
             break; // close connection — body not drained

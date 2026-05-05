@@ -1,4 +1,3 @@
-use std::task::Poll;
 use std::time::Duration;
 
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
@@ -253,31 +252,21 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
-        Command::Keys { pattern } => {
-            match dispatch_keys(pattern.map(Bytes::from), store, state).await {
-                Ok(keys) => {
-                    if keys.len() >= KEYS_SCAN_LIMIT {
-                        return r::error(
-                            "ERR",
-                            "KEYS result too large; use SCAN to paginate large keyspaces",
-                        );
-                    }
-                    r::array(keys.into_iter().map(r::bulk).collect())
+        Command::Keys { pattern } => match dispatch_keys(pattern, store, state).await {
+            Ok(keys) => {
+                if keys.len() >= KEYS_SCAN_LIMIT {
+                    return r::error(
+                        "ERR",
+                        "KEYS result too large; use SCAN to paginate large keyspaces",
+                    );
                 }
-                Err(e) => r::error("ERR", &e),
+                r::array(keys.into_iter().map(r::bulk).collect())
             }
-        }
+            Err(e) => r::error("ERR", &e),
+        },
 
         Command::Scan { cursor, args } => {
-            match dispatch_scan(
-                cursor,
-                args.pattern.map(Bytes::from),
-                args.count,
-                store,
-                state,
-            )
-            .await
-            {
+            match dispatch_scan(cursor, args.pattern, args.count, store, state).await {
                 Ok(page) => r::scan_reply(page.next_cursor, page.keys),
                 Err(e) => r::error("ERR", &e),
             }
@@ -370,7 +359,7 @@ async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, S
     let results = join_all(futs).await;
     let mut total = 0u64;
     for r in results {
-        total += r.map_err(|e| e.to_string())?.map_err(|e| e)?;
+        total += r.map_err(|e| e.to_string())??;
     }
     Ok(total)
 }
@@ -816,20 +805,6 @@ async fn dispatch_exists(
         total += r.map_err(|_| "cross-shard reply dropped".to_string())??;
     }
     Ok(total)
-}
-
-async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
 }
 
 fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {

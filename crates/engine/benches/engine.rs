@@ -150,7 +150,8 @@ mod store {
         let pairs: Vec<(Bytes, Bytes)> =
             (0..n).map(|i| (key(i), Bytes::from_static(VAL))).collect();
         bencher.bench_local(move || {
-            black_box(rt.block_on(store.mset("default", &pairs)).unwrap());
+            rt.block_on(store.mset("default", &pairs)).unwrap();
+            black_box(());
         });
     }
 
