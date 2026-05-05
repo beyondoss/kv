@@ -1,54 +1,61 @@
 [tools]
 dprint = "latest"
-node = "22"
+node = "lts"
 rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
 yamlfmt = "latest"
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
 
-[tasks."build"]
+[tasks."build:rs"]
 run = "cargo build"
 
-[tasks."build:release"]
+[tasks."build:rs:release"]
 run = "cargo build --release"
+
+[tasks."build:ts"]
+run = "npm run build"
+dir = "sdk/ts"
+depends = ["generate:types"]
+
+[tasks."check:rs"]
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks."check:ts"]
+run = "npm run typecheck"
+dir = "sdk/ts"
+depends = ["generate:types"]
+
+[tasks."check:fmt"]
+run = "dprint check"
 
 [tasks."format"]
 run = "dprint fmt"
 
-[tasks."test"]
-run = "cargo test --test cross_shard --test http --test resp"
-
-[tasks."test:unit"]
-run = "cargo test --lib"
-
-[tasks."sdk:ts:install"]
+[tasks."install:ts"]
 run = "npm ci"
 dir = "sdk/ts"
 
-[tasks."sdk:ts:typecheck"]
-run = "npm run typecheck"
-dir = "sdk/ts"
-depends = ["sdk:ts:install"]
+[tasks."test:unit:rs"]
+run = "cargo test --lib"
 
-[tasks."sdk:ts:test"]
+[tasks."test:integration:rs"]
+run = "cargo test --test cross_shard --test http --test resp"
+
+[tasks."test:integration:ts"]
 description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
 run = "npm test"
 dir = "sdk/ts"
-depends = ["sdk:ts:install", "build"]
+depends = ["generate:types", "build:rs"]
 
-[tasks."test:all"]
-description = "Run unit, integration (Rust), and TypeScript SDK e2e tests"
-depends = ["test:unit", "test", "sdk:ts:test"]
-
-[tasks."openapi:generate"]
+[tasks."generate:openapi"]
 description = "Generate openapi/v1.json from annotated routes"
 run = "cargo run -p beyond-kv -- generate-openapi"
 
-[tasks."sdk:ts:generate-types"]
+[tasks."generate:types"]
 description = "Generate TypeScript types from the OpenAPI spec"
-depends = ["openapi:generate"]
-dir = "sdk"
 run = "cd ts && node scripts/generate-types.mjs"
+dir = "sdk"
+depends = ["install:ts", "generate:openapi"]
 
 [tasks."bench"]
 run = "cargo bench -p beyond-kv-engine --bench engine"
@@ -59,7 +66,7 @@ run = "cargo bench -p beyond-kv-engine --bench engine -- --sample-count 20"
 # Full honest comparison: Beyond (1 shard) vs Redis, same container, matched
 # durability. batch=100 MGET/MSET sweep gives the latency-throughput curve.
 # Append --shards=N to run Beyond with N worker threads instead.
-[tasks."bench:e2e"]
+[tasks."bench:compare"]
 run = """
 TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 bash crates/bench/docker/run.sh \
@@ -76,7 +83,7 @@ bash crates/bench/docker/run.sh \
 """
 
 # Faster iteration: shorter duration, fewer sweep points, smaller keyspace.
-[tasks."bench:e2e:quick"]
+[tasks."bench:compare:quick"]
 run = """
 bash crates/bench/docker/run.sh \
   --keys 100000 \

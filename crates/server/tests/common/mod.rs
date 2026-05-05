@@ -1,9 +1,7 @@
 #![allow(dead_code)]
+use beyond_kv_engine::store::ShardStore;
 use std::io::Read;
 use std::rc::Rc;
-use std::sync::Arc;
-
-use beyond_kv_engine::store::ShardStore;
 use tempfile::TempDir;
 
 fn wait_for_port(port: u16) {
@@ -35,12 +33,17 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn start() -> Self {
-        // Acquire before binding ports so only one server is live at a time.
+        Self::start_shards(1)
+    }
+
+    /// Start a server with `n_shards` shards (all served by one monoio thread).
+    /// Keys hash to shards by `FxHash(key) % n_shards`; when n > 1 the HTTP
+    /// handler exercises the cross-shard path for foreign-shard keys.
+    pub fn start_shards(n_shards: usize) -> Self {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_owned();
 
-        // Both ports are OS-assigned (port 0) to avoid cross-binary collisions.
         let resp_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let resp_port = resp_listener.local_addr().unwrap().port();
         let http_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
@@ -53,10 +56,9 @@ impl TestServer {
             std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
         let (http_wakeup_read, http_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
 
-        // RESP accept thread.
         std::thread::spawn(move || {
             use std::io::Write as _;
-            let mut wakeup_write = resp_wakeup_write;
+            let mut w = resp_wakeup_write;
             for stream in resp_listener.incoming().flatten() {
                 let peer = match stream.peer_addr() {
                     Ok(p) => p,
@@ -65,16 +67,14 @@ impl TestServer {
                 if resp_tx.send((stream, peer)).is_err() {
                     break;
                 }
-                if wakeup_write.write_all(&[1u8]).is_err() {
+                if w.write_all(&[1u8]).is_err() {
                     break;
                 }
             }
         });
-
-        // HTTP accept thread.
         std::thread::spawn(move || {
             use std::io::Write as _;
-            let mut wakeup_write = http_wakeup_write;
+            let mut w = http_wakeup_write;
             for stream in http_listener.incoming().flatten() {
                 let peer = match stream.peer_addr() {
                     Ok(p) => p,
@@ -83,41 +83,48 @@ impl TestServer {
                 if http_tx.send((stream, peer)).is_err() {
                     break;
                 }
-                if wakeup_write.write_all(&[1u8]).is_err() {
+                if w.write_all(&[1u8]).is_err() {
                     break;
                 }
             }
         });
 
         std::thread::Builder::new()
-            .name(format!("kv-test-{http_port}"))
+            .name(format!("kv-test-shards{n_shards}-{http_port}"))
             .spawn(move || {
                 monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                     .enable_timer()
                     .build()
                     .expect("monoio runtime")
                     .block_on(async move {
-                        let store = Rc::new(
-                            ShardStore::open(&data_dir, 32 << 20)
-                                .await
-                                .expect("ShardStore::open"),
-                        );
-                        // Single-shard test harness: build a one-element sender
-                        // array so dispatch can short-circuit (n_shards == 1
-                        // already triggers the local fast path; this just keeps
-                        // the API uniform).
                         let (txs, wake_writes, mut rxs, mut wake_reads) =
-                            beyond_kv::cross_shard::build_channels(1);
-                        let cross_shard_txs: Arc<[_]> = Arc::from(txs);
-                        let cross_shard_wakeups: Arc<[_]> = Arc::from(wake_writes);
-                        let cross_store = store.clone();
-                        let cross_rx = rxs.remove(0);
-                        let cross_wake_read = wake_reads.remove(0);
-                        monoio::spawn(async move {
-                            beyond_kv::cross_shard::serve(cross_store, cross_rx, cross_wake_read)
-                                .await;
-                        });
-                        let http_store = store.clone();
+                            beyond_kv::cross_shard::build_channels(n_shards);
+                        let cross_shard_txs: std::sync::Arc<[_]> = std::sync::Arc::from(txs);
+                        let cross_shard_wakeups: std::sync::Arc<[_]> =
+                            std::sync::Arc::from(wake_writes);
+
+                        // Open one ShardStore per shard and spawn cross-shard servers.
+                        let mut stores: Vec<Rc<ShardStore>> = Vec::with_capacity(n_shards);
+                        for i in 0..n_shards {
+                            let shard_dir = data_dir.join(format!("shard{i}"));
+                            std::fs::create_dir_all(&shard_dir).unwrap();
+                            let store = Rc::new(
+                                ShardStore::open(&shard_dir, 32 << 20)
+                                    .await
+                                    .expect("ShardStore::open"),
+                            );
+                            let cross_store = store.clone();
+                            let cross_rx = rxs.remove(0);
+                            let cross_wake = wake_reads.remove(0);
+                            monoio::spawn(async move {
+                                beyond_kv::cross_shard::serve(cross_store, cross_rx, cross_wake)
+                                    .await;
+                            });
+                            stores.push(store);
+                        }
+
+                        let resp_store = stores[0].clone();
+                        let http_store = stores[0].clone();
                         let http_txs = cross_shard_txs.clone();
                         let http_wakeups = cross_shard_wakeups.clone();
                         monoio::spawn(async move {
@@ -129,20 +136,20 @@ impl TestServer {
                                 std::time::Duration::from_secs(60),
                                 64 * 1024 * 1024,
                                 0,
-                                1,
+                                n_shards,
                                 http_txs,
                                 http_wakeups,
                             )
                             .await;
                         });
                         beyond_kv::resp::serve(
-                            store,
+                            resp_store,
                             resp_rx,
                             resp_wakeup_read,
                             10_000,
                             std::time::Duration::from_secs(60),
                             0,
-                            1,
+                            n_shards,
                             cross_shard_txs,
                             cross_shard_wakeups,
                         )
@@ -286,6 +293,7 @@ pub struct KvResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub ttl: Option<u64>,
+    pub ttl_ms: Option<u64>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -445,6 +453,7 @@ fn raw_send(req: ureq::Request, body: &[u8]) -> KvResponse {
 fn read_response(res: ureq::Response) -> KvResponse {
     let status = res.status();
     let ttl = res.header("x-kv-ttl").and_then(|s| s.parse().ok());
+    let ttl_ms = res.header("x-kv-ttl-ms").and_then(|s| s.parse().ok());
     let metadata = res
         .header("x-kv-metadata")
         .and_then(|s| serde_json::from_str(s).ok());
@@ -454,6 +463,7 @@ fn read_response(res: ureq::Response) -> KvResponse {
         status,
         body,
         ttl,
+        ttl_ms,
         metadata,
     }
 }

@@ -43,7 +43,6 @@
           "kv"
         ],
         "summary": "List keys in a namespace, optionally filtered by prefix. Results are returned in\nlexicographic order. Pagination is cursor-based: when `complete` is `false`, pass the\nreturned `cursor` value as the `cursor` query parameter on the next request to fetch\nthe subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.\nAcross multiple shards, the cursor encodes per-shard positions so fan-out is handled\ntransparently by the server.",
-        "description": "Pass `count=1` to return only the total key count instead of a key listing.",
         "operationId": "list_keys",
         "parameters": [
           {
@@ -85,22 +84,11 @@
               "format": "int64",
               "minimum": 0
             }
-          },
-          {
-            "name": "count",
-            "in": "query",
-            "description": "Set `count=1` to return only the total key count instead of a listing.",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Page of matching keys in lexicographic order. When `count=1` is supplied, returns `{\"count\": N}` instead.",
+            "description": "Page of matching keys in lexicographic order.",
             "content": {
               "application/json": {
                 "schema": {
@@ -235,14 +223,6 @@
                   "minimum": 0
                 },
                 "description": "Remaining TTL in whole seconds. Absent if the key has no expiry."
-              },
-              "X-KV-TTL-MS": {
-                "schema": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "description": "Remaining TTL in milliseconds. Absent if the key has no expiry."
               }
             },
             "content": {
@@ -515,14 +495,6 @@
                   "minimum": 0
                 },
                 "description": "Remaining TTL in whole seconds the deleted entry had. Absent if it had no expiry."
-              },
-              "X-KV-TTL-MS": {
-                "schema": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "description": "Remaining TTL in milliseconds the deleted entry had. Absent if it had no expiry."
               }
             },
             "content": {
@@ -597,14 +569,6 @@
                   "minimum": 0
                 },
                 "description": "Remaining TTL in whole seconds. Absent if no expiry."
-              },
-              "X-KV-TTL-MS": {
-                "schema": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "description": "Remaining TTL in milliseconds. Absent if no expiry."
               }
             }
           },
@@ -734,14 +698,6 @@
                   "minimum": 0
                 },
                 "description": "New remaining TTL in seconds. Absent if persist was requested."
-              },
-              "X-KV-TTL-MS": {
-                "schema": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "description": "New remaining TTL in milliseconds. Absent if persist was requested."
               }
             },
             "content": {

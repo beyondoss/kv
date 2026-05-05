@@ -8,7 +8,7 @@ describe("createKvClient — backend routing", () => {
     const kv = createKvClient({ url: getHttpUrl(), namespace: uniqueNs() });
     const key = uniqueKey();
     await kv.set(key, "http");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(new TextDecoder().decode(entry!.value)).toBe("http");
   });
 
@@ -16,7 +16,7 @@ describe("createKvClient — backend routing", () => {
     const kv = createKvClient({ url: getRespUrl(), db: 0 });
     const key = uniqueKey();
     await kv.set(key, "resp");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(new TextDecoder().decode(entry!.value)).toBe("resp");
   });
 });
@@ -51,7 +51,8 @@ describe("createServerKvClient — environment configuration", () => {
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "server-kv");
-    expect(await kv.get(key)).not.toBeNull();
+    const { data: entry } = await kv.get(key);
+    expect(entry).not.toBeNull();
   });
 
   it("creates a RESP client from a redis:// KV_URL", async () => {
@@ -60,7 +61,8 @@ describe("createServerKvClient — environment configuration", () => {
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "server-resp");
-    expect(await kv.get(key)).not.toBeNull();
+    const { data: entry } = await kv.get(key);
+    expect(entry).not.toBeNull();
   });
 
   it("passes KV_DB to the RESP backend", () => {
@@ -77,6 +79,7 @@ describe("createServerKvClient — environment configuration", () => {
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "namespaced");
-    expect(await kv.get(key)).not.toBeNull();
+    const { data: entry } = await kv.get(key);
+    expect(entry).not.toBeNull();
   });
 });

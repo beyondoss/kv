@@ -49,21 +49,22 @@ await kv.close();
 | Compare+set    | `SETREV key value revision [EX n]`                                                         | `PUT /v1/kv/{key}?ns=N` + `If-Match: <revision>`                       |
 | Delete         | `DEL key`                                                                                  | `DELETE /v1/kv/{key}?ns=N`                                             |
 | Get+delete     | `GETDEL key`                                                                               | `DELETE /v1/kv/{key}?ns=N` + `X-KV-Return-Old: 1`                      |
-| Exists         | `EXISTS key`                                                                               | —                                                                      |
-| Get+set        | `GETSET key value`                                                                         | —                                                                      |
-| Get+expire     | `GETEX key [EX n \| PERSIST]`                                                              | —                                                                      |
+| Exists         | `EXISTS key`                                                                               | `HEAD /v1/kv/{key}?ns=N` (200 / 404)                                   |
+| Get+set        | `GETSET key value`                                                                         | `PUT /v1/kv/{key}?ns=N` + `X-KV-Return-Old: 1`                         |
+| Get+expire     | `GETEX key [EX n \| PERSIST]`                                                              | `PATCH /v1/kv/{key}?ns=N&ttl=n` + `X-KV-Return-Value: 1`               |
 | Increment      | `INCR key` / `INCRBY key n`                                                                | `POST /v1/kv/{key}/incr?ns=N&delta=n`                                  |
 | Decrement      | `DECR key` / `DECRBY key n`                                                                | `POST /v1/kv/{key}/incr?ns=N&delta=-n`                                 |
-| Bulk get       | `MGET k1 k2 ...`                                                                           | parallel requests                                                      |
-| Bulk set       | `MSET k1 v1 k2 v2 ...`                                                                     | parallel requests                                                      |
+| Bulk get       | `MGET k1 k2 ...`                                                                           | `POST /v1/kv/batch?ns=N`                                               |
+| Bulk set       | `MSET k1 v1 k2 v2 ...`                                                                     | `POST /v1/kv/batch?ns=N`                                               |
 | Scan           | `SCAN cursor [MATCH pat] [COUNT n]`                                                        | `GET /v1/kv?ns=N&cursor=0&prefix=p`                                    |
-| Keys           | `KEYS pattern`                                                                             | —                                                                      |
-| TTL (get)      | `TTL key` / `PTTL key`                                                                     | `X-KV-TTL` response header on GET                                      |
-| TTL (set)      | `EXPIRE key n` / `PEXPIRE key ms` / `EXPIREAT key ts` / `PEXPIREAT key ts` / `PERSIST key` | `X-KV-TTL: <seconds>` request header on PUT                            |
+| Keys           | `KEYS pattern`                                                                             | `GET /v1/kv?ns=N&prefix=p` (cursor-paginated)                          |
+| TTL (get)      | `TTL key` / `PTTL key`                                                                     | `X-KV-TTL` response header on GET / HEAD                               |
+| TTL (set)      | `EXPIRE key n` / `PEXPIRE key ms` / `EXPIREAT key ts` / `PEXPIREAT key ts` / `PERSIST key` | `PATCH /v1/kv/{key}?ns=N&ttl=n` (or `ttl_ms`, `ttl_at`, `persist=1`)   |
 | Watch          | `WATCH key ...` / `PWATCH prefix ...` / `UNWATCH`                                          | `GET /v1/watch/{key}?ns=N` (SSE) / `GET /v1/watch?ns=N&prefix=p` (SSE) |
 | Namespace      | `SELECT 0–15`                                                                              | `?ns=N` query param (0=`default`, 1=`db1`, …, 15=`db15`)               |
-| Count          | `DBSIZE`                                                                                   | —                                                                      |
-| Flush          | `FLUSHDB`                                                                                  | —                                                                      |
+| Count          | `DBSIZE`                                                                                   | `GET /v1/kv?ns=N&count=1`                                              |
+| Flush          | `FLUSHDB`                                                                                  | `DELETE /v1/kv?ns=N`                                                   |
+| Compact        | `BGREWRITEAOF`                                                                             | `POST /v1/admin/compact?ns=N`                                          |
 
 TTL is stored as an absolute millisecond timestamp. `EXPIRE`/`PERSIST` update a sidecar map without rewriting the value. Expiry is lazy on access; a background sweep handles L1 eviction.
 

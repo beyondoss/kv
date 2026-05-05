@@ -1,27 +1,35 @@
 import createFetchClient, { type Client } from "openapi-fetch";
 import { createHttpKvClient } from "./http.js";
 import type {
-  KvBatchOp,
-  KvBatchResults,
-  KvCasOptions,
-  KvDeleteOptions,
-  KvEntry,
-  KvListOptions,
-  KvListResult,
-  KvMSetEntry,
-  KvSetOptions,
-  KvWatchEvent,
-  KvWatchOptions,
+  BatchOp,
+  BatchResults,
+  CasOptions,
+  DeleteOptions,
+  Entry,
+  ExpiryOptions,
+  GetAndSetOptions,
+  KvResult,
+  ListOptions,
+  ListResult,
+  MSetEntry,
+  SetOptions,
+  WatchEvent,
+  WatchOptions,
 } from "./kv-types.js";
 import { createRespKvClient } from "./resp.js";
 import type { components, paths } from "./types.js";
 
 export type { components, paths };
-export type { KvCasOptions } from "./kv-types.js";
+export type {
+  CasOptions,
+  ExpiryOptions,
+  GetAndSetOptions,
+  KvResult,
+} from "./kv-types.js";
 export type { operations } from "./types.js";
 
 export interface KvCommandEvent {
-  /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
+  /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`, `"BATCH"`. */
   command: string;
   keyCount: number;
 }
@@ -34,52 +42,77 @@ export interface KvResponseEvent {
 
 /** The KvClient interface — satisfied by both the RESP and HTTP backends. */
 export interface KvClient {
-  get(key: string): Promise<KvEntry | null>;
-  getOrThrow(key: string): Promise<KvEntry>;
+  get(key: string): Promise<KvResult<Entry | null>>;
   set(
     key: string,
     value: string | Uint8Array,
-    opts?: KvSetOptions,
-  ): Promise<void>;
-  delete(key: string, opts?: KvDeleteOptions): Promise<void>;
-  list(opts?: KvListOptions): Promise<KvListResult>;
-  /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: parallel requests. */
-  mget(keys: string[]): Promise<(KvEntry | null)[]>;
-  /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: parallel requests. */
-  mset(entries: KvMSetEntry[]): Promise<void>;
+    opts?: SetOptions,
+  ): Promise<KvResult<void>>;
+  /** Check whether `key` exists without fetching its value. */
+  exists(key: string): Promise<KvResult<boolean>>;
+  /** Atomically set `key` to `value` and return the entry that existed before the write, or `null` if the key was absent. */
+  getAndSet(
+    key: string,
+    value: string | Uint8Array,
+    opts?: GetAndSetOptions,
+  ): Promise<KvResult<Entry | null>>;
+  /**
+   * Update the TTL of `key` without changing its value. Exactly one TTL option must be supplied.
+   * Returns `null` when `returnValue` is false (default), or the current `Entry` when `returnValue` is true.
+   * Returns a 404 error if the key does not exist.
+   */
+  expire(key: string, opts: ExpiryOptions): Promise<KvResult<Entry | null>>;
+  /**
+   * Delete `key` and return the entry that existed before deletion.
+   * Returns `null` if the key was absent.
+   */
+  delete(
+    key: string,
+    opts: DeleteOptions & { returnOld: true },
+  ): Promise<KvResult<Entry | null>>;
+  /** Delete `key`. Idempotent — returns void whether or not the key existed. */
+  delete(key: string, opts?: DeleteOptions): Promise<KvResult<void>>;
+  list(opts?: ListOptions): Promise<KvResult<ListResult>>;
+  /** Return the total number of keys in the namespace. */
+  count(): Promise<KvResult<number>>;
+  /** Delete all keys in the namespace. Idempotent. */
+  flush(): Promise<KvResult<void>>;
+  /** Trigger a background log compaction (equivalent to BGREWRITEAOF). Returns immediately. */
+  compact(): Promise<KvResult<void>>;
+  /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: batch request. */
+  multiGet(keys: string[]): Promise<KvResult<(Entry | null)[]>>;
+  /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: batch request. */
+  multiSet(entries: MSetEntry[]): Promise<KvResult<void>>;
   /**
    * Atomically increment the integer stored at `key` by `delta` (default 1).
    * Missing keys are treated as 0. Returns the new value.
-   * Throws if the stored value is not a valid integer or if the result would overflow.
    */
-  incr(key: string, delta?: number): Promise<number>;
+  incr(key: string, delta?: number): Promise<KvResult<number>>;
   /**
    * Atomically decrement the integer stored at `key` by `delta` (default 1).
    * Missing keys are treated as 0. Returns the new value.
-   * Throws if the stored value is not a valid integer or if the result would overflow.
    */
-  decr(key: string, delta?: number): Promise<number>;
+  decr(key: string, delta?: number): Promise<KvResult<number>>;
   /**
    * Compare-and-swap: atomically set `key` to `value` only if the stored revision
    * matches `revision`. Returns the new revision on success.
-   * Throws `KvError` (409) if the revision does not match or the key is absent.
+   * Returns error (409) if the revision does not match or the key is absent.
    *
    * Unlike `set(key, value, { ifMatch })`, `cas()` returns the new revision so you
    * can chain CAS operations without an extra `get()` round-trip.
    *
    * @example
    * ```ts
-   * const entry = await kv.get("counter");
-   * const newRev = await kv.cas("counter", "42", entry!.revision);
-   * // newRev is the revision to use for the next CAS
+   * const { data: entry } = await kv.get("counter");
+   * const { data: newRev } = await kv.cas("counter", "42", entry!.revision);
    * ```
    */
   cas(
     key: string,
     value: string | Uint8Array,
     revision: number,
-    opts?: KvCasOptions,
-  ): Promise<number>;
+    opts?: CasOptions,
+  ): Promise<KvResult<number>>;
   /**
    * Atomically fetch and delete `key` in a single operation.
    * Returns the entry that existed before deletion, or `null` if the key was absent.
@@ -87,13 +120,15 @@ export interface KvClient {
    * On the RESP backend this is a best-effort pipeline (REVISION + TTL + GETDEL)
    * rather than a single atomic command; for strict atomicity use the HTTP backend.
    */
-  getAndDelete(key: string): Promise<KvEntry | null>;
+  getAndDelete(key: string): Promise<KvResult<Entry | null>>;
   /**
    * Execute multiple operations in one round-trip.
-   * RESP backend: commands are pipelined. HTTP backend: requests run in parallel.
+   * RESP backend: commands are pipelined. HTTP backend: single batch request.
    * Results are returned in the same order as `ops`.
    */
-  batch<T extends readonly KvBatchOp[]>(ops: T): Promise<KvBatchResults<T>>;
+  batch<T extends readonly BatchOp[]>(
+    ops: T,
+  ): Promise<KvResult<BatchResults<T>>>;
   /**
    * Subscribe to changes on a key or prefix.
    *
@@ -103,7 +138,7 @@ export interface KvClient {
    *
    * Supported on both RESP and HTTP backends.
    */
-  watch(key: string, opts?: KvWatchOptions): AsyncGenerator<KvWatchEvent>;
+  watch(key: string, opts?: WatchOptions): AsyncGenerator<WatchEvent>;
   /** Release underlying connections. Call when the client is no longer needed. */
   close(): Promise<void>;
 }

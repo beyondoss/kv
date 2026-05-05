@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+  "/v1/admin/compact": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Trigger a background log compaction (equivalent to BGREWRITEAOF). Returns immediately;
+     *     compaction runs asynchronously.
+     */
+    post: operations["compact"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/kv": {
     parameters: {
       query?: never;
@@ -18,10 +38,40 @@ export interface paths {
      *     the subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.
      *     Across multiple shards, the cursor encodes per-shard positions so fan-out is handled
      *     transparently by the server.
+     * @description Pass `count=1` to return only the total key count instead of a key listing.
      */
     get: operations["list_keys"];
     put?: never;
     post?: never;
+    /** Delete all keys in the namespace. Returns 204 even if the namespace was already empty. */
+    delete: operations["flush_namespace"];
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/kv/batch": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Execute a batch of mixed key-value operations in a single round-trip. Operations are
+     *     executed in order and results are returned in the same order. There is no cross-operation
+     *     atomicity guarantee — each operation is individually atomic.
+     * @description Supported operations:
+     *     - `get`: returns `{"value":"<base64url>","revision":N,"ttl":N,"metadata":{...}}` or `null` if not found
+     *     - `set`: stores a value; returns `null`
+     *     - `delete`: removes a key; returns `null`
+     *     - `incr`: atomically increments a counter; returns `{"value":N}`
+     *
+     *     Set values and get results are base64url-encoded (no padding), matching the SSE watch format.
+     */
+    post: operations["batch"];
     delete?: never;
     options?: never;
     head?: never;
@@ -66,13 +116,33 @@ export interface paths {
     post?: never;
     /**
      * Delete `key` from the store. Idempotent — returns 204 whether or not the key existed.
-     *     Supply `If-Match: <rev>` for a conditional delete: returns 409 if the stored revision
-     *     does not match, leaving the key untouched.
+     * @description **Conditional delete** — supply `If-Match: <rev>`: returns 409 if the stored revision
+     *     does not match, leaving the key untouched. Mutually exclusive with `X-KV-Return-Old`.
+     *
+     *     **Atomic read-then-delete** — set `X-KV-Return-Old: 1` to atomically delete the key
+     *     and return its previous value (200) in a single operation. Returns 204 when the key
+     *     did not exist. Mutually exclusive with `If-Match`.
      */
     delete: operations["delete_value"];
     options?: never;
-    head?: never;
-    patch?: never;
+    /**
+     * Check whether `key` exists without fetching its value. Returns key metadata in response
+     *     headers: `X-KV-TTL` (remaining seconds, absent if no expiry), `X-KV-Revision` (absent
+     *     if never written via `If-Match`), and `X-KV-Metadata` (absent if none stored).
+     *     Returns 200 if the key exists, 404 if it does not.
+     */
+    head: operations["head_value"];
+    /**
+     * Modify the TTL of `key` without changing its value. Exactly one TTL option must be
+     *     supplied: `ttl` (seconds from now), `ttl_ms` (millis from now), `ttl_at` (absolute
+     *     unix seconds), `ttl_at_ms` (absolute unix millis), or `persist=1` to remove the TTL.
+     * @description Set `X-KV-Return-Value: 1` to atomically fetch the current value in the same operation
+     *     (GETEX semantics) — the response body is the value bytes and status is 200.
+     *     Without that header the response is 204.
+     *
+     *     Returns 404 if the key does not exist.
+     */
+    patch: operations["patch_ttl"];
     trace?: never;
   };
   "/v1/kv/{key}/incr": {
@@ -101,6 +171,13 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    CountResponse: {
+      /**
+       * Format: int64
+       * @description Total number of keys in the namespace.
+       */
+      count: number;
+    };
     ErrorResponse: {
       /**
        * @description Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,
@@ -144,6 +221,27 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+  compact: {
+    parameters: {
+      query?: {
+        /** @description Namespace (0–15). Defaults to 0. */
+        ns?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Compaction started in the background. */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
   list_keys: {
     parameters: {
       query?: {
@@ -155,6 +253,8 @@ export interface operations {
         cursor?: string;
         /** @description Maximum keys to return per page (1–1000). Defaults to 100. */
         limit?: number;
+        /** @description Set `count=1` to return only the total key count instead of a listing. */
+        count?: number;
       };
       header?: never;
       path?: never;
@@ -162,13 +262,69 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description Page of matching keys in lexicographic order. */
+      /** @description Page of matching keys in lexicographic order. When `count=1` is supplied, returns `{"count": N}` instead. */
       200: {
         headers: {
           [name: string]: unknown;
         };
         content: {
           "application/json": components["schemas"]["ListResponse"];
+        };
+      };
+    };
+  };
+  flush_namespace: {
+    parameters: {
+      query?: {
+        /** @description Namespace (0–15). Defaults to 0. */
+        ns?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description All keys deleted (idempotent). */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  batch: {
+    parameters: {
+      query?: {
+        /** @description Namespace (0–15). Defaults to 0. */
+        ns?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** @description Array of operations. */
+    requestBody?: {
+      content: {
+        "application/json": unknown;
+      };
+    };
+    responses: {
+      /** @description Array of results in the same order as the request. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Malformed request body. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
         };
       };
     };
@@ -197,6 +353,8 @@ export interface operations {
           "X-KV-Revision"?: number;
           /** @description Remaining TTL in whole seconds. Absent if the key has no expiry. */
           "X-KV-TTL"?: number;
+          /** @description Remaining TTL in milliseconds. Absent if the key has no expiry. */
+          "X-KV-TTL-MS"?: number;
           [name: string]: unknown;
         };
         content: {
@@ -296,8 +454,10 @@ export interface operations {
         ns?: number;
       };
       header?: {
-        /** @description Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched. */
+        /** @description Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched. Mutually exclusive with `X-KV-Return-Old`. */
         "If-Match"?: number | null;
+        /** @description Set to any value to atomically delete and return the previous value (200). Returns 204 when the key did not exist. Mutually exclusive with `If-Match`. */
+        "X-KV-Return-Old"?: string | null;
       };
       path: {
         /** @description Key to delete. Percent-encoded. */
@@ -307,7 +467,24 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description Deleted. Also returned when the key did not exist (idempotent). */
+      /** @description Key deleted. Body contains the previous value (`X-KV-Return-Old` path only). */
+      200: {
+        headers: {
+          /** @description JSON metadata blob the deleted entry had. Absent if none was stored. */
+          "X-KV-Metadata"?: string;
+          /** @description Revision of the deleted entry. */
+          "X-KV-Revision"?: number;
+          /** @description Remaining TTL in whole seconds the deleted entry had. Absent if it had no expiry. */
+          "X-KV-TTL"?: number;
+          /** @description Remaining TTL in milliseconds the deleted entry had. Absent if it had no expiry. */
+          "X-KV-TTL-MS"?: number;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/octet-stream": unknown;
+        };
+      };
+      /** @description Deleted (or key did not exist — idempotent). */
       204: {
         headers: {
           [name: string]: unknown;
@@ -322,6 +499,115 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["ErrorResponse"];
         };
+      };
+    };
+  };
+  head_value: {
+    parameters: {
+      query?: {
+        /** @description Namespace (0–15). Defaults to 0. */
+        ns?: number;
+      };
+      header?: never;
+      path: {
+        /** @description Key to check. Percent-encoded. */
+        key: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Key exists. Metadata in headers; no body. */
+      200: {
+        headers: {
+          /** @description JSON metadata blob. Absent if none was stored. */
+          "X-KV-Metadata"?: string;
+          /** @description Current revision counter. Absent if never written via `If-Match`. */
+          "X-KV-Revision"?: number;
+          /** @description Remaining TTL in whole seconds. Absent if no expiry. */
+          "X-KV-TTL"?: number;
+          /** @description Remaining TTL in milliseconds. Absent if no expiry. */
+          "X-KV-TTL-MS"?: number;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Key does not exist. */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  patch_ttl: {
+    parameters: {
+      query?: {
+        /** @description Namespace (0–15). Defaults to 0. */
+        ns?: number;
+        /** @description New TTL in seconds from now. */
+        ttl?: number;
+        /** @description New TTL in milliseconds from now. */
+        ttl_ms?: number;
+        /** @description Absolute expiry as a Unix timestamp in seconds. */
+        ttl_at?: number;
+        /** @description Absolute expiry as a Unix timestamp in milliseconds. */
+        ttl_at_ms?: number;
+        /** @description Set `persist=1` to remove the TTL entirely. */
+        persist?: number;
+      };
+      header?: {
+        /** @description Set to any value to return the current value bytes in the response body (GETEX semantics). */
+        "X-KV-Return-Value"?: string | null;
+      };
+      path: {
+        /** @description Key to update. Percent-encoded. */
+        key: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description TTL updated. Body contains the current value (`X-KV-Return-Value` path only). */
+      200: {
+        headers: {
+          /** @description JSON metadata. Absent if none stored. */
+          "X-KV-Metadata"?: string;
+          /** @description Current revision. Absent if key was never written via `If-Match`. */
+          "X-KV-Revision"?: number;
+          /** @description New remaining TTL in seconds. Absent if persist was requested. */
+          "X-KV-TTL"?: number;
+          /** @description New remaining TTL in milliseconds. Absent if persist was requested. */
+          "X-KV-TTL-MS"?: number;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/octet-stream": unknown;
+        };
+      };
+      /** @description TTL updated. No body. */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description No TTL option supplied, or multiple supplied. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ErrorResponse"];
+        };
+      };
+      /** @description Key does not exist. */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
       };
     };
   };

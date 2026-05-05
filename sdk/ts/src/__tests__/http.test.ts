@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { KvClient } from "../client.js";
-import { KvError, KvNotFoundError } from "../errors.js";
-import type { KvWatchEvent } from "../kv-types.js";
-import type { KvWatchOptions } from "../kv-types.js";
+import { KvError } from "../errors.js";
+import type { WatchEvent } from "../kv-types.js";
+import type { WatchOptions } from "../kv-types.js";
 import {
   dec,
   enc,
@@ -17,14 +17,15 @@ import {
 describe("HTTP backend — get / set / delete", () => {
   it("get returns null for a missing key", async () => {
     const kv = httpClient();
-    expect(await kv.get(uniqueKey())).toBeNull();
+    const { data: entry } = await kv.get(uniqueKey());
+    expect(entry).toBeNull();
   });
 
   it("get returns the stored value", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "hello");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry).not.toBeNull();
     expect(dec(entry!.value)).toBe("hello");
   });
@@ -34,7 +35,7 @@ describe("HTTP backend — get / set / delete", () => {
     const key = uniqueKey();
     const bytes = new Uint8Array([0, 1, 127, 128, 255]);
     await kv.set(key, bytes);
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry?.value).toEqual(bytes);
   });
 
@@ -42,7 +43,7 @@ describe("HTTP backend — get / set / delete", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v", { ttl: 60 });
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
   });
@@ -51,7 +52,7 @@ describe("HTTP backend — get / set / delete", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeUndefined();
   });
 
@@ -60,7 +61,7 @@ describe("HTTP backend — get / set / delete", () => {
     const key = uniqueKey();
     const meta = { region: "us-east-1", version: 42 };
     await kv.set(key, "v", { metadata: meta });
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry?.metadata).toEqual(meta);
   });
 
@@ -69,8 +70,7 @@ describe("HTTP backend — get / set / delete", () => {
     const key = uniqueKey();
     await kv.set(key, "first");
     await kv.set(key, "second");
-    const entry = await kv.get(key);
-    expect(dec(entry!.value)).toBe("second");
+    expect(dec((await kv.get(key)).data!.value)).toBe("second");
   });
 
   it("delete removes a key", async () => {
@@ -78,87 +78,72 @@ describe("HTTP backend — get / set / delete", () => {
     const key = uniqueKey();
     await kv.set(key, "v");
     await kv.delete(key);
-    expect(await kv.get(key)).toBeNull();
+    const { data: entry } = await kv.get(key);
+    expect(entry).toBeNull();
   });
 
   it("delete on a missing key does not throw", async () => {
     const kv = httpClient();
-    await expect(kv.delete(uniqueKey())).resolves.toBeUndefined();
-  });
-});
-
-describe("HTTP backend — getOrThrow", () => {
-  it("throws KvNotFoundError for a missing key", async () => {
-    const kv = httpClient();
-    const key = uniqueKey();
-    await expect(kv.getOrThrow(key)).rejects.toSatisfy(
-      (e) => e instanceof KvNotFoundError && e.key === key && e.status === 404,
-    );
-  });
-
-  it("returns the entry for an existing key", async () => {
-    const kv = httpClient();
-    const key = uniqueKey();
-    await kv.set(key, "found");
-    const entry = await kv.getOrThrow(key);
-    expect(dec(entry.value)).toBe("found");
+    const { error: delErr } = await kv.delete(uniqueKey());
+    expect(delErr).toBeUndefined();
   });
 });
 
 describe("HTTP backend — ifAbsent / ifPresent", () => {
   it("ifAbsent succeeds on a missing key", async () => {
     const kv = httpClient();
-    await expect(kv.set(uniqueKey(), "v", { ifAbsent: true })).resolves
-      .toBeUndefined();
+    const { error } = await kv.set(uniqueKey(), "v", { ifAbsent: true });
+    expect(error).toBeUndefined();
   });
 
   it("ifAbsent throws KvError(409) when the key already exists", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "original");
-    await expect(kv.set(key, "new", { ifAbsent: true })).rejects.toSatisfy(
-      (e) => e instanceof KvError && e.status === 409,
+    const { error } = await kv.set(key, "new", { ifAbsent: true });
+    expect(error).toSatisfy(
+      (e: unknown) => e instanceof KvError && (e as KvError).status === 409,
     );
-    expect(dec((await kv.get(key))!.value)).toBe("original");
+    expect(dec((await kv.get(key)).data!.value)).toBe("original");
   });
 
   it("ifPresent succeeds when the key exists", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "old");
-    await expect(kv.set(key, "new", { ifPresent: true })).resolves
-      .toBeUndefined();
-    expect(dec((await kv.get(key))!.value)).toBe("new");
+    const { error } = await kv.set(key, "new", { ifPresent: true });
+    expect(error).toBeUndefined();
+    expect(dec((await kv.get(key)).data!.value)).toBe("new");
   });
 
   it("ifPresent throws KvError(409) when the key does not exist", async () => {
     const kv = httpClient();
-    await expect(kv.set(uniqueKey(), "v", { ifPresent: true })).rejects
-      .toSatisfy(
-        (e) => e instanceof KvError && e.status === 409,
-      );
+    const { error } = await kv.set(uniqueKey(), "v", { ifPresent: true });
+    expect(error).toSatisfy(
+      (e: unknown) => e instanceof KvError && (e as KvError).status === 409,
+    );
   });
 });
 
 describe("HTTP backend — list", () => {
   it("returns an empty result for an empty namespace", async () => {
-    const kv = httpClient();
-    const result = await kv.list();
-    expect(result.keys).toHaveLength(0);
-    expect(result.nextCursor).toBeUndefined();
+    const kv = httpClient("db15"); // reserved: no other test writes to db15
+    const { data: result } = await kv.list();
+    expect(result!.keys).toHaveLength(0);
+    expect(result!.nextCursor).toBeUndefined();
   });
 
   it("returns all keys inserted into the namespace", async () => {
     const kv = httpClient();
     const keys = [uniqueKey("a"), uniqueKey("b"), uniqueKey("c")];
-    await kv.mset(keys.map((key) => ({ key, value: "v" })));
+    await kv.multiSet(keys.map((key) => ({ key, value: "v" })));
 
-    const result = await kv.list();
-    const names = result.keys.map((k) => k.name);
+    const { data: result } = await kv.list();
+    const names = result!.keys.map((k) => k.name);
     for (const key of keys) {
       expect(names).toContain(key);
     }
-    expect(result.nextCursor).toBeUndefined();
+    expect(result!.nextCursor).toBeUndefined();
   });
 
   it("filters by prefix", async () => {
@@ -166,10 +151,12 @@ describe("HTTP backend — list", () => {
     const prefix = `pfx:${crypto.randomUUID()}`;
     const matching = [`${prefix}:a`, `${prefix}:b`];
     const other = [uniqueKey("other")];
-    await kv.mset([...matching, ...other].map((key) => ({ key, value: "v" })));
+    await kv.multiSet(
+      [...matching, ...other].map((key) => ({ key, value: "v" })),
+    );
 
-    const result = await kv.list({ prefix });
-    const names = result.keys.map((k) => k.name);
+    const { data: result } = await kv.list({ prefix });
+    const names = result!.keys.map((k) => k.name);
     expect(names.sort()).toEqual(matching.sort());
   });
 
@@ -178,19 +165,19 @@ describe("HTTP backend — list", () => {
     const prefix = `page:${crypto.randomUUID()}`;
     const total = 5;
     const allKeys = Array.from({ length: total }, (_, i) => `${prefix}:${i}`);
-    await kv.mset(allKeys.map((key) => ({ key, value: "v" })));
+    await kv.multiSet(allKeys.map((key) => ({ key, value: "v" })));
 
     const seen: string[] = [];
     let cursor: string | undefined;
 
     do {
-      const page = await kv.list({
+      const { data: page } = await kv.list({
         prefix,
         limit: 2,
         ...(cursor !== undefined ? { cursor } : {}),
       });
-      seen.push(...page.keys.map((k) => k.name));
-      cursor = page.nextCursor;
+      seen.push(...page!.keys.map((k) => k.name));
+      cursor = page!.nextCursor;
     } while (cursor !== undefined);
 
     expect(seen.sort()).toEqual(allKeys.sort());
@@ -203,15 +190,16 @@ describe("HTTP backend — mget / mset", () => {
     const existing = uniqueKey();
     const missing = uniqueKey();
     await kv.set(existing, "hi");
-    const results = await kv.mget([existing, missing]);
+    const { data: results } = await kv.multiGet([existing, missing]);
     expect(results).toHaveLength(2);
-    expect(dec(results[0]!.value)).toBe("hi");
-    expect(results[1]).toBeNull();
+    expect(dec(results![0]!.value)).toBe("hi");
+    expect(results![1]).toBeNull();
   });
 
   it("mget with empty array returns empty array", async () => {
     const kv = httpClient();
-    expect(await kv.mget([])).toEqual([]);
+    const { data: results } = await kv.multiGet([]);
+    expect(results).toEqual([]);
   });
 
   it("mset sets all entries atomically", async () => {
@@ -221,23 +209,24 @@ describe("HTTP backend — mget / mset", () => {
       { key: uniqueKey(), value: "two" },
       { key: uniqueKey(), value: enc("three") },
     ];
-    await kv.mset(entries);
-    const results = await kv.mget(entries.map((e) => e.key));
-    expect(dec(results[0]!.value)).toBe("one");
-    expect(dec(results[1]!.value)).toBe("two");
-    expect(dec(results[2]!.value)).toBe("three");
+    await kv.multiSet(entries);
+    const { data: results } = await kv.multiGet(entries.map((e) => e.key));
+    expect(dec(results![0]!.value)).toBe("one");
+    expect(dec(results![1]!.value)).toBe("two");
+    expect(dec(results![2]!.value)).toBe("three");
   });
 
   it("mset with empty array is a no-op", async () => {
     const kv = httpClient();
-    await expect(kv.mset([])).resolves.toBeUndefined();
+    const { error } = await kv.multiSet([]);
+    expect(error).toBeUndefined();
   });
 
   it("mset respects per-entry ttl", async () => {
     const kv = httpClient();
     const key = uniqueKey();
-    await kv.mset([{ key, value: "v", opts: { ttl: 60 } }]);
-    const entry = await kv.get(key);
+    await kv.multiSet([{ key, value: "v", opts: { ttl: 60 } }]);
+    const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
   });
@@ -245,18 +234,16 @@ describe("HTTP backend — mget / mset", () => {
 
 describe("HTTP backend — namespace isolation", () => {
   it("keys in different namespaces do not overlap", async () => {
-    const nsA = uniqueNs();
-    const nsB = uniqueNs();
     const url = getHttpUrl();
     const { createKvClient } = await import("../client.js");
-    const kvA = createKvClient({ url, namespace: nsA });
-    const kvB = createKvClient({ url, namespace: nsB });
+    const kvA = createKvClient({ url, namespace: "db13" });
+    const kvB = createKvClient({ url, namespace: "db14" });
 
     const key = uniqueKey();
     await kvA.set(key, "in-a");
 
-    expect(await kvB.get(key)).toBeNull();
-    expect(dec((await kvA.get(key))!.value)).toBe("in-a");
+    expect((await kvB.get(key)).data).toBeNull();
+    expect(dec((await kvA.get(key)).data!.value)).toBe("in-a");
   });
 });
 
@@ -369,10 +356,10 @@ describe("HTTP backend — key encoding edge cases", () => {
   ])("round-trips key %s", async (_label, key) => {
     const kv = httpClient();
     await kv.set(key, "v");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry).not.toBeNull();
     expect(dec(entry!.value)).toBe("v");
-    expect(await kv.get(key + "-missing")).toBeNull();
+    expect((await kv.get(key + "-missing")).data).toBeNull();
   });
 });
 
@@ -397,7 +384,8 @@ describe("HTTP backend — timeout", () => {
       retries: 0,
     });
 
-    await expect(kv.get(uniqueKey())).rejects.toThrow();
+    const { error } = await kv.get(uniqueKey());
+    expect(error).toBeDefined();
   });
 });
 
@@ -419,13 +407,13 @@ describe("HTTP backend — close", () => {
 async function watchCollect(
   kv: KvClient,
   key: string,
-  opts: KvWatchOptions,
-  predicate: (events: KvWatchEvent[]) => boolean,
-  act: () => Promise<void>,
-): Promise<KvWatchEvent[]> {
+  opts: WatchOptions,
+  predicate: (events: WatchEvent[]) => boolean,
+  act: () => Promise<unknown>,
+): Promise<WatchEvent[]> {
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 5_000);
-  const events: KvWatchEvent[] = [];
+  const events: WatchEvent[] = [];
 
   let readyResolve!: () => void;
   const readyPromise = new Promise<void>((r) => {
@@ -448,10 +436,10 @@ async function watchCollect(
   return events;
 }
 
-type MutationEvent = Extract<KvWatchEvent, { type: "set" | "del" }>;
-type SetEvent = Extract<KvWatchEvent, { type: "set" }>;
+type MutationEvent = Extract<WatchEvent, { type: "set" | "del" }>;
+type SetEvent = Extract<WatchEvent, { type: "set" }>;
 
-function nonReady(events: KvWatchEvent[]): MutationEvent[] {
+function nonReady(events: WatchEvent[]): MutationEvent[] {
   return events.filter((e): e is MutationEvent => e.type !== "ready");
 }
 
@@ -522,9 +510,9 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => nonReady(evs).some((e) => e.type === "del"),
       async () => kv.delete(key),
     );
-    const delEvent = events.find((
-      e,
-    ): e is Extract<KvWatchEvent, { type: "del" }> => e.type === "del");
+    const delEvent = events.find(
+      (e): e is Extract<WatchEvent, { type: "del" }> => e.type === "del",
+    );
     expect(delEvent).toBeDefined();
     expect(delEvent!.key).toBe(key);
     expect(delEvent!.revision).toBeGreaterThan(0);
@@ -575,7 +563,7 @@ describe("HTTP backend — watch (exact key)", () => {
     const key = uniqueKey();
     const ac = new AbortController();
 
-    const events: KvWatchEvent[] = [];
+    const events: WatchEvent[] = [];
     const watchTask = (async () => {
       for await (const ev of kv.watch(key, { signal: ac.signal })) {
         events.push(ev);
@@ -614,8 +602,8 @@ describe("HTTP backend — watch (exact key)", () => {
       (evs) => evs.some((e) => e.type === "ready"),
       async () => {},
     );
-    const replayed = replayEvents.filter((e): e is SetEvent =>
-      e.type === "set"
+    const replayed = replayEvents.filter(
+      (e): e is SetEvent => e.type === "set",
     );
     expect(replayed.length).toBeGreaterThanOrEqual(1);
     const lastValue = dec(replayed[replayed.length - 1]!.value);
@@ -671,34 +659,34 @@ describe("HTTP backend — incr", () => {
   it("incr on missing key starts at 1", async () => {
     const kv = httpClient();
     const key = uniqueKey();
-    expect(await kv.incr(key)).toBe(1);
+    expect((await kv.incr(key)).data).toBe(1);
   });
 
   it("incr increments an existing value", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "5");
-    expect(await kv.incr(key)).toBe(6);
+    expect((await kv.incr(key)).data).toBe(6);
   });
 
   it("incr with positive delta adds delta", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "10");
-    expect(await kv.incr(key, 5)).toBe(15);
+    expect((await kv.incr(key, 5)).data).toBe(15);
   });
 
   it("incr with negative delta decrements", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "10");
-    expect(await kv.incr(key, -3)).toBe(7);
+    expect((await kv.incr(key, -3)).data).toBe(7);
   });
 
-  it("incr on a non-integer value throws KvError", async () => {
+  it("incr on a non-integer value returns KvError", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, enc("hello"));
-    await expect(kv.incr(key)).rejects.toBeInstanceOf(KvError);
+    expect((await kv.incr(key)).error).toBeInstanceOf(KvError);
   });
 });

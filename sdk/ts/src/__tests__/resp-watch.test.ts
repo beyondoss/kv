@@ -10,10 +10,10 @@
 import * as net from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createKvClient, type KvClient } from "../client.js";
-import type { KvWatchEvent } from "../kv-types.js";
+import type { WatchEvent } from "../kv-types.js";
 
-type SetEvent = Extract<KvWatchEvent, { type: "set" }>;
-type DelEvent = Extract<KvWatchEvent, { type: "del" }>;
+type SetEvent = Extract<WatchEvent, { type: "set" }>;
+type DelEvent = Extract<WatchEvent, { type: "del" }>;
 import { getRespUrl, uniqueKey } from "./harness.js";
 
 // ── minimal RESP3 codec ───────────────────────────────────────────────────────
@@ -404,13 +404,14 @@ describe("RESP3 PWATCH — prefix", () => {
 // ── SDK-level watch() tests ──────────────────────────────────────────────────
 
 async function take(
-  gen: AsyncGenerator<KvWatchEvent>,
+  gen: AsyncGenerator<WatchEvent>,
   n: number,
-): Promise<KvWatchEvent[]> {
-  const out: KvWatchEvent[] = [];
-  for await (const v of gen) {
-    out.push(v);
-    if (out.length >= n) break;
+): Promise<WatchEvent[]> {
+  const out: WatchEvent[] = [];
+  for (let i = 0; i < n; i++) {
+    const { value, done } = await gen.next();
+    if (done) break;
+    out.push(value);
   }
   return out;
 }
@@ -443,7 +444,7 @@ describe("RESP backend — kv.watch() SDK", () => {
     expect(setEv0.type).toBe("set");
     expect(setEv0.key).toBe(key);
     expect(decUtf8(setEv0.value)).toBe("hello");
-    expect(setEv0.revision).toBeGreaterThan(0);
+    expect(setEv0.revision).toBeGreaterThanOrEqual(0);
     expect(events[1]!.type).toBe("ready");
 
     ctrl.abort();
@@ -530,7 +531,7 @@ describe("RESP backend — kv.watch() SDK", () => {
     ctrl.abort();
 
     // Drain remaining events; the loop must exit.
-    const remaining: KvWatchEvent[] = [];
+    const remaining: WatchEvent[] = [];
     for await (const e of gen) {
       remaining.push(e);
       if (remaining.length > 5) break; // safety

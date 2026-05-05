@@ -2,20 +2,33 @@ import Redis from "ioredis";
 import * as net from "node:net";
 
 import type { KvClient, KvRespClientOptions } from "./client.js";
-import { KvError, KvNotFoundError } from "./errors.js";
+import { KvError } from "./errors.js";
 import type {
-  KvBatchOp,
-  KvBatchResults,
-  KvDeleteOptions,
-  KvEntry,
-  KvListOptions,
-  KvListResult,
-  KvMSetEntry,
-  KvSetOptions,
-  KvWatchEvent,
-  KvWatchOptions,
+  BatchOp,
+  BatchResults,
+  BatchSetOpts,
+  CasOptions,
+  DeleteOptions,
+  Entry,
+  ExpiryOptions,
+  GetAndSetOptions,
+  KvResult,
+  ListOptions,
+  ListResult,
+  SetOptions,
+  WatchEvent,
+  WatchOptions,
 } from "./kv-types.js";
 import { makeEntry } from "./kv-types.js";
+
+function toKvError(err: unknown): KvError {
+  if (err instanceof KvError) return err;
+  return new KvError(
+    "internal_error",
+    err instanceof Error ? err.message : String(err),
+    500,
+  );
+}
 
 export function createRespKvClient(opts: KvRespClientOptions): KvClient {
   const redis = new Redis(opts.url, {
@@ -26,8 +39,8 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     lazyConnect: false,
   });
 
-  redis.defineCommand("revision", { lua: "", numberOfKeys: 1 });
-  redis.defineCommand("setrev", { lua: "", numberOfKeys: 1 });
+  (redis as any).addBuiltinCommand("revision");
+  (redis as any).addBuiltinCommand("setrev");
 
   const { onCommand, onResponse } = opts;
 
@@ -50,14 +63,14 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     );
   }
 
-  async function get(key: string): Promise<KvEntry | null> {
+  async function _get(key: string): Promise<Entry | null> {
     return track("GET", 1, async () => {
       const pipeline = redis.pipeline();
       pipeline.getBuffer(key);
       (pipeline as any).revision(key);
       pipeline.ttl(key);
-      const [[, valueBuf], [, revision], [, ttlSecs]] = await pipeline
-        .exec() as [
+      const [[, valueBuf], [, revision], [, ttlSecs]] =
+        (await pipeline.exec()) as [
           [null, Buffer | null],
           [null, number],
           [null, number],
@@ -72,10 +85,10 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     });
   }
 
-  async function set(
+  async function _set(
     key: string,
     value: string | Uint8Array,
-    setOpts?: KvSetOptions,
+    setOpts?: SetOptions,
   ): Promise<void> {
     return track("SET", 1, async () => {
       const buf = value instanceof Uint8Array
@@ -124,213 +137,536 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     });
   }
 
-  return {
-    get,
+  async function _exists(key: string): Promise<boolean> {
+    return track("EXISTS", 1, async () => {
+      const n = await redis.exists(key);
+      return n > 0;
+    });
+  }
 
-    async getOrThrow(key: string): Promise<KvEntry> {
-      const entry = await get(key);
-      if (entry == null) throw new KvNotFoundError(key);
-      return entry;
-    },
+  async function _getAndSet(
+    key: string,
+    value: string | Uint8Array,
+    getAndSetOpts?: GetAndSetOptions,
+  ): Promise<Entry | null> {
+    return track("GETSET", 1, async () => {
+      const buf = value instanceof Uint8Array
+        ? Buffer.from(value)
+        : Buffer.from(value);
 
-    set,
+      const pipeline = redis.pipeline();
+      (pipeline as any).revision(key);
+      pipeline.ttl(key);
+      pipeline.getsetBuffer(key, buf);
+      if (getAndSetOpts?.ttl != null) {
+        pipeline.expire(key, getAndSetOpts.ttl);
+      }
 
-    async incr(key: string, delta: number = 1): Promise<number> {
-      return track("INCR", 1, () => redis.incrby(key, delta));
-    },
+      const results = (await pipeline.exec()) as Array<[Error | null, unknown]>;
+      const oldBuf = results[2]![1] as Buffer | null;
+      if (oldBuf === null) return null;
 
-    async delete(key: string, _opts?: KvDeleteOptions): Promise<void> {
-      return track("DEL", 1, () => redis.del(key).then(() => undefined));
-    },
-
-    async list(listOpts?: KvListOptions): Promise<KvListResult> {
-      return track("SCAN", 1, async () => {
-        const cursor = listOpts?.cursor ?? "0";
-        const count = listOpts?.limit ?? 100;
-        const [scanCursor, keys] = listOpts?.prefix
-          ? await redis.scan(
-            cursor,
-            "MATCH",
-            `${listOpts.prefix}*`,
-            "COUNT",
-            count,
-          )
-          : await redis.scan(cursor, "COUNT", count);
-
-        const done = scanCursor === "0";
-        const result: KvListResult = { keys: keys.map((name) => ({ name })) };
-        if (!done) result.nextCursor = scanCursor;
-        return result;
+      const revision = results[0]![1] as number;
+      const ttlSecs = results[1]![1] as number;
+      return makeEntry({
+        value: new Uint8Array(oldBuf),
+        revision: revision > 0 ? revision : 0,
+        ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
       });
-    },
+    });
+  }
 
-    async mget(keys: string[]): Promise<(KvEntry | null)[]> {
-      if (keys.length === 0) return [];
-      return track("MGET", keys.length, async () => {
-        // Pipeline getBuffer+revision+ttl triples per key so revision and TTL
-        // are returned for each key, matching the behaviour of the single
-        // get() and the HTTP backend.
-        const pipeline = redis.pipeline();
-        for (const key of keys) {
-          pipeline.getBuffer(key);
-          (pipeline as any).revision(key);
-          pipeline.ttl(key);
+  async function _expire(
+    key: string,
+    expireOpts: ExpiryOptions,
+  ): Promise<Entry | null> {
+    return track("EXPIRE", 1, async () => {
+      if (expireOpts.returnValue) {
+        // GETEX: atomically fetch value and update TTL
+        const getexArgs: (string | number)[] = [key];
+        if (expireOpts.persist) {
+          getexArgs.push("PERSIST");
+        } else if (expireOpts.ttl != null) {
+          getexArgs.push("EX", expireOpts.ttl);
+        } else if (expireOpts.ttl_ms != null) {
+          getexArgs.push("PX", expireOpts.ttl_ms);
+        } else if (expireOpts.ttl_at != null) {
+          getexArgs.push("EXAT", expireOpts.ttl_at);
+        } else if (expireOpts.ttl_at_ms != null) {
+          getexArgs.push("PXAT", expireOpts.ttl_at_ms);
         }
-        const results = await pipeline.exec() as Array<
-          [null, Buffer | null | number]
+
+        const pipeline = redis.pipeline();
+        (pipeline as any).getexBuffer(...getexArgs);
+        (pipeline as any).revision(key);
+        pipeline.ttl(key);
+        const results = (await pipeline.exec()) as Array<
+          [Error | null, unknown]
         >;
-        const out: (KvEntry | null)[] = [];
-        for (let i = 0; i < keys.length; i++) {
-          const valueBuf = results[i * 3]![1] as Buffer | null;
-          const revision = results[i * 3 + 1]![1] as number;
-          const ttlSecs = results[i * 3 + 2]![1] as number;
-          if (valueBuf === null) {
-            out.push(null);
-          } else {
-            out.push(makeEntry({
-              value: new Uint8Array(valueBuf),
-              revision: revision > 0 ? revision : 0,
-              ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
-            }));
-          }
+
+        const valueBuf = results[0]![1] as Buffer | null;
+        if (valueBuf === null) {
+          throw new KvError("not_found", `key not found: ${key}`, 404);
         }
-        return out;
+        const revision = results[1]![1] as number;
+        const ttlSecs = results[2]![1] as number;
+        return makeEntry({
+          value: new Uint8Array(valueBuf),
+          revision: revision > 0 ? revision : 0,
+          ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+        });
+      }
+
+      // TTL-only update — check key exists first (EXPIRE returns 0 if missing)
+      let affected: number;
+      if (expireOpts.persist) {
+        affected = await redis.persist(key);
+      } else if (expireOpts.ttl != null) {
+        affected = await redis.expire(key, expireOpts.ttl);
+      } else if (expireOpts.ttl_ms != null) {
+        affected = await redis.pexpire(key, expireOpts.ttl_ms);
+      } else if (expireOpts.ttl_at != null) {
+        affected = await redis.expireat(key, expireOpts.ttl_at);
+      } else if (expireOpts.ttl_at_ms != null) {
+        affected = await redis.pexpireat(key, expireOpts.ttl_at_ms);
+      } else {
+        throw new KvError(
+          "invalid_request",
+          "expire: exactly one TTL option must be supplied",
+          400,
+        );
+      }
+
+      if (affected === 0) {
+        throw new KvError("not_found", `key not found: ${key}`, 404);
+      }
+      return null;
+    });
+  }
+
+  async function _cas(
+    key: string,
+    value: string | Uint8Array,
+    revision: number,
+    _casOpts?: CasOptions,
+  ): Promise<number> {
+    return track("CAS", 1, async () => {
+      const buf = value instanceof Uint8Array
+        ? Buffer.from(value)
+        : Buffer.from(value);
+      const args: (string | Buffer)[] = [key, buf, String(revision)];
+      if (_casOpts?.ttl != null) args.push("EX", String(_casOpts.ttl));
+      try {
+        const newRev = await (redis as any).setrev(...args);
+        return newRev as number;
+      } catch (e: unknown) {
+        if (isConflictError(e)) {
+          throw new KvError("conflict", "revision mismatch", 409);
+        }
+        throw e;
+      }
+    });
+  }
+
+  async function _getAndDelete(key: string): Promise<Entry | null> {
+    return track("GETDEL", 1, async () => {
+      const pipeline = redis.pipeline();
+      (pipeline as any).revision(key);
+      pipeline.ttl(key);
+      pipeline.getdelBuffer(key);
+      const results = (await pipeline.exec()) as [
+        [null, number],
+        [null, number],
+        [null, Buffer | null],
+      ];
+      const valueBuf = results[2]![1];
+      if (valueBuf === null) return null;
+      const revision = results[0]![1] as number;
+      const ttlSecs = results[1]![1] as number;
+      return makeEntry({
+        value: new Uint8Array(valueBuf),
+        revision: revision > 0 ? revision : 0,
+        ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
       });
+    });
+  }
+
+  async function _batch<T extends readonly BatchOp[]>(
+    ops: T,
+  ): Promise<BatchResults<T>> {
+    if (ops.length === 0) return [] as unknown as BatchResults<T>;
+    return track("BATCH", ops.length, async () => {
+      const pipeline = redis.pipeline();
+      const offsets: number[] = [];
+      let offset = 0;
+      for (const op of ops) {
+        offsets.push(offset);
+        if (op.op === "get") {
+          pipeline.getBuffer(op.key);
+          (pipeline as any).revision(op.key);
+          pipeline.ttl(op.key);
+          offset += 3;
+        } else if (op.op === "set") {
+          pipelineSet(pipeline, op.key, op.value, op.opts);
+          offset += 1;
+        } else if (op.op === "delete") {
+          pipeline.del(op.key);
+          offset += 1;
+        } else if (op.op === "exists") {
+          pipeline.exists(op.key);
+          offset += 1;
+        } else {
+          pipeline.incrby(op.key, (op as any).delta ?? 1);
+          offset += 1;
+        }
+      }
+
+      const results = (await pipeline.exec()) as Array<[Error | null, unknown]>;
+
+      return ops.map((op, i) => {
+        const off = offsets[i]!;
+        if (op.op === "get") {
+          const valueBuf = results[off]![1] as Buffer | null;
+          if (valueBuf === null) return null;
+          const revision = results[off + 1]![1] as number;
+          const ttlSecs = results[off + 2]![1] as number;
+          return makeEntry({
+            value: new Uint8Array(valueBuf),
+            revision: revision > 0 ? revision : 0,
+            ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+          });
+        } else if (op.op === "set") {
+          const [err, result] = results[off]!;
+          if (err) {
+            if (isConflictError(err)) {
+              throw new KvError("conflict", "revision mismatch", 409);
+            }
+            if (op.opts?.ifAbsent) {
+              throw new KvError("conflict", "key already exists", 409);
+            }
+            if (op.opts?.ifPresent) {
+              throw new KvError("conflict", "key does not exist", 409);
+            }
+            throw err;
+          }
+          if (result === null) {
+            if (op.opts?.ifAbsent) {
+              throw new KvError("conflict", "key already exists", 409);
+            }
+            if (op.opts?.ifPresent) {
+              throw new KvError("conflict", "key does not exist", 409);
+            }
+          }
+        } else if (op.op === "incr") {
+          const [err, n] = results[off]!;
+          if (err) throw err;
+          return n as number;
+        } else if (op.op === "exists") {
+          const [err, n] = results[off]!;
+          if (err) throw err;
+          return (n as number) > 0;
+        }
+        return undefined;
+      }) as unknown as BatchResults<T>;
+    });
+  }
+
+  // Adds a SET (or SETREV) command to a pipeline, handling all BatchSetOpts.
+  function pipelineSet(
+    pipeline: ReturnType<typeof redis.pipeline>,
+    key: string,
+    value: string | Uint8Array,
+    opts?: BatchSetOpts,
+  ): void {
+    const buf = value instanceof Uint8Array
+      ? Buffer.from(value)
+      : Buffer.from(value);
+    const ttl = opts?.ttl_ms != null ? null : (opts?.ttl ?? null); // ttl_ms takes priority
+    const ttlMs = opts?.ttl_ms ?? null;
+
+    if (opts?.ifMatch != null) {
+      const args: (string | Buffer)[] = [key, buf, String(opts.ifMatch)];
+      if (ttl != null) args.push("EX", String(ttl));
+      (pipeline as any).setrev(...args);
+    } else if (ttlMs != null && opts?.ifAbsent) {
+      pipeline.set(key, buf, "PX", ttlMs, "NX");
+    } else if (ttlMs != null && opts?.ifPresent) {
+      pipeline.set(key, buf, "PX", ttlMs, "XX");
+    } else if (ttlMs != null) {
+      pipeline.set(key, buf, "PX", ttlMs);
+    } else if (ttl != null && opts?.ifAbsent) {
+      pipeline.set(key, buf, "EX", ttl, "NX");
+    } else if (ttl != null && opts?.ifPresent) {
+      pipeline.set(key, buf, "EX", ttl, "XX");
+    } else if (ttl != null) {
+      pipeline.set(key, buf, "EX", ttl);
+    } else if (opts?.ifAbsent) {
+      pipeline.set(key, buf, "NX");
+    } else if (opts?.ifPresent) {
+      pipeline.set(key, buf, "XX");
+    } else {
+      pipeline.set(key, buf);
+    }
+  }
+
+  return {
+    async get(key) {
+      try {
+        return { data: await _get(key), error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
     },
 
-    async mset(entries: KvMSetEntry[]): Promise<void> {
-      if (entries.length === 0) return;
-      return track("MSET", entries.length, async () => {
-        const withTtl = entries.filter((e) => e.opts?.ttl != null);
-        const plain = entries.filter((e) => e.opts?.ttl == null);
-
-        const pipeline = redis.pipeline();
-
-        if (plain.length > 0) {
-          const pairs: (string | Buffer)[] = [];
-          for (const { key, value } of plain) {
-            pairs.push(
-              key,
-              value instanceof Uint8Array
-                ? Buffer.from(value)
-                : Buffer.from(value),
-            );
-          }
-          pipeline.mset(...(pairs as [string, string, ...string[]]));
-        }
-        for (const { key, value, opts } of withTtl) {
-          const buf = value instanceof Uint8Array
-            ? Buffer.from(value)
-            : Buffer.from(value);
-          pipeline.set(key, buf, "EX", opts!.ttl!);
-        }
-
-        await pipeline.exec();
-      });
+    async set(key, value, opts) {
+      try {
+        await _set(key, value, opts);
+        return { data: undefined, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
     },
 
-    async batch<T extends readonly KvBatchOp[]>(
-      ops: T,
-    ): Promise<KvBatchResults<T>> {
-      if (ops.length === 0) return [] as unknown as KvBatchResults<T>;
-      return track("BATCH", ops.length, async () => {
-        const pipeline = redis.pipeline();
-        // Track how many pipeline slots each op occupies (get = 3, others = 1).
-        const offsets: number[] = [];
-        let offset = 0;
-        for (const op of ops) {
-          offsets.push(offset);
-          if (op.op === "get") {
-            pipeline.getBuffer(op.key);
-            (pipeline as any).revision(op.key);
-            pipeline.ttl(op.key);
-            offset += 3;
-          } else if (op.op === "set") {
-            const buf = op.value instanceof Uint8Array
-              ? Buffer.from(op.value)
-              : Buffer.from(op.value);
-            if (op.opts?.ifMatch != null) {
-              const args: (string | Buffer)[] = [
-                op.key,
-                buf,
-                String(op.opts.ifMatch),
-              ];
-              if (op.opts.ttl != null) args.push("EX", String(op.opts.ttl));
-              (pipeline as any).setrev(...args);
-            } else if (op.opts?.ttl != null && op.opts.ifAbsent) {
-              pipeline.set(op.key, buf, "EX", op.opts.ttl, "NX");
-            } else if (op.opts?.ttl != null && op.opts.ifPresent) {
-              pipeline.set(op.key, buf, "EX", op.opts.ttl, "XX");
-            } else if (op.opts?.ttl != null) {
-              pipeline.set(op.key, buf, "EX", op.opts.ttl);
-            } else if (op.opts?.ifAbsent) {
-              pipeline.set(op.key, buf, "NX");
-            } else if (op.opts?.ifPresent) {
-              pipeline.set(op.key, buf, "XX");
+    async exists(key) {
+      try {
+        return { data: await _exists(key), error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async getAndSet(key, value, getAndSetOpts) {
+      try {
+        return {
+          data: await _getAndSet(key, value, getAndSetOpts),
+          error: undefined,
+        };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async expire(key, expireOpts) {
+      try {
+        return { data: await _expire(key, expireOpts), error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async cas(key, value, revision, casOpts) {
+      try {
+        return {
+          data: await _cas(key, value, revision, casOpts),
+          error: undefined,
+        };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async getAndDelete(key) {
+      try {
+        return { data: await _getAndDelete(key), error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async incr(key, delta = 1) {
+      try {
+        const n = await track("INCR", 1, () => redis.incrby(key, delta));
+        return { data: n, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async decr(key, delta = 1) {
+      try {
+        const n = await track("DECR", 1, () => redis.decrby(key, delta));
+        return { data: n, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async delete(key: string, opts?: DeleteOptions) {
+      try {
+        if (opts?.returnOld) {
+          return {
+            data: await _getAndDelete(key),
+            error: undefined,
+          } as KvResult<Entry | null>;
+        }
+        await track("DEL", 1, () => redis.del(key).then(() => undefined));
+        return { data: undefined, error: undefined } as KvResult<void>;
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) } as KvResult<never>;
+      }
+    },
+
+    async list(listOpts?: ListOptions): Promise<KvResult<ListResult>> {
+      try {
+        const result = await track("SCAN", 1, async () => {
+          const cursor = listOpts?.cursor ?? "0";
+          const count = listOpts?.limit ?? 100;
+          const [scanCursor, keys] = listOpts?.prefix
+            ? await redis.scan(
+              cursor,
+              "MATCH",
+              `${listOpts.prefix}*`,
+              "COUNT",
+              count,
+            )
+            : await redis.scan(cursor, "COUNT", count);
+
+          const done = scanCursor === "0";
+          const res: ListResult = { keys: keys.map((name) => ({ name })) };
+          if (!done) res.nextCursor = scanCursor;
+          return res;
+        });
+        return { data: result, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async count() {
+      try {
+        const n = await track("DBSIZE", 1, () => redis.dbsize());
+        return { data: n, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async flush() {
+      try {
+        await track("FLUSHDB", 1, () => redis.flushdb().then(() => undefined));
+        return { data: undefined, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async compact() {
+      try {
+        await track(
+          "BGREWRITEAOF",
+          1,
+          () => redis.bgrewriteaof().then(() => undefined),
+        );
+        return { data: undefined, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async multiGet(keys) {
+      if (keys.length === 0) return { data: [], error: undefined };
+      try {
+        const result = await track("MGET", keys.length, async () => {
+          const pipeline = redis.pipeline();
+          for (const key of keys) {
+            pipeline.getBuffer(key);
+            (pipeline as any).revision(key);
+            pipeline.ttl(key);
+          }
+          const results = (await pipeline.exec()) as Array<
+            [null, Buffer | null | number]
+          >;
+          const out: (Entry | null)[] = [];
+          for (let i = 0; i < keys.length; i++) {
+            const valueBuf = results[i * 3]![1] as Buffer | null;
+            const revision = results[i * 3 + 1]![1] as number;
+            const ttlSecs = results[i * 3 + 2]![1] as number;
+            if (valueBuf === null) {
+              out.push(null);
             } else {
-              pipeline.set(op.key, buf);
+              out.push(
+                makeEntry({
+                  value: new Uint8Array(valueBuf),
+                  revision: revision > 0 ? revision : 0,
+                  ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
+                }),
+              );
             }
-            offset += 1;
-          } else if (op.op === "delete") {
-            pipeline.del(op.key);
-            offset += 1;
-          } else {
-            pipeline.incrby(op.key, (op as any).delta ?? 1);
-            offset += 1;
           }
-        }
+          return out;
+        });
+        return { data: result, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
 
-        const results = await pipeline.exec() as Array<[Error | null, unknown]>;
+    async multiSet(entries) {
+      if (entries.length === 0) return { data: undefined, error: undefined };
+      try {
+        await track("MSET", entries.length, async () => {
+          // Entries with no special options can be sent as a single MSET.
+          // Anything with TTL, conditionals, or ifMatch needs individual SET commands.
+          const plain = entries.filter(
+            (e) =>
+              e.opts == null
+              || (e.opts.ttl == null
+                && e.opts.ttl_ms == null
+                && !e.opts.ifAbsent
+                && !e.opts.ifPresent
+                && e.opts.ifMatch == null
+                && !e.opts.keepTtl),
+          );
+          const complex = entries.filter(
+            (e) =>
+              e.opts != null
+              && (e.opts.ttl != null
+                || e.opts.ttl_ms != null
+                || e.opts.ifAbsent
+                || e.opts.ifPresent
+                || e.opts.ifMatch != null
+                || e.opts.keepTtl),
+          );
 
-        return ops.map((op, i) => {
-          const off = offsets[i]!;
-          if (op.op === "get") {
-            const valueBuf = results[off]![1] as Buffer | null;
-            if (valueBuf === null) return null;
-            const revision = results[off + 1]![1] as number;
-            const ttlSecs = results[off + 2]![1] as number;
-            return makeEntry({
-              value: new Uint8Array(valueBuf),
-              revision: revision > 0 ? revision : 0,
-              ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
-            });
-          } else if (op.op === "set") {
-            const [err, result] = results[off]!;
-            if (err) {
-              if (isConflictError(err)) {
-                throw new KvError("conflict", "revision mismatch", 409);
-              }
-              if (op.opts?.ifAbsent) {
-                throw new KvError("conflict", "key already exists", 409);
-              }
-              if (op.opts?.ifPresent) {
-                throw new KvError("conflict", "key does not exist", 409);
-              }
-              throw err;
+          const pipeline = redis.pipeline();
+
+          if (plain.length > 0) {
+            const pairs: (string | Buffer)[] = [];
+            for (const { key, value } of plain) {
+              pairs.push(
+                key,
+                value instanceof Uint8Array
+                  ? Buffer.from(value)
+                  : Buffer.from(value),
+              );
             }
-            // SET NX/XX returns null when the condition wasn't met (not an error in ioredis)
-            if (result === null) {
-              if (op.opts?.ifAbsent) {
-                throw new KvError("conflict", "key already exists", 409);
-              }
-              if (op.opts?.ifPresent) {
-                throw new KvError("conflict", "key does not exist", 409);
-              }
-            }
-          } else if (op.op === "incr") {
-            const [err, n] = results[off]!;
-            if (err) throw err;
-            return n as number;
+            pipeline.mset(...(pairs as [string, string, ...string[]]));
           }
-          return undefined; // delete / set with no return value
-        }) as unknown as KvBatchResults<T>;
-      });
+
+          for (const { key, value, opts } of complex) {
+            pipelineSet(pipeline, key, value, opts);
+          }
+
+          await pipeline.exec();
+        });
+        return { data: undefined, error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
+    },
+
+    async batch(ops) {
+      try {
+        return { data: await _batch(ops), error: undefined };
+      } catch (err) {
+        return { data: undefined, error: toKvError(err) };
+      }
     },
 
     async *watch(
       key: string,
-      watchOpts?: KvWatchOptions,
-    ): AsyncGenerator<KvWatchEvent> {
+      watchOpts?: WatchOptions,
+    ): AsyncGenerator<WatchEvent> {
       const url = new URL(opts.url);
       const host = url.hostname;
       const port = parseInt(url.port, 10);
@@ -375,10 +711,8 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
             return;
           }
           conn?.close();
-          // Sleep 1s before reconnect.
           await sleep(1000, signal);
           if (signal?.aborted) return;
-          // loop, reconnect with SINCE lastRevision
         }
       }
     },
@@ -386,7 +720,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     close(): Promise<void> {
       return redis.quit().then(() => undefined);
     },
-  };
+  } as KvClient;
 }
 
 function isConflictError(e: unknown): boolean {
@@ -585,7 +919,6 @@ class Resp3Conn {
       if (v && typeof v === "object" && "push" in (v as object)) {
         return v as { push: RespValue[] };
       }
-      // Skip non-push frames (shouldn't happen during watch stream).
     }
   }
 
@@ -626,7 +959,7 @@ function respToString(v: RespValue): string {
   throw new Error(`expected string-like, got ${typeof v}`);
 }
 
-function pushToEvent(frame: { push: RespValue[] }): KvWatchEvent | null {
+function pushToEvent(frame: { push: RespValue[] }): WatchEvent | null {
   const arr = frame.push;
   if (arr.length < 2) return null;
   const ns = respToString(arr[0]!);
@@ -648,11 +981,11 @@ function pushToEvent(frame: { push: RespValue[] }): KvWatchEvent | null {
     return { type: "set", key, value, revision };
   }
   if (kind === "del") {
-    if (arr.length < 4) return null;
+    if (arr.length < 5) return null;
     const key = respToString(arr[2]!);
-    const revision = typeof arr[3] === "number"
-      ? arr[3]
-      : parseInt(respToString(arr[3]!), 10);
+    const revision = typeof arr[4] === "number"
+      ? arr[4]
+      : parseInt(respToString(arr[4]!), 10);
     return { type: "del", key, revision };
   }
   return null;

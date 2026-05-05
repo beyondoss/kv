@@ -1,6 +1,8 @@
+import type { KvError } from "./errors.js";
+
 const decoder = new TextDecoder();
 
-export interface KvEntry {
+export interface Entry {
   value: Uint8Array;
   /** Decode the value as a UTF-8 string. */
   text(): string;
@@ -8,6 +10,8 @@ export interface KvEntry {
   json<T = unknown>(): T;
   /** Remaining TTL in seconds. Absent if the key has no expiry. */
   ttl?: number;
+  /** Remaining TTL in milliseconds. Absent if the key has no expiry. */
+  ttl_ms?: number;
   /**
    * Arbitrary JSON metadata attached to the entry.
    * [HTTP only] — always `undefined` when using the RESP backend.
@@ -15,7 +19,7 @@ export interface KvEntry {
   metadata?: unknown;
   /**
    * Monotonically-increasing revision (server write timestamp in ms).
-   * Use with `ifMatch` in `KvSetOptions` for compare-and-swap.
+   * Use with `ifMatch` in `SetOptions` for compare-and-swap.
    */
   revision: number;
 }
@@ -23,9 +27,10 @@ export interface KvEntry {
 export function makeEntry(raw: {
   value: Uint8Array;
   ttl?: number;
+  ttl_ms?: number;
   metadata?: unknown;
   revision: number;
-}): KvEntry {
+}): Entry {
   return {
     ...raw,
     text() {
@@ -37,7 +42,7 @@ export function makeEntry(raw: {
   };
 }
 
-export interface KvSetOptions {
+export interface SetOptions {
   /** TTL in seconds. */
   ttl?: number;
   /**
@@ -45,13 +50,13 @@ export interface KvSetOptions {
    * [HTTP only] — silently ignored by the RESP backend.
    */
   metadata?: unknown;
-  /** Set only if the key does not already exist. Throws `KvError` (409) if it does. */
+  /** Set only if the key does not already exist. Returns error (409) if it does. */
   ifAbsent?: boolean;
-  /** Set only if the key already exists. Throws `KvError` (409) if it does not. */
+  /** Set only if the key already exists. Returns error (409) if it does not. */
   ifPresent?: boolean;
   /**
    * Compare-and-swap: only set if the current revision matches this value.
-   * Throws `KvError` (409) on mismatch.
+   * Returns error (409) on mismatch.
    * Obtain the current revision from `kv.get()`.
    * Prefer `kv.cas()` over this when you need the new revision after a successful write.
    */
@@ -63,21 +68,56 @@ export interface KvSetOptions {
   keepTtl?: boolean;
 }
 
-/**
- * Options for {@link KvClient.cas}.
- */
-export interface KvCasOptions {
+export type BatchSetOpts = SetOptions & {
+  /** TTL in milliseconds. Takes priority over `ttl` (seconds) when both are set. */
+  ttl_ms?: number;
+};
+
+/** Options for {@link KvClient.expire}. Exactly one TTL option must be supplied. */
+export interface ExpiryOptions {
+  /** New TTL in seconds from now. */
+  ttl?: number;
+  /** New TTL in milliseconds from now. */
+  ttl_ms?: number;
+  /** Absolute expiry as a Unix timestamp in seconds. */
+  ttl_at?: number;
+  /** Absolute expiry as a Unix timestamp in milliseconds. */
+  ttl_at_ms?: number;
+  /** Remove the TTL entirely. Mutually exclusive with all other options. */
+  persist?: boolean;
+  /**
+   * Also fetch and return the current value in the same operation (GETEX semantics).
+   * When `true`, the returned `Entry` contains the current value bytes.
+   * When `false` (default), returns `null`.
+   */
+  returnValue?: boolean;
+}
+
+/** Options for {@link KvClient.getAndSet}. Mutually exclusive with conditional-write options. */
+export interface GetAndSetOptions {
+  /** TTL in seconds to set on the key after the swap. */
+  ttl?: number;
+  /**
+   * Arbitrary JSON metadata to attach to the new value.
+   * [HTTP only] — silently ignored by the RESP backend.
+   */
+  metadata?: unknown;
+}
+
+/** Options for {@link KvClient.cas}. */
+export interface CasOptions {
   /** TTL in seconds. Sets a new expiry on successful write. */
   ttl?: number;
 }
 
-export interface KvMSetEntry {
+export interface MSetEntry {
   key: string;
   value: string | Uint8Array;
-  opts?: Pick<KvSetOptions, "ttl">;
+  /** Full set options per entry. TTL-only entries are batched with MSET on the RESP backend; all others use individual SET commands. */
+  opts?: BatchSetOpts;
 }
 
-export interface KvListOptions {
+export interface ListOptions {
   prefix?: string;
   /**
    * Opaque pagination cursor from a previous `list()` response. Pass the
@@ -87,9 +127,9 @@ export interface KvListOptions {
   limit?: number;
 }
 
-export interface KvListResult {
+export interface ListResult {
   /** Keys returned for this page. Call `get()` to fetch values. */
-  keys: KvListKey[];
+  keys: ListKey[];
   /**
    * Opaque cursor to pass to the next `list()` call. Absent when the scan
    * has reached the end of the keyspace.
@@ -97,12 +137,12 @@ export interface KvListResult {
   nextCursor?: string;
 }
 
-export interface KvListKey {
+export interface ListKey {
   name: string;
 }
 
 /** A watch event emitted by `KvClient.watch()`. */
-export type KvWatchEvent =
+export type WatchEvent =
   | { type: "ready" }
   | {
     type: "set";
@@ -114,7 +154,7 @@ export type KvWatchEvent =
   }
   | { type: "del"; key: string; revision: number };
 
-export interface KvWatchOptions {
+export interface WatchOptions {
   /** If true, treat `key` as a prefix and watch all matching keys. */
   prefix?: boolean;
   /** Resume from this revision (exclusive). 0 = deliver current state then live stream. */
@@ -123,26 +163,38 @@ export interface KvWatchOptions {
   signal?: AbortSignal;
 }
 
-export interface KvDeleteOptions {
+export interface DeleteOptions {
   /**
    * Compare-and-delete: only delete if the stored revision matches this value.
-   * Throws `KvError` (409) on mismatch.
+   * Returns error (409) on mismatch.
    * [HTTP only] — silently ignored by the RESP backend.
    */
   ifMatch?: number;
+  /**
+   * Return the previous entry before deleting. Absent entries return `null`.
+   * Use the overload signature that returns `KvResult<Entry | null>`.
+   */
+  returnOld?: boolean;
 }
 
-export type KvBatchOp =
+export type BatchOp =
   | { op: "get"; key: string }
-  | { op: "set"; key: string; value: string | Uint8Array; opts?: KvSetOptions }
-  | { op: "delete"; key: string; opts?: KvDeleteOptions }
-  | { op: "incr"; key: string; delta?: number };
+  | { op: "set"; key: string; value: string | Uint8Array; opts?: BatchSetOpts }
+  | { op: "delete"; key: string; opts?: DeleteOptions }
+  | { op: "incr"; key: string; delta?: number }
+  | { op: "exists"; key: string };
 
-type KvBatchOpResult<T extends KvBatchOp> = T extends { op: "get" }
-  ? KvEntry | null
+type BatchOpResult<T extends BatchOp> = T extends { op: "get" } ? Entry | null
   : T extends { op: "incr" } ? number
+  : T extends { op: "exists" } ? boolean
+  : T extends { op: "delete"; opts: { returnOld: true } } ? Entry | null
   : void;
 
-export type KvBatchResults<T extends readonly KvBatchOp[]> = {
-  [K in keyof T]: T[K] extends KvBatchOp ? KvBatchOpResult<T[K]> : never;
+export type BatchResults<T extends readonly BatchOp[]> = {
+  [K in keyof T]: T[K] extends BatchOp ? BatchOpResult<T[K]> : never;
 };
+
+/** Result type returned by all KvClient methods. Never throws — errors are in `error`. */
+export type KvResult<T> =
+  | { data: T; error: undefined }
+  | { data: undefined; error: KvError };

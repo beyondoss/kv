@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use beyond_kv_engine::store::ShardStore;
-use beyond_kv_engine::types::{Entry, ScanPage};
+use beyond_kv_engine::types::{Entry, ScanPage, SetOptions};
 use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use bytes::Bytes;
 use futures_channel::mpsc::{self, Receiver, Sender};
@@ -91,6 +91,60 @@ pub enum CrossShardRequest {
         ns: String,
         pattern: Option<Bytes>,
         reply: oneshot::Sender<Result<Vec<Bytes>, String>>,
+    },
+    /// Set a single key with full options on a foreign shard.
+    Set {
+        ns: String,
+        key: Bytes,
+        value: Bytes,
+        opts: SetOptions,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Atomically increment a counter on a foreign shard.
+    Incr {
+        ns: String,
+        key: Bytes,
+        delta: i64,
+        reply: oneshot::Sender<Result<i64, String>>,
+    },
+    /// Conditionally delete a key by revision on a foreign shard.
+    DelRev {
+        ns: String,
+        key: Bytes,
+        revision: u64,
+        reply: oneshot::Sender<Result<Option<()>, String>>,
+    },
+    /// Set a key only if it does not exist on a foreign shard.
+    SetNx {
+        ns: String,
+        key: Bytes,
+        value: Bytes,
+        opts: SetOptions,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Set a key only if it already exists on a foreign shard.
+    SetXx {
+        ns: String,
+        key: Bytes,
+        value: Bytes,
+        opts: SetOptions,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Compare-and-swap write on a foreign shard.
+    SetRev {
+        ns: String,
+        key: Bytes,
+        value: Bytes,
+        opts: SetOptions,
+        revision: u64,
+        reply: oneshot::Sender<Result<Option<u64>, String>>,
+    },
+    /// Atomically get-then-delete a key on a foreign shard.
+    GetDel {
+        ns: String,
+        key: Bytes,
+        orig_idx: usize,
+        reply: oneshot::Sender<Result<(usize, Option<Entry>), String>>,
     },
     /// Register a watch subscription on this shard and return the initial state
     /// plus a live event channel. Used for cross-shard WATCH/PWATCH fan-out.
@@ -245,6 +299,97 @@ async fn handle(store: Rc<ShardStore>, req: CrossShardRequest) {
                     }
                 }
             };
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::Set {
+            ns,
+            key,
+            value,
+            opts,
+            reply,
+        } => {
+            let res = store
+                .set(&ns, &key, value, opts)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::Incr {
+            ns,
+            key,
+            delta,
+            reply,
+        } => {
+            let res = store
+                .incr(&ns, &key, delta)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::DelRev {
+            ns,
+            key,
+            revision,
+            reply,
+        } => {
+            let res = store
+                .delrev(&ns, &key, revision)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::SetNx {
+            ns,
+            key,
+            value,
+            opts,
+            reply,
+        } => {
+            let res = store
+                .setnx(&ns, &key, value, opts)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::SetXx {
+            ns,
+            key,
+            value,
+            opts,
+            reply,
+        } => {
+            let res = store
+                .setxx(&ns, &key, value, opts)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::SetRev {
+            ns,
+            key,
+            value,
+            opts,
+            revision,
+            reply,
+        } => {
+            let res = store
+                .setrev(&ns, &key, value, opts, revision)
+                .await
+                .map(|opt| opt.map(|r| r))
+                .map_err(|e| e.to_string());
+            let _ = reply.send(res);
+        }
+        CrossShardRequest::GetDel {
+            ns,
+            key,
+            orig_idx,
+            reply,
+        } => {
+            let res = store
+                .getdel(&ns, &key)
+                .await
+                .map(|e| (orig_idx, e))
+                .map_err(|e| e.to_string());
             let _ = reply.send(res);
         }
         CrossShardRequest::WatchSubscribe {

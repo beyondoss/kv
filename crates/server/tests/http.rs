@@ -816,3 +816,897 @@ fn namespace_out_of_range_returns_400() {
     assert_eq!(res.status, 400);
     assert_eq!(res.json()["error"], "invalid_namespace");
 }
+
+// ── HEAD ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn head_missing_key_returns_404() {
+    let srv = TestServer::start();
+    let url = srv.value_url(0, "no-such-key");
+    let res = common::raw_call_url(ureq::head(&url));
+    assert_eq!(res.status, 404);
+}
+
+#[test]
+fn head_existing_key_returns_200_no_body() {
+    let srv = TestServer::start();
+    srv.put("hk", b"value");
+    let url = srv.value_url(0, "hk");
+    let res = common::raw_call_url(ureq::head(&url));
+    assert_eq!(res.status, 200);
+    assert!(res.body.is_empty(), "HEAD must not return a body");
+}
+
+#[test]
+fn head_returns_ttl_header_when_set() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "hk-ttl",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let url = srv.value_url(0, "hk-ttl");
+    let res = common::raw_call_url(ureq::head(&url));
+    assert_eq!(res.status, 200);
+    let ttl = res.ttl.expect("X-KV-TTL header missing");
+    assert!(ttl > 0 && ttl <= 60);
+}
+
+#[test]
+fn head_returns_no_ttl_header_when_key_has_no_ttl() {
+    let srv = TestServer::start();
+    srv.put("hk-notl", b"v");
+    let url = srv.value_url(0, "hk-notl");
+    let res = common::raw_call_url(ureq::head(&url));
+    assert_eq!(res.status, 200);
+    assert!(res.ttl.is_none(), "no TTL should mean no X-KV-TTL header");
+}
+
+#[test]
+fn head_returns_metadata_header() {
+    let srv = TestServer::start();
+    let meta = serde_json::json!({"role": "admin"});
+    srv.put_opts(
+        0,
+        "hk-meta",
+        b"v",
+        PutOptions {
+            metadata: Some(meta.clone()),
+            ..Default::default()
+        },
+    );
+    let url = srv.value_url(0, "hk-meta");
+    let res = common::raw_call_url(ureq::head(&url));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.metadata, Some(meta));
+}
+
+// ── PATCH (TTL update / PERSIST / GETEX) ─────────────────────────────────────
+
+fn patch_url(srv: &TestServer, ns: u8, key: &str, extra: &str) -> String {
+    let base = srv.value_url(ns, key);
+    if extra.is_empty() {
+        base
+    } else {
+        format!("{base}&{extra}")
+    }
+}
+
+#[test]
+fn patch_ttl_updates_existing_key() {
+    let srv = TestServer::start();
+    srv.put("pk", b"v");
+    let url = patch_url(&srv, 0, "pk", "ttl=120");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 204);
+    let ttl = srv.get("pk").ttl.expect("TTL should be set after PATCH");
+    assert!(ttl > 0 && ttl <= 120);
+}
+
+#[test]
+fn patch_ttl_ms_param_works() {
+    let srv = TestServer::start();
+    srv.put("pk-ms", b"v");
+    let url = patch_url(&srv, 0, "pk-ms", "ttl_ms=90000");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 204);
+    let ttl = srv.get("pk-ms").ttl.expect("TTL should be set");
+    assert!(ttl > 0 && ttl <= 90);
+}
+
+#[test]
+fn patch_persist_removes_ttl() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "pk-persist",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    assert!(
+        srv.get("pk-persist").ttl.is_some(),
+        "key should start with a TTL"
+    );
+    let url = patch_url(&srv, 0, "pk-persist", "persist=1");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 204);
+    assert!(
+        srv.get("pk-persist").ttl.is_none(),
+        "persist=1 must clear TTL"
+    );
+}
+
+#[test]
+fn patch_missing_key_returns_404() {
+    let srv = TestServer::start();
+    let url = patch_url(&srv, 0, "no-such-key", "ttl=60");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 404);
+}
+
+#[test]
+fn patch_no_option_returns_400() {
+    let srv = TestServer::start();
+    srv.put("pk-bad", b"v");
+    let url = patch_url(&srv, 0, "pk-bad", "");
+    let res = common::raw_call_url(ureq::patch(&url));
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "invalid_request");
+}
+
+#[test]
+fn patch_return_value_header_returns_current_value() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "pk-getex",
+        b"hello",
+        PutOptions {
+            ttl_header: Some(30),
+            ..Default::default()
+        },
+    );
+    let url = patch_url(&srv, 0, "pk-getex", "ttl=120");
+    let res = common::raw_call_url(ureq::patch(&url).set("X-KV-Return-Value", "1"));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, b"hello");
+    let new_ttl = res.ttl.expect("X-KV-TTL should be returned with value");
+    assert!(new_ttl > 0 && new_ttl <= 120);
+}
+
+#[test]
+fn patch_return_value_without_ttl_op_returns_value_unchanged() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "pk-getex-noop",
+        b"world",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let url = patch_url(&srv, 0, "pk-getex-noop", "");
+    let res = common::raw_call_url(ureq::patch(&url).set("X-KV-Return-Value", "1"));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, b"world");
+    let ttl = res.ttl.expect("X-KV-TTL should be preserved");
+    assert!(ttl > 0 && ttl <= 60);
+}
+
+// ── DBSIZE (GET /v1/kv?count=1) ───────────────────────────────────────────────
+
+fn dbsize_url(srv: &TestServer, ns: u8) -> String {
+    format!("http://127.0.0.1:{}/v1/kv?ns={ns}&count=1", srv.http_port)
+}
+
+#[test]
+fn dbsize_empty_namespace_returns_zero() {
+    let srv = TestServer::start();
+    let res = common::raw_call_url(ureq::get(&dbsize_url(&srv, 0)));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["count"], 0);
+}
+
+#[test]
+fn dbsize_counts_all_keys_in_namespace() {
+    let srv = TestServer::start();
+    for k in ["alpha", "beta", "gamma"] {
+        srv.put(k, b"v");
+    }
+    let res = common::raw_call_url(ureq::get(&dbsize_url(&srv, 0)));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["count"], 3);
+}
+
+#[test]
+fn dbsize_is_namespace_scoped() {
+    let srv = TestServer::start();
+    srv.put_ns(0, "ns0-key", b"v");
+    srv.put_ns(1, "ns1-key1", b"v");
+    srv.put_ns(1, "ns1-key2", b"v");
+    let res0 = common::raw_call_url(ureq::get(&dbsize_url(&srv, 0)));
+    let res1 = common::raw_call_url(ureq::get(&dbsize_url(&srv, 1)));
+    assert_eq!(res0.json()["count"], 1);
+    assert_eq!(res1.json()["count"], 2);
+}
+
+// ── FLUSHDB (DELETE /v1/kv) ───────────────────────────────────────────────────
+
+fn flushdb_url(srv: &TestServer, ns: u8) -> String {
+    format!("http://127.0.0.1:{}/v1/kv?ns={ns}", srv.http_port)
+}
+
+#[test]
+fn flushdb_removes_all_keys_in_namespace() {
+    let srv = TestServer::start();
+    for k in ["fa", "fb", "fc"] {
+        srv.put(k, b"v");
+    }
+    let res = common::raw_call_url(ureq::delete(&flushdb_url(&srv, 0)));
+    assert_eq!(res.status, 204);
+    let list = srv.list(0).json();
+    assert_eq!(
+        list["keys"].as_array().unwrap().len(),
+        0,
+        "all keys must be gone after FLUSHDB"
+    );
+}
+
+#[test]
+fn flushdb_is_namespace_scoped() {
+    let srv = TestServer::start();
+    srv.put_ns(0, "safe-key", b"v");
+    srv.put_ns(1, "flushed-key", b"v");
+    let res = common::raw_call_url(ureq::delete(&flushdb_url(&srv, 1)));
+    assert_eq!(res.status, 204);
+    assert_eq!(
+        srv.get_ns(0, "safe-key").status,
+        200,
+        "ns=0 key must survive ns=1 flush"
+    );
+    assert!(
+        srv.get_ns(1, "flushed-key").is_not_found(),
+        "ns=1 key must be gone"
+    );
+}
+
+#[test]
+fn flushdb_is_idempotent() {
+    let srv = TestServer::start();
+    let url = flushdb_url(&srv, 0);
+    let res1 = common::raw_call_url(ureq::delete(&url));
+    let res2 = common::raw_call_url(ureq::delete(&url));
+    assert_eq!(res1.status, 204);
+    assert_eq!(res2.status, 204);
+}
+
+// ── POST /v1/kv/batch ─────────────────────────────────────────────────────────
+
+fn batch_url(srv: &TestServer, ns: u8) -> String {
+    format!("http://127.0.0.1:{}/v1/kv/batch?ns={ns}", srv.http_port)
+}
+
+fn b64(b: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .expect("invalid base64url")
+}
+
+fn batch_call(srv: &TestServer, ns: u8, ops: serde_json::Value) -> common::KvResponse {
+    let url = batch_url(srv, ns);
+    let body = ops.to_string();
+    let res = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body);
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r.into_reader(), &mut buf).unwrap();
+            common::KvResponse {
+                status,
+                body: buf,
+                ttl: None,
+                ttl_ms: None,
+                metadata: None,
+            }
+        }
+        Err(ureq::Error::Status(_, r)) => {
+            let status = r.status();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r.into_reader(), &mut buf).unwrap();
+            common::KvResponse {
+                status,
+                body: buf,
+                ttl: None,
+                ttl_ms: None,
+                metadata: None,
+            }
+        }
+        Err(e) => panic!("HTTP transport error: {e}"),
+    }
+}
+
+#[test]
+fn batch_get_hit_returns_value_and_revision() {
+    let srv = TestServer::start();
+    srv.put("bk-hit", b"hello");
+    let res = batch_call(&srv, 0, serde_json::json!([{"op": "get", "key": "bk-hit"}]));
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    let entry = &results[0];
+    assert_eq!(b64_decode(entry["value"].as_str().unwrap()), b"hello");
+    assert!(entry["revision"].as_u64().unwrap_or(0) > 0);
+}
+
+#[test]
+fn batch_get_miss_returns_null() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "get", "key": "no-such"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert!(results[0].is_null());
+}
+
+#[test]
+fn batch_set_stores_value() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "set", "key": "bk-set", "value": b64(b"world")}]),
+    );
+    assert_eq!(res.status, 200);
+    assert_eq!(srv.get("bk-set").body, b"world");
+}
+
+#[test]
+fn batch_set_with_ttl_stores_ttl() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "set", "key": "bk-ttl", "value": b64(b"v"), "ttl": 60}]),
+    );
+    assert_eq!(res.status, 200);
+    let ttl = srv.get("bk-ttl").ttl.expect("TTL should be set");
+    assert!(ttl > 0 && ttl <= 60);
+}
+
+#[test]
+fn batch_delete_removes_key() {
+    let srv = TestServer::start();
+    srv.put("bk-del", b"v");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "delete", "key": "bk-del"}]),
+    );
+    assert_eq!(res.status, 200);
+    assert!(srv.get("bk-del").is_not_found());
+}
+
+#[test]
+fn batch_incr_from_missing_starts_at_delta() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "incr", "key": "bk-ctr", "delta": 5}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results[0]["value"], 5);
+}
+
+#[test]
+fn batch_incr_accumulates() {
+    let srv = TestServer::start();
+    srv.put("bk-acc", b"10");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "incr", "key": "bk-acc", "delta": 3}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results[0]["value"], 13);
+}
+
+#[test]
+fn batch_mixed_ops_return_ordered_results() {
+    let srv = TestServer::start();
+    srv.put("bk-mix-a", b"alpha");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([
+            {"op": "get",    "key": "bk-mix-a"},
+            {"op": "set",    "key": "bk-mix-b", "value": b64(b"beta")},
+            {"op": "get",    "key": "bk-mix-missing"},
+            {"op": "incr",   "key": "bk-mix-ctr", "delta": 1},
+        ]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results.as_array().unwrap().len(), 4);
+    assert_eq!(b64_decode(results[0]["value"].as_str().unwrap()), b"alpha");
+    assert!(results[1].is_null(), "set returns null");
+    assert!(results[2].is_null(), "get miss returns null");
+    assert_eq!(results[3]["value"], 1);
+}
+
+#[test]
+fn batch_set_nx_conflict_returns_409() {
+    let srv = TestServer::start();
+    srv.put("bk-nx", b"existing");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "set", "key": "bk-nx", "value": b64(b"new"), "nx": true}]),
+    );
+    assert_eq!(res.status, 409);
+    assert_eq!(res.json()["error"], "conflict");
+    assert_eq!(
+        srv.get("bk-nx").body,
+        b"existing",
+        "value must not change on nx conflict"
+    );
+}
+
+#[test]
+fn batch_set_xx_conflict_returns_409() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "set", "key": "bk-xx-miss", "value": b64(b"v"), "xx": true}]),
+    );
+    assert_eq!(res.status, 409);
+    assert_eq!(res.json()["error"], "conflict");
+}
+
+#[test]
+fn batch_set_if_match_conflict_returns_409() {
+    let srv = TestServer::start();
+    srv.put("bk-cas", b"v");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "set", "key": "bk-cas", "value": b64(b"v2"), "ifMatch": 9999}]),
+    );
+    assert_eq!(res.status, 409);
+    assert_eq!(res.json()["error"], "conflict");
+}
+
+#[test]
+fn batch_malformed_body_returns_400() {
+    let srv = TestServer::start();
+    let url = batch_url(&srv, 0);
+    let res = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string("this is not json");
+    let (status, body) = match res {
+        Ok(r) => {
+            let s = r.status();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r.into_reader(), &mut buf).unwrap();
+            (s, buf)
+        }
+        Err(ureq::Error::Status(s, r)) => {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r.into_reader(), &mut buf).unwrap();
+            (s, buf)
+        }
+        Err(e) => panic!("{e}"),
+    };
+    assert_eq!(status, 400);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "invalid_request");
+}
+
+#[test]
+fn batch_get_returns_ttl_when_set() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "bk-ttl-get",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "get", "key": "bk-ttl-get"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    let entry = &results[0];
+    let ttl = entry["ttl"].as_u64().expect("ttl field should be present");
+    assert!(ttl > 0 && ttl <= 60);
+}
+
+// ── POST /v1/admin/compact ────────────────────────────────────────────────────
+
+fn compact_url(srv: &TestServer, ns: u8) -> String {
+    format!(
+        "http://127.0.0.1:{}/v1/admin/compact?ns={ns}",
+        srv.http_port
+    )
+}
+
+#[test]
+fn compact_returns_204() {
+    let srv = TestServer::start();
+    let res = common::raw_call_url(ureq::post(&compact_url(&srv, 0)));
+    assert_eq!(res.status, 204);
+}
+
+#[test]
+fn compact_is_idempotent() {
+    let srv = TestServer::start();
+    srv.put("ck", b"v");
+    let url = compact_url(&srv, 0);
+    let res1 = common::raw_call_url(ureq::post(&url));
+    let res2 = common::raw_call_url(ureq::post(&url));
+    assert_eq!(res1.status, 204);
+    assert_eq!(res2.status, 204);
+    assert_eq!(srv.get("ck").body, b"v", "key survives compaction");
+}
+
+// ── X-KV-TTL-MS header ───────────────────────────────────────────────────────
+
+#[test]
+fn get_response_includes_ttl_ms_header() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "ttl-ms-k",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let res = common::raw_call_url(ureq::get(&srv.value_url(0, "ttl-ms-k")));
+    assert_eq!(res.status, 200);
+    let ttl_ms = res.ttl_ms.expect("X-KV-TTL-MS header must be present");
+    assert!(ttl_ms > 0 && ttl_ms <= 60_000, "ttl_ms={ttl_ms}");
+    let ttl_s = res.ttl.expect("X-KV-TTL header must be present");
+    assert!(
+        ttl_ms >= ttl_s * 1000 - 1000,
+        "ttl_ms should be >= ttl_s * 1000 - 1s"
+    );
+}
+
+#[test]
+fn get_response_has_no_ttl_ms_header_for_persistent_key() {
+    let srv = TestServer::start();
+    srv.put("persist-k", b"v");
+    let res = common::raw_call_url(ureq::get(&srv.value_url(0, "persist-k")));
+    assert_eq!(res.status, 200);
+    assert!(
+        res.ttl_ms.is_none(),
+        "persistent key must not have X-KV-TTL-MS"
+    );
+}
+
+// ── Batch: keepTtl ───────────────────────────────────────────────────────────
+
+#[test]
+fn batch_set_keeptll_preserves_expiry() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "bk-keepttl",
+        b"v1",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let ttl_before = srv.get("bk-keepttl").ttl.expect("initial TTL must be set");
+
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": "bk-keepttl",
+            "value": b64(b"v2"),
+            "keepTtl": true
+        }]),
+    );
+    assert_eq!(res.status, 200);
+    assert_eq!(srv.get("bk-keepttl").body, b"v2");
+    let ttl_after = srv
+        .get("bk-keepttl")
+        .ttl
+        .expect("TTL must be preserved after keepTtl set");
+    assert!(
+        ttl_after > 0 && ttl_after <= ttl_before,
+        "TTL must be preserved"
+    );
+}
+
+#[test]
+fn batch_set_ttl_ms_sub_second_precision() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": "bk-ttl-ms",
+            "value": b64(b"v"),
+            "ttlMs": 30_000
+        }]),
+    );
+    assert_eq!(res.status, 200);
+    let ttl = srv.get("bk-ttl-ms").ttl.expect("TTL must be set via ttlMs");
+    assert!(ttl > 0 && ttl <= 30, "ttl={ttl}");
+}
+
+#[test]
+fn batch_set_ttl_ms_takes_priority_over_ttl_secs() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": "bk-ttl-prio",
+            "value": b64(b"v"),
+            "ttl": 999,
+            "ttlMs": 10_000
+        }]),
+    );
+    assert_eq!(res.status, 200);
+    let ttl = srv.get("bk-ttl-prio").ttl.expect("TTL must be set");
+    assert!(
+        ttl > 0 && ttl <= 10,
+        "ttlMs should take priority, ttl={ttl}"
+    );
+}
+
+// ── Batch: get returns ttl_ms ─────────────────────────────────────────────────
+
+#[test]
+fn batch_get_returns_ttl_ms_when_set() {
+    let srv = TestServer::start();
+    srv.put_opts(
+        0,
+        "bk-getttl-ms",
+        b"v",
+        PutOptions {
+            ttl_header: Some(60),
+            ..Default::default()
+        },
+    );
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "get", "key": "bk-getttl-ms"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    let entry = &results[0];
+    let ttl_ms = entry["ttl_ms"]
+        .as_u64()
+        .expect("ttl_ms should be in batch get result");
+    let ttl_s = entry["ttl"]
+        .as_u64()
+        .expect("ttl should be in batch get result");
+    assert!(ttl_ms > 0 && ttl_ms <= 60_000, "ttl_ms={ttl_ms}");
+    assert!(ttl_ms >= ttl_s * 1000 - 1000);
+}
+
+// ── Batch: delete with returnOld ──────────────────────────────────────────────
+
+#[test]
+fn batch_delete_return_old_returns_entry() {
+    let srv = TestServer::start();
+    srv.put("bk-getdel", b"precious");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "delete", "key": "bk-getdel", "returnOld": true}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    let entry = &results[0];
+    assert!(
+        !entry.is_null(),
+        "returnOld on existing key must return entry"
+    );
+    assert_eq!(b64_decode(entry["value"].as_str().unwrap()), b"precious");
+    assert!(entry["revision"].as_u64().unwrap_or(0) > 0);
+    assert!(srv.get("bk-getdel").is_not_found(), "key must be deleted");
+}
+
+#[test]
+fn batch_delete_return_old_missing_key_returns_null() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "delete", "key": "bk-getdel-miss", "returnOld": true}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert!(
+        results[0].is_null(),
+        "returnOld on missing key must return null"
+    );
+}
+
+#[test]
+fn batch_delete_without_return_old_returns_null() {
+    let srv = TestServer::start();
+    srv.put("bk-del-plain", b"v");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "delete", "key": "bk-del-plain"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert!(
+        results[0].is_null(),
+        "delete without returnOld must return null"
+    );
+    assert!(srv.get("bk-del-plain").is_not_found());
+}
+
+// ── Batch: exists ─────────────────────────────────────────────────────────────
+
+#[test]
+fn batch_exists_live_key_returns_true() {
+    let srv = TestServer::start();
+    srv.put("bk-ex-live", b"v");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "exists", "key": "bk-ex-live"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results[0], true, "exists on live key must return true");
+}
+
+#[test]
+fn batch_exists_missing_key_returns_false() {
+    let srv = TestServer::start();
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{"op": "exists", "key": "bk-ex-miss"}]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results[0], false, "exists on missing key must return false");
+}
+
+#[test]
+fn batch_exists_mixed_with_other_ops() {
+    let srv = TestServer::start();
+    srv.put("bk-mix-ex", b"v");
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([
+            {"op": "exists", "key": "bk-mix-ex"},
+            {"op": "exists", "key": "bk-mix-ex-no"},
+            {"op": "get",    "key": "bk-mix-ex"},
+        ]),
+    );
+    assert_eq!(res.status, 200);
+    let results = res.json();
+    assert_eq!(results[0], true);
+    assert_eq!(results[1], false);
+    assert!(!results[2].is_null());
+}
+
+// ── Cross-shard: batch conditional set respects NX ────────────────────────────
+
+#[test]
+fn batch_set_nx_cross_shard_respects_condition() {
+    // Use 2 shards so that keys on shard 1 exercise the cross-shard path.
+    // We try keys until we find one whose hash routes to the foreign shard.
+    let srv = common::TestServer::start_shards(2);
+
+    // Try a handful of keys — at least one will land on shard 1 (foreign).
+    // We want to verify that NX is honoured even for cross-shard writes.
+    let key = "nx-cross";
+    srv.put(key, b"original");
+
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": key,
+            "value": b64(b"overwrite"),
+            "nx": true
+        }]),
+    );
+    // Whether the key lands on shard 0 or shard 1, NX must prevent overwrite.
+    assert_eq!(
+        res.status, 409,
+        "NX batch set on existing key must fail regardless of shard"
+    );
+    assert_eq!(
+        srv.get(key).body,
+        b"original",
+        "value must not change on NX conflict"
+    );
+}
+
+#[test]
+fn batch_set_xx_cross_shard_respects_condition() {
+    let srv = common::TestServer::start_shards(2);
+    let key = "xx-cross-miss";
+
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": key,
+            "value": b64(b"v"),
+            "xx": true
+        }]),
+    );
+    assert_eq!(
+        res.status, 409,
+        "XX on missing key must fail regardless of shard"
+    );
+}
+
+#[test]
+fn batch_set_if_match_cross_shard_respects_condition() {
+    let srv = common::TestServer::start_shards(2);
+    let key = "cas-cross";
+    srv.put(key, b"v");
+
+    let res = batch_call(
+        &srv,
+        0,
+        serde_json::json!([{
+            "op": "set",
+            "key": key,
+            "value": b64(b"v2"),
+            "ifMatch": 9999
+        }]),
+    );
+    assert_eq!(
+        res.status, 409,
+        "ifMatch mismatch must fail regardless of shard"
+    );
+    assert_eq!(
+        srv.get(key).body,
+        b"v",
+        "value must not change on CAS conflict"
+    );
+}

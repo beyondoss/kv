@@ -49,7 +49,7 @@ export async function setup(): Promise<void> {
   const binaryPath = process.env["BEYOND_KV_BINARY"]
     ?? resolve(__dirname, "../../../../target/debug/beyond-kv");
 
-  serverProcess = spawn(binaryPath, [], {
+  serverProcess = spawn(binaryPath, ["serve"], {
     env: {
       ...process.env,
       KV_DATA_DIR: tempDataDir,

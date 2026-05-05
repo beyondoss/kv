@@ -6,6 +6,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
+use crate::routing::shard_for_key;
 
 use base64::Engine as _;
 use beyond_kv_engine::error::EngineError;
@@ -195,18 +196,29 @@ async fn route(
             .unwrap_or_else(|_| fallback_500());
     }
 
-    // GET /v1/kv → list endpoint (no key in path).
-    if path == "/v1/kv" || path == "/v1/kv/" {
-        if *method != http::Method::GET {
+    if path == "/v1/admin/compact" {
+        if *method != http::Method::POST {
             return method_not_allowed();
         }
         let ns = match parse_ns(query) {
             Ok(n) => n,
             Err(r) => return r,
         };
-        return handle_list(
+        return handle_compact(ns, store).await;
+    }
+
+    // POST /v1/kv/batch — bulk mixed operations.
+    if path == "/v1/kv/batch" {
+        if *method != http::Method::POST {
+            return method_not_allowed();
+        }
+        let ns = match parse_ns(query) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        return handle_batch(
             ns,
-            query,
+            body,
             store,
             shard_idx,
             n_shards,
@@ -216,36 +228,82 @@ async fn route(
         .await;
     }
 
+    // GET/DELETE /v1/kv → list or flush (no key in path).
+    if path == "/v1/kv" || path == "/v1/kv/" {
+        let ns = match parse_ns(query) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        return match *method {
+            http::Method::GET => {
+                if query_param(query, "count").is_some() {
+                    handle_dbsize(
+                        ns,
+                        store,
+                        shard_idx,
+                        n_shards,
+                        cross_shard_txs,
+                        cross_shard_wakeups,
+                    )
+                    .await
+                } else {
+                    handle_list(
+                        ns,
+                        query,
+                        store,
+                        shard_idx,
+                        n_shards,
+                        cross_shard_txs,
+                        cross_shard_wakeups,
+                    )
+                    .await
+                }
+            }
+            http::Method::DELETE => {
+                handle_flushdb(
+                    ns,
+                    store,
+                    shard_idx,
+                    n_shards,
+                    cross_shard_txs,
+                    cross_shard_wakeups,
+                )
+                .await
+            }
+            _ => method_not_allowed(),
+        };
+    }
+
     // /v1/kv/{key}[/incr]
     if let Some(rest) = path.strip_prefix("/v1/kv/") {
         let ns = match parse_ns(query) {
             Ok(n) => n,
             Err(r) => return r,
         };
-        // POST /v1/kv/{key}/incr
-        if *method == http::Method::POST {
-            if let Some(key_encoded) = rest.strip_suffix("/incr") {
-                let key = percent_decode(key_encoded);
-                if key.is_empty() {
-                    return not_found_json("not_found", "endpoint not found");
-                }
-                let delta = query_param(query, "delta")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1);
-                return handle_incr(ns, &key, delta, store).await;
+        // /v1/kv/{key}/incr — only POST is allowed.
+        if let Some(key_encoded) = rest.strip_suffix("/incr") {
+            if *method != http::Method::POST {
+                return method_not_allowed();
             }
-            return method_not_allowed();
+            let key = percent_decode(key_encoded);
+            if key.is_empty() {
+                return not_found_json("not_found", "endpoint not found");
+            }
+            let delta = query_param(query, "delta")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            return handle_incr(ns, &key, delta, store).await;
         }
-        // Reject /v1/kv/{key}/incr for non-POST
-        let key_encoded = rest.strip_suffix("/incr").unwrap_or(rest);
-        let key = percent_decode(key_encoded);
+        let key = percent_decode(rest);
         if key.is_empty() {
             return not_found_json("not_found", "endpoint not found");
         }
         return match *method {
             http::Method::GET => handle_get(ns, &key, store).await,
+            http::Method::HEAD => handle_head(ns, &key, store).await,
             http::Method::PUT => handle_put(ns, &key, body, parts, store).await,
             http::Method::DELETE => handle_delete(ns, &key, parts, store).await,
+            http::Method::PATCH => handle_patch(ns, &key, parts, store).await,
             _ => method_not_allowed(),
         };
     }
@@ -271,6 +329,7 @@ async fn route(
         (status = 200, description = "Key found. Value bytes in body.", content_type = "application/octet-stream",
             headers(
                 ("X-KV-TTL" = u64, description = "Remaining TTL in whole seconds. Absent if the key has no expiry."),
+                ("X-KV-TTL-MS" = u64, description = "Remaining TTL in milliseconds. Absent if the key has no expiry."),
                 ("X-KV-Revision" = u64, description = "Current revision counter. Absent if the key was never written via `If-Match`."),
                 ("X-KV-Metadata" = String, description = "JSON metadata blob attached to the key. Absent if none was stored."),
             )
@@ -283,13 +342,13 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
         Err(e) => engine_error_response(e),
         Ok(None) => not_found_json("not_found", "key does not exist"),
         Ok(Some(entry)) => {
-            let ttl_secs = entry.expires_at.map(|t| {
-                t.saturating_duration_since(std::time::Instant::now())
-                    .as_secs()
-            });
+            let ttl_remaining = entry
+                .expires_at
+                .map(|t| t.saturating_duration_since(std::time::Instant::now()));
             let mut builder = http::Response::builder().status(200);
-            if let Some(ttl) = ttl_secs {
-                builder = builder.header("X-KV-TTL", ttl.to_string());
+            if let Some(rem) = ttl_remaining {
+                builder = builder.header("X-KV-TTL", rem.as_secs().to_string());
+                builder = builder.header("X-KV-TTL-MS", (rem.as_millis() as u64).to_string());
             }
             if entry.revision > 0 {
                 builder = builder.header("X-KV-Revision", entry.revision.to_string());
@@ -305,6 +364,178 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
                 .header("Content-Type", "application/octet-stream")
                 .body(HttpBody::fixed_body(Some(entry.value)))
                 .unwrap_or_else(|_| internal_error("response build failed"))
+        }
+    }
+}
+
+/// Check whether `key` exists without fetching its value. Returns key metadata in response
+/// headers: `X-KV-TTL` (remaining seconds, absent if no expiry), `X-KV-Revision` (absent
+/// if never written via `If-Match`), and `X-KV-Metadata` (absent if none stored).
+/// Returns 200 if the key exists, 404 if it does not.
+#[utoipa::path(
+    head,
+    path = "/v1/kv/{key}",
+    operation_id = "head_value",
+    tag = "kv",
+    params(
+        ("key" = String, Path, description = "Key to check. Percent-encoded."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+    ),
+    responses(
+        (status = 200, description = "Key exists. Metadata in headers; no body.",
+            headers(
+                ("X-KV-TTL" = u64, description = "Remaining TTL in whole seconds. Absent if no expiry."),
+                ("X-KV-TTL-MS" = u64, description = "Remaining TTL in milliseconds. Absent if no expiry."),
+                ("X-KV-Revision" = u64, description = "Current revision counter. Absent if never written via `If-Match`."),
+                ("X-KV-Metadata" = String, description = "JSON metadata blob. Absent if none was stored."),
+            )
+        ),
+        (status = 404, description = "Key does not exist."),
+    )
+)]
+async fn handle_head(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
+    match store.get(ns, key).await {
+        Err(e) => engine_error_response(e),
+        Ok(None) => http::Response::builder()
+            .status(404)
+            .body(HttpBody::fixed_body(None))
+            .unwrap_or_else(|_| fallback_500()),
+        Ok(Some(entry)) => {
+            let ttl_remaining = entry
+                .expires_at
+                .map(|t| t.saturating_duration_since(std::time::Instant::now()));
+            let mut builder = http::Response::builder().status(200);
+            if let Some(rem) = ttl_remaining {
+                builder = builder.header("X-KV-TTL", rem.as_secs().to_string());
+                builder = builder.header("X-KV-TTL-MS", (rem.as_millis() as u64).to_string());
+            }
+            if entry.revision > 0 {
+                builder = builder.header("X-KV-Revision", entry.revision.to_string());
+            }
+            if let Some(meta) = &entry.metadata {
+                if let Ok(json) = serde_json::to_string(meta) {
+                    if let Ok(hv) = http::HeaderValue::from_str(&json) {
+                        builder = builder.header("X-KV-Metadata", hv);
+                    }
+                }
+            }
+            builder
+                .body(HttpBody::fixed_body(None))
+                .unwrap_or_else(|_| internal_error("response build failed"))
+        }
+    }
+}
+
+/// Modify the TTL of `key` without changing its value. Exactly one TTL option must be
+/// supplied: `ttl` (seconds from now), `ttl_ms` (millis from now), `ttl_at` (absolute
+/// unix seconds), `ttl_at_ms` (absolute unix millis), or `persist=1` to remove the TTL.
+///
+/// Set `X-KV-Return-Value: 1` to atomically fetch the current value in the same operation
+/// (GETEX semantics) — the response body is the value bytes and status is 200.
+/// Without that header the response is 204.
+///
+/// Returns 404 if the key does not exist.
+#[utoipa::path(
+    patch,
+    path = "/v1/kv/{key}",
+    operation_id = "patch_ttl",
+    tag = "kv",
+    params(
+        ("key" = String, Path, description = "Key to update. Percent-encoded."),
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+        ("ttl" = Option<u64>, Query, description = "New TTL in seconds from now."),
+        ("ttl_ms" = Option<u64>, Query, description = "New TTL in milliseconds from now."),
+        ("ttl_at" = Option<u64>, Query, description = "Absolute expiry as a Unix timestamp in seconds."),
+        ("ttl_at_ms" = Option<u64>, Query, description = "Absolute expiry as a Unix timestamp in milliseconds."),
+        ("persist" = Option<u8>, Query, description = "Set `persist=1` to remove the TTL entirely."),
+        ("X-KV-Return-Value" = Option<String>, Header, description = "Set to any value to return the current value bytes in the response body (GETEX semantics)."),
+    ),
+    responses(
+        (status = 200, description = "TTL updated. Body contains the current value (`X-KV-Return-Value` path only).", content_type = "application/octet-stream",
+            headers(
+                ("X-KV-TTL" = u64, description = "New remaining TTL in seconds. Absent if persist was requested."),
+                ("X-KV-TTL-MS" = u64, description = "New remaining TTL in milliseconds. Absent if persist was requested."),
+                ("X-KV-Revision" = u64, description = "Current revision. Absent if key was never written via `If-Match`."),
+                ("X-KV-Metadata" = String, description = "JSON metadata. Absent if none stored."),
+            )
+        ),
+        (status = 204, description = "TTL updated. No body."),
+        (status = 400, body = ErrorResponse, description = "No TTL option supplied, or multiple supplied."),
+        (status = 404, description = "Key does not exist."),
+    )
+)]
+async fn handle_patch(
+    ns: &str,
+    key: &[u8],
+    parts: &http::request::Parts,
+    store: &ShardStore,
+) -> http::Response<HttpBody> {
+    let query = parts.uri.query().unwrap_or("");
+    let return_value = parts.headers.contains_key("x-kv-return-value");
+
+    let getex_op = parse_ttl_op(query);
+
+    if return_value {
+        // GETEX: atomically get the value and optionally update TTL.
+        match store.getex(ns, key, getex_op).await {
+            Err(e) => engine_error_response(e),
+            Ok(None) => http::Response::builder()
+                .status(404)
+                .body(HttpBody::fixed_body(None))
+                .unwrap_or_else(|_| fallback_500()),
+            Ok(Some(entry)) => {
+                let ttl_remaining = entry
+                    .expires_at
+                    .map(|t| t.saturating_duration_since(std::time::Instant::now()));
+                let mut builder = http::Response::builder().status(200);
+                if let Some(rem) = ttl_remaining {
+                    builder = builder.header("X-KV-TTL", rem.as_secs().to_string());
+                    builder = builder.header("X-KV-TTL-MS", (rem.as_millis() as u64).to_string());
+                }
+                if entry.revision > 0 {
+                    builder = builder.header("X-KV-Revision", entry.revision.to_string());
+                }
+                if let Some(meta) = &entry.metadata {
+                    if let Ok(json) = serde_json::to_string(meta) {
+                        if let Ok(hv) = http::HeaderValue::from_str(&json) {
+                            builder = builder.header("X-KV-Metadata", hv);
+                        }
+                    }
+                }
+                builder
+                    .header("Content-Type", "application/octet-stream")
+                    .body(HttpBody::fixed_body(Some(entry.value)))
+                    .unwrap_or_else(|_| internal_error("response build failed"))
+            }
+        }
+    } else {
+        // TTL-only update: no value read.
+        match getex_op {
+            None => json_response(
+                400,
+                &serde_json::json!({
+                    "error": "invalid_request",
+                    "message": "supply exactly one of: ttl, ttl_ms, ttl_at, ttl_at_ms, persist=1"
+                }),
+            ),
+            Some(beyond_kv_engine::types::GetExOp::Persist) => match store.persist(ns, key).await {
+                Ok(true) => no_content(),
+                Ok(false) => http::Response::builder()
+                    .status(404)
+                    .body(HttpBody::fixed_body(None))
+                    .unwrap_or_else(|_| fallback_500()),
+                Err(e) => engine_error_response(e),
+            },
+            Some(beyond_kv_engine::types::GetExOp::SetTtl(dur)) => {
+                match store.expire(ns, key, dur).await {
+                    Ok(true) => no_content(),
+                    Ok(false) => http::Response::builder()
+                        .status(404)
+                        .body(HttpBody::fixed_body(None))
+                        .unwrap_or_else(|_| fallback_500()),
+                    Err(e) => engine_error_response(e),
+                }
+            }
         }
     }
 }
@@ -460,8 +691,13 @@ async fn handle_put(
 }
 
 /// Delete `key` from the store. Idempotent — returns 204 whether or not the key existed.
-/// Supply `If-Match: <rev>` for a conditional delete: returns 409 if the stored revision
-/// does not match, leaving the key untouched.
+///
+/// **Conditional delete** — supply `If-Match: <rev>`: returns 409 if the stored revision
+/// does not match, leaving the key untouched. Mutually exclusive with `X-KV-Return-Old`.
+///
+/// **Atomic read-then-delete** — set `X-KV-Return-Old: 1` to atomically delete the key
+/// and return its previous value (200) in a single operation. Returns 204 when the key
+/// did not exist. Mutually exclusive with `If-Match`.
 #[utoipa::path(
     delete,
     path = "/v1/kv/{key}",
@@ -470,10 +706,19 @@ async fn handle_put(
     params(
         ("key" = String, Path, description = "Key to delete. Percent-encoded."),
         ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
-        ("If-Match" = Option<u64>, Header, description = "Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched."),
+        ("If-Match" = Option<u64>, Header, description = "Delete only if the stored revision equals this value. Returns 409 on mismatch, leaving the key untouched. Mutually exclusive with `X-KV-Return-Old`."),
+        ("X-KV-Return-Old" = Option<String>, Header, description = "Set to any value to atomically delete and return the previous value (200). Returns 204 when the key did not exist. Mutually exclusive with `If-Match`."),
     ),
     responses(
-        (status = 204, description = "Deleted. Also returned when the key did not exist (idempotent)."),
+        (status = 200, description = "Key deleted. Body contains the previous value (`X-KV-Return-Old` path only).", content_type = "application/octet-stream",
+            headers(
+                ("X-KV-TTL" = u64, description = "Remaining TTL in whole seconds the deleted entry had. Absent if it had no expiry."),
+                ("X-KV-TTL-MS" = u64, description = "Remaining TTL in milliseconds the deleted entry had. Absent if it had no expiry."),
+                ("X-KV-Revision" = u64, description = "Revision of the deleted entry."),
+                ("X-KV-Metadata" = String, description = "JSON metadata blob the deleted entry had. Absent if none was stored."),
+            )
+        ),
+        (status = 204, description = "Deleted (or key did not exist — idempotent)."),
         (status = 409, body = ErrorResponse, description = "Revision mismatch — `If-Match` was supplied but the stored revision differs."),
     )
 )]
@@ -488,6 +733,7 @@ async fn handle_delete(
         .get("if-match")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
+    let return_old = parts.headers.contains_key("x-kv-return-old");
 
     if let Some(expected_rev) = if_match {
         return match store.delrev(ns, key, expected_rev).await {
@@ -497,6 +743,37 @@ async fn handle_delete(
                 &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
             ),
             Err(e) => engine_error_response(e),
+        };
+    }
+
+    if return_old {
+        return match store.getdel(ns, key).await {
+            Err(e) => engine_error_response(e),
+            Ok(None) => no_content(),
+            Ok(Some(entry)) => {
+                let ttl_remaining = entry
+                    .expires_at
+                    .map(|t| t.saturating_duration_since(std::time::Instant::now()));
+                let mut builder = http::Response::builder().status(200);
+                if let Some(rem) = ttl_remaining {
+                    builder = builder.header("X-KV-TTL", rem.as_secs().to_string());
+                    builder = builder.header("X-KV-TTL-MS", (rem.as_millis() as u64).to_string());
+                }
+                if entry.revision > 0 {
+                    builder = builder.header("X-KV-Revision", entry.revision.to_string());
+                }
+                if let Some(meta) = &entry.metadata {
+                    if let Ok(json) = serde_json::to_string(meta) {
+                        if let Ok(hv) = http::HeaderValue::from_str(&json) {
+                            builder = builder.header("X-KV-Metadata", hv);
+                        }
+                    }
+                }
+                builder
+                    .header("Content-Type", "application/octet-stream")
+                    .body(HttpBody::fixed_body(Some(entry.value)))
+                    .unwrap_or_else(|_| internal_error("response build failed"))
+            }
         };
     }
 
@@ -537,6 +814,711 @@ async fn handle_incr(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_dbsize(
+    ns: &str,
+    store: &ShardStore,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
+) -> http::Response<HttpBody> {
+    if n_shards <= 1 {
+        return match store.db_size(ns).await {
+            Ok(count) => json_response(200, &serde_json::json!({ "count": count })),
+            Err(e) => engine_error_response(e),
+        };
+    }
+
+    let mut total: u64 = 0;
+    let mut reply_rxs = Vec::with_capacity(n_shards - 1);
+
+    for shard in 0..n_shards {
+        if shard == shard_idx {
+            match store.db_size(ns).await {
+                Ok(n) => total += n,
+                Err(e) => return engine_error_response(e),
+            }
+        } else {
+            let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+            let req = CrossShardRequest::DbSize {
+                ns: ns.to_string(),
+                reply: reply_tx,
+            };
+            if cross_shard_txs[shard].clone().try_send(req).is_err() {
+                return json_response(
+                    503,
+                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                );
+            }
+            let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
+            reply_rxs.push(reply_rx);
+        }
+    }
+
+    for rx in reply_rxs {
+        match rx.await {
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => return internal_error(&e),
+            Err(e) => return internal_error(&e.to_string()),
+        }
+    }
+
+    json_response(200, &serde_json::json!({ "count": total }))
+}
+
+/// Delete all keys in the namespace. Returns 204 even if the namespace was already empty.
+#[utoipa::path(
+    delete,
+    path = "/v1/kv",
+    operation_id = "flush_namespace",
+    tag = "kv",
+    params(
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+    ),
+    responses(
+        (status = 204, description = "All keys deleted (idempotent)."),
+    )
+)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_flushdb(
+    ns: &str,
+    store: &ShardStore,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
+) -> http::Response<HttpBody> {
+    if n_shards <= 1 {
+        return match store.flush_db(ns).await {
+            Ok(()) => no_content(),
+            Err(e) => engine_error_response(e),
+        };
+    }
+
+    let mut reply_rxs = Vec::with_capacity(n_shards - 1);
+
+    for shard in 0..n_shards {
+        if shard == shard_idx {
+            if let Err(e) = store.flush_db(ns).await {
+                return engine_error_response(e);
+            }
+        } else {
+            let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+            let req = CrossShardRequest::FlushDb {
+                ns: ns.to_string(),
+                reply: reply_tx,
+            };
+            if cross_shard_txs[shard].clone().try_send(req).is_err() {
+                return json_response(
+                    503,
+                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                );
+            }
+            let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
+            reply_rxs.push(reply_rx);
+        }
+    }
+
+    for rx in reply_rxs {
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return internal_error(&e),
+            Err(e) => return internal_error(&e.to_string()),
+        }
+    }
+
+    no_content()
+}
+
+/// Trigger a background log compaction (equivalent to BGREWRITEAOF). Returns immediately;
+/// compaction runs asynchronously.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/compact",
+    operation_id = "compact",
+    tag = "admin",
+    params(
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+    ),
+    responses(
+        (status = 204, description = "Compaction started in the background."),
+    )
+)]
+async fn handle_compact(ns: &str, store: &ShardStore) -> http::Response<HttpBody> {
+    match store.reclaim(ns).await {
+        Ok(()) => no_content(),
+        Err(e) => engine_error_response(e),
+    }
+}
+
+/// Execute a batch of mixed key-value operations in a single round-trip. Operations are
+/// executed in order and results are returned in the same order. There is no cross-operation
+/// atomicity guarantee — each operation is individually atomic.
+///
+/// Supported operations:
+/// - `get`: returns `{"value":"<base64url>","revision":N,"ttl":N,"metadata":{...}}` or `null` if not found
+/// - `set`: stores a value; returns `null`
+/// - `delete`: removes a key; returns `null`
+/// - `incr`: atomically increments a counter; returns `{"value":N}`
+///
+/// Set values and get results are base64url-encoded (no padding), matching the SSE watch format.
+#[utoipa::path(
+    post,
+    path = "/v1/kv/batch",
+    operation_id = "batch",
+    tag = "kv",
+    params(
+        ("ns" = Option<u8>, Query, description = "Namespace (0–15). Defaults to 0."),
+    ),
+    request_body(content_type = "application/json", description = "Array of operations."),
+    responses(
+        (status = 200, description = "Array of results in the same order as the request."),
+        (status = 400, body = ErrorResponse, description = "Malformed request body."),
+    )
+)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_batch(
+    ns: &str,
+    body: Bytes,
+    store: &ShardStore,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
+) -> http::Response<HttpBody> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "op", rename_all = "lowercase")]
+    enum BatchOp {
+        Get {
+            key: String,
+        },
+        Set {
+            key: String,
+            #[serde(default, deserialize_with = "deser_b64_opt")]
+            value: Option<Bytes>,
+            /// TTL in whole seconds. Overridden by `ttl_ms` when both are present.
+            #[serde(default)]
+            ttl: Option<u64>,
+            /// TTL in milliseconds. Takes priority over `ttl` when both are present.
+            #[serde(default, rename = "ttlMs")]
+            ttl_ms: Option<u64>,
+            #[serde(default)]
+            metadata: Option<serde_json::Value>,
+            #[serde(default)]
+            nx: bool,
+            #[serde(default)]
+            xx: bool,
+            #[serde(rename = "ifMatch")]
+            if_match: Option<u64>,
+            /// Preserve the existing TTL when overwriting a key.
+            #[serde(default, rename = "keepTtl")]
+            keep_ttl: bool,
+        },
+        Delete {
+            key: String,
+            #[serde(rename = "ifMatch")]
+            if_match: Option<u64>,
+            /// Atomically return the previous value before deleting.
+            #[serde(default, rename = "returnOld")]
+            return_old: bool,
+        },
+        Incr {
+            key: String,
+            #[serde(default = "default_delta")]
+            delta: i64,
+        },
+        Exists {
+            key: String,
+        },
+    }
+
+    fn default_delta() -> i64 {
+        1
+    }
+
+    fn deser_b64_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Bytes>, D::Error> {
+        use serde::Deserialize as _;
+        let s = Option::<String>::deserialize(d)?;
+        match s {
+            None => Ok(None),
+            Some(s) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s.as_bytes())
+                .map(|b| Some(Bytes::from(b)))
+                .map_err(serde::de::Error::custom),
+        }
+    }
+
+    let ops: Vec<BatchOp> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(
+                400,
+                &serde_json::json!({"error":"invalid_request","message": e.to_string()}),
+            );
+        }
+    };
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        let result = match op {
+            BatchOp::Get { key } => {
+                let raw_key = percent_decode(&key);
+                let entry = if n_shards > 1 {
+                    let target = shard_for_key(&raw_key, n_shards);
+                    if target == shard_idx {
+                        store.get(ns, &raw_key).await.map_err(|e| e.to_string())
+                    } else {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::MGet {
+                            ns: ns.to_string(),
+                            keys: vec![(0, Bytes::copy_from_slice(&raw_key))],
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(Ok(mut v)) => Ok(v.pop().and_then(|(_, e)| e)),
+                            Ok(Err(e)) => Err(e),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                } else {
+                    store.get(ns, &raw_key).await.map_err(|e| e.to_string())
+                };
+
+                match entry {
+                    Err(e) => return internal_error(&e),
+                    Ok(None) => serde_json::Value::Null,
+                    Ok(Some(e)) => {
+                        let mut obj = serde_json::json!({
+                            "value": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&e.value),
+                            "revision": e.revision,
+                        });
+                        if let Some(exp) = e.expires_at {
+                            let rem = exp.saturating_duration_since(std::time::Instant::now());
+                            obj["ttl"] = rem.as_secs().into();
+                            obj["ttl_ms"] = (rem.as_millis() as u64).into();
+                        }
+                        if let Some(meta) = e.metadata {
+                            obj["metadata"] = meta.as_ref().clone();
+                        }
+                        obj
+                    }
+                }
+            }
+
+            BatchOp::Set {
+                key,
+                value,
+                ttl,
+                ttl_ms,
+                metadata,
+                nx,
+                xx,
+                if_match,
+                keep_ttl,
+            } => {
+                let raw_key = percent_decode(&key);
+                let value_bytes = value.unwrap_or_default();
+                let opts = SetOptions {
+                    ttl: ttl_ms
+                        .map(Duration::from_millis)
+                        .or_else(|| ttl.map(Duration::from_secs)),
+                    metadata: metadata.map(Arc::new),
+                    keep_ttl,
+                };
+
+                let outcome: BatchSetOutcome = if n_shards > 1 {
+                    let target = shard_for_key(&raw_key, n_shards);
+                    if target == shard_idx {
+                        batch_set_local(ns, &raw_key, value_bytes, opts, nx, xx, if_match, store)
+                            .await
+                    } else if let Some(rev) = if_match {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::SetRev {
+                            ns: ns.to_string(),
+                            key: Bytes::copy_from_slice(&raw_key),
+                            value: value_bytes,
+                            opts,
+                            revision: rev,
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(Ok(Some(_))) => BatchSetOutcome::Ok,
+                            Ok(Ok(None)) => BatchSetOutcome::Conflict("revision mismatch"),
+                            Ok(Err(e)) => BatchSetOutcome::Err(e),
+                            Err(e) => BatchSetOutcome::Err(e.to_string()),
+                        }
+                    } else if nx {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::SetNx {
+                            ns: ns.to_string(),
+                            key: Bytes::copy_from_slice(&raw_key),
+                            value: value_bytes,
+                            opts,
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(Ok(true)) => BatchSetOutcome::Ok,
+                            Ok(Ok(false)) => BatchSetOutcome::Conflict("key already exists"),
+                            Ok(Err(e)) => BatchSetOutcome::Err(e),
+                            Err(e) => BatchSetOutcome::Err(e.to_string()),
+                        }
+                    } else if xx {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::SetXx {
+                            ns: ns.to_string(),
+                            key: Bytes::copy_from_slice(&raw_key),
+                            value: value_bytes,
+                            opts,
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(Ok(true)) => BatchSetOutcome::Ok,
+                            Ok(Ok(false)) => BatchSetOutcome::Conflict("key does not exist"),
+                            Ok(Err(e)) => BatchSetOutcome::Err(e),
+                            Err(e) => BatchSetOutcome::Err(e.to_string()),
+                        }
+                    } else {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::Set {
+                            ns: ns.to_string(),
+                            key: Bytes::copy_from_slice(&raw_key),
+                            value: value_bytes,
+                            opts,
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(Ok(())) => BatchSetOutcome::Ok,
+                            Ok(Err(e)) => BatchSetOutcome::Err(e),
+                            Err(e) => BatchSetOutcome::Err(e.to_string()),
+                        }
+                    }
+                } else {
+                    batch_set_local(ns, &raw_key, value_bytes, opts, nx, xx, if_match, store).await
+                };
+
+                match outcome {
+                    BatchSetOutcome::Ok => serde_json::Value::Null,
+                    BatchSetOutcome::Conflict(msg) => {
+                        return json_response(
+                            409,
+                            &serde_json::json!({"error":"conflict","message":msg}),
+                        );
+                    }
+                    BatchSetOutcome::Err(e) => return internal_error(&e),
+                }
+            }
+
+            BatchOp::Delete {
+                key,
+                if_match,
+                return_old,
+            } => {
+                let raw_key = percent_decode(&key);
+
+                // `return_old` path: atomically get-then-delete, return Entry JSON.
+                if return_old {
+                    let entry_result: Result<Option<beyond_kv_engine::types::Entry>, String> =
+                        if n_shards > 1 {
+                            let target = shard_for_key(&raw_key, n_shards);
+                            if target == shard_idx {
+                                store.getdel(ns, &raw_key).await.map_err(|e| e.to_string())
+                            } else {
+                                let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                                let req = CrossShardRequest::GetDel {
+                                    ns: ns.to_string(),
+                                    key: Bytes::copy_from_slice(&raw_key),
+                                    orig_idx: 0,
+                                    reply: reply_tx,
+                                };
+                                if cross_shard_txs[target].clone().try_send(req).is_err() {
+                                    return json_response(
+                                        503,
+                                        &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                                    );
+                                }
+                                let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                                match reply_rx.await {
+                                    Ok(Ok((_, e))) => Ok(e),
+                                    Ok(Err(e)) => Err(e),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            }
+                        } else {
+                            store.getdel(ns, &raw_key).await.map_err(|e| e.to_string())
+                        };
+
+                    match entry_result {
+                        Err(e) => return internal_error(&e),
+                        Ok(None) => serde_json::Value::Null,
+                        Ok(Some(e)) => {
+                            let mut obj = serde_json::json!({
+                                "value": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&e.value),
+                                "revision": e.revision,
+                            });
+                            if let Some(exp) = e.expires_at {
+                                let rem = exp.saturating_duration_since(std::time::Instant::now());
+                                obj["ttl"] = rem.as_secs().into();
+                                obj["ttl_ms"] = (rem.as_millis() as u64).into();
+                            }
+                            if let Some(meta) = e.metadata {
+                                obj["metadata"] = meta.as_ref().clone();
+                            }
+                            obj
+                        }
+                    }
+                } else {
+                    // Standard delete (or conditional-by-revision delete).
+                    // Returns Ok(true)=deleted, Ok(false)=conflict (rev mismatch), Err=engine error.
+                    let del_result: Result<bool, String> = if n_shards > 1 {
+                        let target = shard_for_key(&raw_key, n_shards);
+                        if target == shard_idx {
+                            if let Some(rev) = if_match {
+                                store
+                                    .delrev(ns, &raw_key, rev)
+                                    .await
+                                    .map(|opt| opt.is_some())
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                store
+                                    .del(ns, &[raw_key.as_slice()])
+                                    .await
+                                    .map(|_| true)
+                                    .map_err(|e| e.to_string())
+                            }
+                        } else if let Some(rev) = if_match {
+                            let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                            let req = CrossShardRequest::DelRev {
+                                ns: ns.to_string(),
+                                key: Bytes::copy_from_slice(&raw_key),
+                                revision: rev,
+                                reply: reply_tx,
+                            };
+                            if cross_shard_txs[target].clone().try_send(req).is_err() {
+                                return json_response(
+                                    503,
+                                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                                );
+                            }
+                            let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                            match reply_rx.await {
+                                Ok(r) => r.map(|opt| opt.is_some()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        } else {
+                            let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                            let req = CrossShardRequest::Del {
+                                ns: ns.to_string(),
+                                keys: vec![Bytes::copy_from_slice(&raw_key)],
+                                reply: reply_tx,
+                            };
+                            if cross_shard_txs[target].clone().try_send(req).is_err() {
+                                return json_response(
+                                    503,
+                                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                                );
+                            }
+                            let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                            match reply_rx.await {
+                                Ok(r) => r.map(|_| true),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                    } else if let Some(rev) = if_match {
+                        store
+                            .delrev(ns, &raw_key, rev)
+                            .await
+                            .map(|opt| opt.is_some())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        store
+                            .del(ns, &[raw_key.as_slice()])
+                            .await
+                            .map(|_| true)
+                            .map_err(|e| e.to_string())
+                    };
+
+                    match del_result {
+                        Err(e) => return internal_error(&e),
+                        Ok(false) => {
+                            return json_response(
+                                409,
+                                &serde_json::json!({"error":"conflict","message":"revision mismatch"}),
+                            );
+                        }
+                        Ok(true) => serde_json::Value::Null,
+                    }
+                }
+            }
+
+            BatchOp::Exists { key } => {
+                let raw_key = percent_decode(&key);
+                let count: Result<u64, String> = if n_shards > 1 {
+                    let target = shard_for_key(&raw_key, n_shards);
+                    if target == shard_idx {
+                        store
+                            .exists(ns, &[raw_key.as_slice()])
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::Exists {
+                            ns: ns.to_string(),
+                            keys: vec![Bytes::copy_from_slice(&raw_key)],
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(r) => r,
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                } else {
+                    store
+                        .exists(ns, &[raw_key.as_slice()])
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+
+                match count {
+                    Err(e) => return internal_error(&e),
+                    Ok(n) => serde_json::Value::Bool(n > 0),
+                }
+            }
+
+            BatchOp::Incr { key, delta } => {
+                let raw_key = percent_decode(&key);
+                let res: Result<i64, String> = if n_shards > 1 {
+                    let target = shard_for_key(&raw_key, n_shards);
+                    if target == shard_idx {
+                        store
+                            .incr(ns, &raw_key, delta)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+                        let req = CrossShardRequest::Incr {
+                            ns: ns.to_string(),
+                            key: Bytes::copy_from_slice(&raw_key),
+                            delta,
+                            reply: reply_tx,
+                        };
+                        if cross_shard_txs[target].clone().try_send(req).is_err() {
+                            return json_response(
+                                503,
+                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
+                            );
+                        }
+                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        match reply_rx.await {
+                            Ok(r) => r,
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                } else {
+                    store
+                        .incr(ns, &raw_key, delta)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+
+                match res {
+                    Err(e) => return internal_error(&e),
+                    Ok(n) => serde_json::json!({ "value": n }),
+                }
+            }
+        };
+
+        results.push(result);
+    }
+
+    json_response(200, &serde_json::Value::Array(results))
+}
+
+enum BatchSetOutcome {
+    Ok,
+    Conflict(&'static str),
+    Err(String),
+}
+
+async fn batch_set_local(
+    ns: &str,
+    key: &[u8],
+    value: Bytes,
+    opts: SetOptions,
+    nx: bool,
+    xx: bool,
+    if_match: Option<u64>,
+    store: &ShardStore,
+) -> BatchSetOutcome {
+    if let Some(rev) = if_match {
+        match store.setrev(ns, key, value, opts, rev).await {
+            Ok(Some(_)) => BatchSetOutcome::Ok,
+            Ok(None) => BatchSetOutcome::Conflict("revision mismatch"),
+            Err(e) => BatchSetOutcome::Err(e.to_string()),
+        }
+    } else if nx {
+        match store.setnx(ns, key, value, opts).await {
+            Ok(true) => BatchSetOutcome::Ok,
+            Ok(false) => BatchSetOutcome::Conflict("key already exists"),
+            Err(e) => BatchSetOutcome::Err(e.to_string()),
+        }
+    } else if xx {
+        match store.setxx(ns, key, value, opts).await {
+            Ok(true) => BatchSetOutcome::Ok,
+            Ok(false) => BatchSetOutcome::Conflict("key does not exist"),
+            Err(e) => BatchSetOutcome::Err(e.to_string()),
+        }
+    } else {
+        match store.set(ns, key, value, opts).await {
+            Ok(()) => BatchSetOutcome::Ok,
+            Err(e) => BatchSetOutcome::Err(e.to_string()),
+        }
+    }
+}
+
 /// Multi-shard cursor prefix used in HTTP LIST responses. Format: `\x02 + shard_byte + per_shard_cursor`.
 /// Distinct from the engine's `\x01` continuation cursor so we can detect which format is in use.
 const LIST_CURSOR_PREFIX: u8 = 0x02;
@@ -547,6 +1529,8 @@ const LIST_CURSOR_PREFIX: u8 = 0x02;
 /// the subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.
 /// Across multiple shards, the cursor encodes per-shard positions so fan-out is handled
 /// transparently by the server.
+///
+/// Pass `count=1` to return only the total key count instead of a key listing.
 #[utoipa::path(
     get,
     path = "/v1/kv",
@@ -557,9 +1541,10 @@ const LIST_CURSOR_PREFIX: u8 = 0x02;
         ("prefix" = Option<String>, Query, description = "Return only keys that begin with this string. Percent-encoded. Omit to return all keys."),
         ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous `ListResponse`. Omit or pass `0` to start from the beginning."),
         ("limit" = Option<u64>, Query, description = "Maximum keys to return per page (1–1000). Defaults to 100."),
+        ("count" = Option<u8>, Query, description = "Set `count=1` to return only the total key count instead of a listing."),
     ),
     responses(
-        (status = 200, body = ListResponse, description = "Page of matching keys in lexicographic order."),
+        (status = 200, body = ListResponse, description = "Page of matching keys in lexicographic order. When `count=1` is supplied, returns `{\"count\": N}` instead."),
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -930,6 +1915,44 @@ fn sse_event_json(event: &WatchEvent) -> String {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Parse TTL modification options from the query string into a `GetExOp`.
+/// Returns `None` when no TTL option is present (valid for GETEX with no TTL change,
+/// invalid for PATCH where at least one option is required).
+fn parse_ttl_op(query: &str) -> Option<beyond_kv_engine::types::GetExOp> {
+    use beyond_kv_engine::types::GetExOp;
+    if query_param(query, "persist").is_some() {
+        return Some(GetExOp::Persist);
+    }
+    if let Some(s) = query_param(query, "ttl") {
+        if let Ok(secs) = s.parse::<u64>() {
+            return Some(GetExOp::SetTtl(Duration::from_secs(secs)));
+        }
+    }
+    if let Some(s) = query_param(query, "ttl_ms") {
+        if let Ok(ms) = s.parse::<u64>() {
+            return Some(GetExOp::SetTtl(Duration::from_millis(ms)));
+        }
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(s) = query_param(query, "ttl_at") {
+        if let Ok(at) = s.parse::<u64>() {
+            let remaining = at.saturating_sub(now_secs);
+            return Some(GetExOp::SetTtl(Duration::from_secs(remaining)));
+        }
+    }
+    if let Some(s) = query_param(query, "ttl_at_ms") {
+        if let Ok(at_ms) = s.parse::<u64>() {
+            let now_ms = now_secs * 1000;
+            let remaining_ms = at_ms.saturating_sub(now_ms);
+            return Some(GetExOp::SetTtl(Duration::from_millis(remaining_ms)));
+        }
+    }
+    None
+}
+
 fn parse_ttl_from_request(parts: &http::request::Parts) -> Option<Duration> {
     let header_ttl = parts
         .headers
@@ -1027,6 +2050,13 @@ struct IncrResponse {
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[allow(dead_code)]
+struct CountResponse {
+    /// Total number of keys in the namespace.
+    count: u64,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
 struct KeyItem {
     /// Key name (percent-decoded).
     name: String,
@@ -1042,6 +2072,7 @@ struct ListResponse {
     complete: bool,
     /// Opaque pagination cursor. Pass as the `cursor` query parameter on the next request
     /// to fetch the subsequent page. Absent when `complete` is `true`.
+    #[schema(nullable)]
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
 }
@@ -1062,15 +2093,20 @@ struct ErrorResponse {
         title = "beyond/kv",
         version = "1",
         description = "Low-latency key-value store with namespaces, TTL, revision-based \
-            conditional writes, atomic increment, and cursor-paginated key listing. \
-            All keys and values are raw bytes; values are transmitted as \
+            conditional writes, atomic increment, cursor-paginated key listing, and batch \
+            operations. All keys and values are raw bytes; values are transmitted as \
             `application/octet-stream`. Namespaces (0–15) are independent keyspaces \
             sharing the same physical store."
     ),
-    paths(handle_get, handle_put, handle_delete, handle_incr, handle_list),
-    components(schemas(IncrResponse, KeyItem, ListResponse, ErrorResponse)),
+    paths(
+        handle_get, handle_head, handle_put, handle_patch, handle_delete,
+        handle_incr, handle_list, handle_flushdb,
+        handle_compact, handle_batch,
+    ),
+    components(schemas(IncrResponse, CountResponse, KeyItem, ListResponse, ErrorResponse)),
     tags(
-        (name = "kv", description = "Key-value operations: get, put, delete, increment, and list."),
+        (name = "kv", description = "Key-value operations: get, put, delete, increment, list, and batch."),
+        (name = "admin", description = "Administrative operations: compaction."),
     )
 )]
 pub struct ApiDoc;

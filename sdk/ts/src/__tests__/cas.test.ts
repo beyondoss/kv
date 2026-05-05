@@ -7,7 +7,7 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry).not.toBeNull();
     expect(entry!.revision).toBeGreaterThan(0);
   });
@@ -16,9 +16,9 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
     await kv.set(key, "v2");
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
     expect(e2!.revision).toBeGreaterThan(e1!.revision);
   });
 
@@ -26,13 +26,12 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
-    await expect(
-      kv.set(key, "v2", { ifMatch: entry!.revision }),
-    ).resolves.toBeUndefined();
+    const { error } = await kv.set(key, "v2", { ifMatch: entry!.revision });
+    expect(error).toBeUndefined();
 
-    const updated = await kv.get(key);
+    const { data: updated } = await kv.get(key);
     expect(dec(updated!.value)).toBe("v2");
   });
 
@@ -40,19 +39,18 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     // Advance the revision with another write.
     await kv.set(key, "v2");
 
-    await expect(
-      kv.set(key, "v3", { ifMatch: entry!.revision }),
-    ).rejects.toSatisfy(
+    const { error } = await kv.set(key, "v3", { ifMatch: entry!.revision });
+    expect(error).toSatisfy(
       (e) => e instanceof KvError && e.status === 409 && e.code === "conflict",
     );
 
     // Value must be unchanged after failed CAS.
-    const current = await kv.get(key);
+    const { data: current } = await kv.get(key);
     expect(dec(current!.value)).toBe("v2");
   });
 
@@ -60,23 +58,22 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
 
-    await expect(
-      kv.set(key, "v1", { ifMatch: 12345 }),
-    ).rejects.toSatisfy(
+    const { error } = await kv.set(key, "v1", { ifMatch: 12345 });
+    expect(error).toSatisfy(
       (e) => e instanceof KvError && e.status === 409,
     );
 
-    expect(await kv.get(key)).toBeNull();
+    expect((await kv.get(key)).data).toBeNull();
   });
 
   it("revision changes after successful CAS", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
 
     await kv.set(key, "v2", { ifMatch: e1!.revision });
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
 
     expect(e2!.revision).toBeGreaterThan(e1!.revision);
     expect(dec(e2!.value)).toBe("v2");
@@ -88,11 +85,11 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     await kv.set(key, "v0");
 
     for (let i = 1; i <= 5; i++) {
-      const entry = await kv.get(key);
+      const { data: entry } = await kv.get(key);
       await kv.set(key, `v${i}`, { ifMatch: entry!.revision });
     }
 
-    const final = await kv.get(key);
+    const { data: final } = await kv.get(key);
     expect(dec(final!.value)).toBe("v5");
   });
 
@@ -100,34 +97,36 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "initial");
-    const stale = await kv.get(key);
+    const { data: stale } = await kv.get(key);
 
     // Advance the revision.
     await kv.set(key, "updated");
 
     // First attempt with stale revision fails.
-    await expect(
-      kv.set(key, "mine", { ifMatch: stale!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error: error1 } = await kv.set(key, "mine", {
+      ifMatch: stale!.revision,
+    });
+    expect(error1).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
     // Re-read and retry succeeds.
-    const fresh = await kv.get(key);
-    await expect(
-      kv.set(key, "mine", { ifMatch: fresh!.revision }),
-    ).resolves.toBeUndefined();
+    const { data: fresh } = await kv.get(key);
+    const { error: error2 } = await kv.set(key, "mine", {
+      ifMatch: fresh!.revision,
+    });
+    expect(error2).toBeUndefined();
 
-    expect(dec((await kv.get(key))!.value)).toBe("mine");
+    expect(dec((await kv.get(key)).data!.value)).toBe("mine");
   });
 
   it("ifMatch with TTL sets expiry on success", async () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     await kv.set(key, "v2", { ifMatch: entry!.revision, ttl: 60 });
 
-    const updated = await kv.get(key);
+    const { data: updated } = await kv.get(key);
     expect(dec(updated!.value)).toBe("v2");
     expect(updated!.ttl).toBeGreaterThan(0);
     expect(updated!.ttl).toBeLessThanOrEqual(60);
@@ -137,29 +136,28 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "initial");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     const rev = entry!.revision;
 
     const N = 10;
-    const results = await Promise.allSettled(
+    const results = await Promise.all(
       Array.from(
         { length: N },
         (_, i) => kv.set(key, `writer-${i}`, { ifMatch: rev }),
       ),
     );
 
-    const successes = results.filter((r) => r.status === "fulfilled");
+    const successes = results.filter((r) => r.error === undefined);
     const conflicts = results.filter(
       (r) =>
-        r.status === "rejected"
-        && r.reason instanceof KvError
-        && r.reason.status === 409,
+        r.error instanceof KvError
+        && r.error.status === 409,
     );
 
     expect(successes).toHaveLength(1);
     expect(conflicts).toHaveLength(N - 1);
 
-    const final = await kv.get(key);
+    const { data: final } = await kv.get(key);
     expect(final!.revision).toBeGreaterThan(rev);
     expect(dec(final!.value)).toMatch(/^writer-\d+$/);
   });
@@ -168,16 +166,15 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
 
     await kv.set(key, "v2");
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
 
-    await expect(
-      kv.set(key, "v3", { ifMatch: e1!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error } = await kv.set(key, "v3", { ifMatch: e1!.revision });
+    expect(error).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
-    const e3 = await kv.get(key);
+    const { data: e3 } = await kv.get(key);
     expect(e3!.revision).toBe(e2!.revision);
   });
 
@@ -185,15 +182,14 @@ describe("HTTP backend — CAS (compare-and-swap)", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     await kv.delete(key);
 
-    await expect(
-      kv.set(key, "v2", { ifMatch: entry!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error } = await kv.set(key, "v2", { ifMatch: entry!.revision });
+    expect(error).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
-    expect(await kv.get(key)).toBeNull();
+    expect((await kv.get(key)).data).toBeNull();
   });
 });
 
@@ -202,7 +198,7 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     expect(entry).not.toBeNull();
     expect(entry!.revision).toBeGreaterThan(0);
     await kv.close();
@@ -212,9 +208,9 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
     await kv.set(key, "v2");
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
     expect(e2!.revision).toBeGreaterThan(e1!.revision);
     await kv.close();
   });
@@ -223,13 +219,12 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
-    await expect(
-      kv.set(key, "v2", { ifMatch: entry!.revision }),
-    ).resolves.toBeUndefined();
+    const { error } = await kv.set(key, "v2", { ifMatch: entry!.revision });
+    expect(error).toBeUndefined();
 
-    const updated = await kv.get(key);
+    const { data: updated } = await kv.get(key);
     expect(dec(updated!.value)).toBe("v2");
     await kv.close();
   });
@@ -238,17 +233,16 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     await kv.set(key, "v2");
 
-    await expect(
-      kv.set(key, "v3", { ifMatch: entry!.revision }),
-    ).rejects.toSatisfy(
+    const { error } = await kv.set(key, "v3", { ifMatch: entry!.revision });
+    expect(error).toSatisfy(
       (e) => e instanceof KvError && e.status === 409 && e.code === "conflict",
     );
 
-    const current = await kv.get(key);
+    const { data: current } = await kv.get(key);
     expect(dec(current!.value)).toBe("v2");
     await kv.close();
   });
@@ -257,13 +251,12 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
 
-    await expect(
-      kv.set(key, "v1", { ifMatch: 12345 }),
-    ).rejects.toSatisfy(
+    const { error } = await kv.set(key, "v1", { ifMatch: 12345 });
+    expect(error).toSatisfy(
       (e) => e instanceof KvError && e.status === 409,
     );
 
-    expect(await kv.get(key)).toBeNull();
+    expect((await kv.get(key)).data).toBeNull();
     await kv.close();
   });
 
@@ -271,10 +264,10 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
 
     await kv.set(key, "v2", { ifMatch: e1!.revision });
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
 
     expect(e2!.revision).toBeGreaterThan(e1!.revision);
     expect(dec(e2!.value)).toBe("v2");
@@ -287,11 +280,11 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     await kv.set(key, "v0");
 
     for (let i = 1; i <= 5; i++) {
-      const entry = await kv.get(key);
+      const { data: entry } = await kv.get(key);
       await kv.set(key, `v${i}`, { ifMatch: entry!.revision });
     }
 
-    const final = await kv.get(key);
+    const { data: final } = await kv.get(key);
     expect(dec(final!.value)).toBe("v5");
     await kv.close();
   });
@@ -300,20 +293,22 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "initial");
-    const stale = await kv.get(key);
+    const { data: stale } = await kv.get(key);
 
     await kv.set(key, "updated");
 
-    await expect(
-      kv.set(key, "mine", { ifMatch: stale!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error: error1 } = await kv.set(key, "mine", {
+      ifMatch: stale!.revision,
+    });
+    expect(error1).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
-    const fresh = await kv.get(key);
-    await expect(
-      kv.set(key, "mine", { ifMatch: fresh!.revision }),
-    ).resolves.toBeUndefined();
+    const { data: fresh } = await kv.get(key);
+    const { error: error2 } = await kv.set(key, "mine", {
+      ifMatch: fresh!.revision,
+    });
+    expect(error2).toBeUndefined();
 
-    expect(dec((await kv.get(key))!.value)).toBe("mine");
+    expect(dec((await kv.get(key)).data!.value)).toBe("mine");
     await kv.close();
   });
 
@@ -321,11 +316,11 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     await kv.set(key, "v2", { ifMatch: entry!.revision, ttl: 60 });
 
-    const updated = await kv.get(key);
+    const { data: updated } = await kv.get(key);
     expect(dec(updated!.value)).toBe("v2");
     expect(updated!.ttl).toBeGreaterThan(0);
     expect(updated!.ttl).toBeLessThanOrEqual(60);
@@ -336,29 +331,28 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "initial");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
     const rev = entry!.revision;
 
     const N = 10;
-    const results = await Promise.allSettled(
+    const results = await Promise.all(
       Array.from(
         { length: N },
         (_, i) => kv.set(key, `writer-${i}`, { ifMatch: rev }),
       ),
     );
 
-    const successes = results.filter((r) => r.status === "fulfilled");
+    const successes = results.filter((r) => r.error === undefined);
     const conflicts = results.filter(
       (r) =>
-        r.status === "rejected"
-        && r.reason instanceof KvError
-        && r.reason.status === 409,
+        r.error instanceof KvError
+        && r.error.status === 409,
     );
 
     expect(successes).toHaveLength(1);
     expect(conflicts).toHaveLength(N - 1);
 
-    const final = await kv.get(key);
+    const { data: final } = await kv.get(key);
     expect(final!.revision).toBeGreaterThan(rev);
     expect(dec(final!.value)).toMatch(/^writer-\d+$/);
     await kv.close();
@@ -368,16 +362,15 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const e1 = await kv.get(key);
+    const { data: e1 } = await kv.get(key);
 
     await kv.set(key, "v2");
-    const e2 = await kv.get(key);
+    const { data: e2 } = await kv.get(key);
 
-    await expect(
-      kv.set(key, "v3", { ifMatch: e1!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error } = await kv.set(key, "v3", { ifMatch: e1!.revision });
+    expect(error).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
-    const e3 = await kv.get(key);
+    const { data: e3 } = await kv.get(key);
     expect(e3!.revision).toBe(e2!.revision);
     await kv.close();
   });
@@ -386,15 +379,14 @@ describe("RESP backend — CAS (compare-and-swap)", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v1");
-    const entry = await kv.get(key);
+    const { data: entry } = await kv.get(key);
 
     await kv.delete(key);
 
-    await expect(
-      kv.set(key, "v2", { ifMatch: entry!.revision }),
-    ).rejects.toSatisfy((e) => e instanceof KvError && e.status === 409);
+    const { error } = await kv.set(key, "v2", { ifMatch: entry!.revision });
+    expect(error).toSatisfy((e) => e instanceof KvError && e.status === 409);
 
-    expect(await kv.get(key)).toBeNull();
+    expect((await kv.get(key)).data).toBeNull();
     await kv.close();
   });
 });
