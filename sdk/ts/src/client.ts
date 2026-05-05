@@ -3,6 +3,7 @@ import { createHttpKvClient } from "./http.js";
 import type {
   KvBatchOp,
   KvBatchResults,
+  KvCasOptions,
   KvDeleteOptions,
   KvEntry,
   KvListOptions,
@@ -17,6 +18,7 @@ import type { components, paths } from "./types.js";
 
 export type { components, paths };
 export type { operations } from "./types.js";
+export type { KvCasOptions } from "./kv-types.js";
 
 export interface KvCommandEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`. */
@@ -51,6 +53,41 @@ export interface KvClient {
    * Throws if the stored value is not a valid integer or if the result would overflow.
    */
   incr(key: string, delta?: number): Promise<number>;
+  /**
+   * Atomically decrement the integer stored at `key` by `delta` (default 1).
+   * Missing keys are treated as 0. Returns the new value.
+   * Throws if the stored value is not a valid integer or if the result would overflow.
+   */
+  decr(key: string, delta?: number): Promise<number>;
+  /**
+   * Compare-and-swap: atomically set `key` to `value` only if the stored revision
+   * matches `revision`. Returns the new revision on success.
+   * Throws `KvError` (409) if the revision does not match or the key is absent.
+   *
+   * Unlike `set(key, value, { ifMatch })`, `cas()` returns the new revision so you
+   * can chain CAS operations without an extra `get()` round-trip.
+   *
+   * @example
+   * ```ts
+   * const entry = await kv.get("counter");
+   * const newRev = await kv.cas("counter", "42", entry!.revision);
+   * // newRev is the revision to use for the next CAS
+   * ```
+   */
+  cas(
+    key: string,
+    value: string | Uint8Array,
+    revision: number,
+    opts?: KvCasOptions,
+  ): Promise<number>;
+  /**
+   * Atomically fetch and delete `key` in a single operation.
+   * Returns the entry that existed before deletion, or `null` if the key was absent.
+   *
+   * On the RESP backend this is a best-effort pipeline (REVISION + TTL + GETDEL)
+   * rather than a single atomic command; for strict atomicity use the HTTP backend.
+   */
+  getAndDelete(key: string): Promise<KvEntry | null>;
   /**
    * Execute multiple operations in one round-trip.
    * RESP backend: commands are pipelined. HTTP backend: requests run in parallel.

@@ -44,7 +44,7 @@ depends = ["test:unit", "test", "sdk:ts:test"]
 description = "Generate openapi/v1.json from annotated routes"
 run = "cargo run -p beyond-kv -- generate-openapi"
 
-[tasks."sdk:generate-types"]
+[tasks."sdk:ts:generate-types"]
 description = "Generate TypeScript types from the OpenAPI spec"
 depends = ["openapi:generate"]
 dir = "sdk"

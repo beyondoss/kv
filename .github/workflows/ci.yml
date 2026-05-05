@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: install rust components
+        run: rustup component add rustfmt clippy
+      - name: fmt
+        run: dprint check
+      - name: clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: test
+        run: cargo test --test cross_shard --test http --test resp
+      - name: sdk:ts typecheck
+        run: mise run sdk:ts:typecheck
+      - name: build
+        run: mise run build:release
+      - name: sdk:ts test
+        run: mise run sdk:ts:test
+      - name: audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit

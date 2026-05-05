@@ -9,8 +9,8 @@ export interface KvEntry {
   /** Remaining TTL in seconds. Absent if the key has no expiry. */
   ttl?: number;
   /**
-   * Arbitrary JSON metadata attached to the entry. Populated by the HTTP
-   * backend only; always `undefined` when using the RESP backend.
+   * Arbitrary JSON metadata attached to the entry.
+   * [HTTP only] — always `undefined` when using the RESP backend.
    */
   metadata?: unknown;
   /**
@@ -42,7 +42,7 @@ export interface KvSetOptions {
   ttl?: number;
   /**
    * Arbitrary JSON metadata to store alongside the value.
-   * HTTP backend only — silently ignored by the RESP backend.
+   * [HTTP only] — silently ignored by the RESP backend.
    */
   metadata?: unknown;
   /** Set only if the key does not already exist. Throws `KvError` (409) if it does. */
@@ -53,8 +53,22 @@ export interface KvSetOptions {
    * Compare-and-swap: only set if the current revision matches this value.
    * Throws `KvError` (409) on mismatch.
    * Obtain the current revision from `kv.get()`.
+   * Prefer `kv.cas()` over this when you need the new revision after a successful write.
    */
   ifMatch?: number;
+  /**
+   * Preserve the existing TTL when overwriting a key. Mutually exclusive with `ttl`.
+   * [HTTP only] — silently ignored by the RESP backend.
+   */
+  keepTtl?: boolean;
+}
+
+/**
+ * Options for {@link KvClient.cas}.
+ */
+export interface KvCasOptions {
+  /** TTL in seconds. Sets a new expiry on successful write. */
+  ttl?: number;
 }
 
 export interface KvMSetEntry {
@@ -112,7 +126,8 @@ export interface KvWatchOptions {
 export interface KvDeleteOptions {
   /**
    * Compare-and-delete: only delete if the stored revision matches this value.
-   * Throws `KvError` (409) on mismatch. HTTP backend only.
+   * Throws `KvError` (409) on mismatch.
+   * [HTTP only] — silently ignored by the RESP backend.
    */
   ifMatch?: number;
 }

@@ -3,6 +3,7 @@ import { KvError, KvNotFoundError } from "./errors.js";
 import type {
   KvBatchOp,
   KvBatchResults,
+  KvCasOptions,
   KvDeleteOptions,
   KvEntry,
   KvListKey,
@@ -128,7 +129,11 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     setOpts?: KvSetOptions,
   ): Promise<void> {
     const headers: Record<string, string> = {};
-    if (setOpts?.ttl != null) headers["x-kv-ttl"] = String(setOpts.ttl);
+    if (setOpts?.keepTtl) {
+      headers["x-kv-keepttl"] = "1";
+    } else if (setOpts?.ttl != null) {
+      headers["x-kv-ttl"] = String(setOpts.ttl);
+    }
     if (setOpts?.metadata != null) {
       headers["x-kv-metadata"] = JSON.stringify(setOpts.metadata);
     }
@@ -149,6 +154,65 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
 
     const res = await request("SET", 1, url, { method: "PUT", headers, body });
     if (!res.ok) throw await parseError(res);
+  }
+
+  async function cas(
+    key: string,
+    value: string | Uint8Array,
+    revision: number,
+    casOpts?: KvCasOptions,
+  ): Promise<number> {
+    const headers: Record<string, string> = {
+      "if-match": String(revision),
+    };
+    if (casOpts?.ttl != null) headers["x-kv-ttl"] = String(casOpts.ttl);
+
+    const body: BodyInit = typeof value === "string"
+      ? value
+      : new Blob([new Uint8Array(value)]);
+
+    const res = await request("CAS", 1, valueUrl(key), {
+      method: "PUT",
+      headers,
+      body,
+    });
+    if (!res.ok) throw await parseError(res);
+    const revHeader = res.headers.get("x-kv-revision");
+    return revHeader != null ? Number(revHeader) : 0;
+  }
+
+  async function getAndDelete(key: string): Promise<KvEntry | null> {
+    const headers: Record<string, string> = { "x-kv-return-old": "1" };
+    const res = await request("GETDEL", 1, valueUrl(key), {
+      method: "DELETE",
+      headers,
+    });
+    if (res.status === 204) return null;
+    if (!res.ok) throw await parseError(res);
+
+    const value = new Uint8Array(await res.arrayBuffer());
+    const ttlHeader = res.headers.get("x-kv-ttl");
+    const revHeader = res.headers.get("x-kv-revision");
+    const metaHeader = res.headers.get("x-kv-metadata");
+
+    const raw: {
+      value: Uint8Array;
+      ttl?: number;
+      metadata?: unknown;
+      revision: number;
+    } = {
+      value,
+      revision: revHeader != null ? Number(revHeader) : 0,
+    };
+    if (ttlHeader != null) raw.ttl = Number(ttlHeader);
+    if (metaHeader != null) {
+      try {
+        raw.metadata = JSON.parse(metaHeader) as unknown;
+      } catch (err) {
+        onMetadataParseError?.(key, metaHeader, err);
+      }
+    }
+    return makeEntry(raw);
   }
 
   async function incr(key: string, delta: number = 1): Promise<number> {
@@ -182,6 +246,13 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
 
     set,
     incr,
+
+    async decr(key: string, delta: number = 1): Promise<number> {
+      return incr(key, -delta);
+    },
+
+    cas,
+    getAndDelete,
 
     delete: deleteOp,
 

@@ -295,7 +295,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
               ...(ttlSecs >= 0 ? { ttl: ttlSecs } : {}),
             });
           } else if (op.op === "set") {
-            const [err] = results[off]!;
+            const [err, result] = results[off]!;
             if (err) {
               if (isConflictError(err)) {
                 throw new KvError("conflict", "revision mismatch", 409);
@@ -307,6 +307,15 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
                 throw new KvError("conflict", "key does not exist", 409);
               }
               throw err;
+            }
+            // SET NX/XX returns null when the condition wasn't met (not an error in ioredis)
+            if (result === null) {
+              if (op.opts?.ifAbsent) {
+                throw new KvError("conflict", "key already exists", 409);
+              }
+              if (op.opts?.ifPresent) {
+                throw new KvError("conflict", "key does not exist", 409);
+              }
             }
           } else if (op.op === "incr") {
             const [err, n] = results[off]!;
