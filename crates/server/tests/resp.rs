@@ -1301,6 +1301,101 @@ fn set_with_rev_condition_conflict_on_stale_revision() {
     assert!(msg.contains("conflict") || msg.contains("err"), "{msg}");
 }
 
+// ── DELREV ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn delrev_correct_revision_deletes_key() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("dr-k", "v").unwrap();
+    let rev: i64 = redis::cmd("REVISION").arg("dr-k").query(&mut con).unwrap();
+    let n: i64 = redis::cmd("DELREV")
+        .arg("dr-k")
+        .arg(rev)
+        .query(&mut con)
+        .unwrap();
+    assert_eq!(n, 1);
+    let gone: Option<String> = con.get("dr-k").unwrap();
+    assert!(gone.is_none());
+}
+
+#[test]
+fn delrev_wrong_revision_returns_error() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("dr-mismatch", "v").unwrap();
+    let err = redis::cmd("DELREV")
+        .arg("dr-mismatch")
+        .arg(9999u64)
+        .query::<i64>(&mut con)
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("conflict") || msg.contains("err"), "{msg}");
+    let still: Option<String> = con.get("dr-mismatch").unwrap();
+    assert!(still.is_some(), "key must survive a revision mismatch");
+}
+
+// ── GETMETA / SET META ────────────────────────────────────────────────────────
+
+#[test]
+fn set_with_meta_then_getmeta_returns_json() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = redis::cmd("SET")
+        .arg("meta-k")
+        .arg("v")
+        .arg("META")
+        .arg(r#"{"env":"test"}"#)
+        .query(&mut con)
+        .unwrap();
+    let meta: String = redis::cmd("GETMETA").arg("meta-k").query(&mut con).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&meta).expect("GETMETA must return valid JSON");
+    assert_eq!(parsed["env"], "test");
+}
+
+#[test]
+fn getmeta_missing_key_returns_nil() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let res: redis::Value = redis::cmd("GETMETA")
+        .arg("no-such-key")
+        .query(&mut con)
+        .unwrap();
+    assert!(matches!(res, redis::Value::Nil));
+}
+
+#[test]
+fn getmeta_key_without_meta_returns_nil() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = con.set("no-meta", "v").unwrap();
+    let res: redis::Value = redis::cmd("GETMETA")
+        .arg("no-meta")
+        .query(&mut con)
+        .unwrap();
+    assert!(matches!(res, redis::Value::Nil));
+}
+
+#[test]
+fn set_invalid_json_meta_is_ignored() {
+    let srv = TestServer::start();
+    let mut con = srv.resp();
+    let _: () = redis::cmd("SET")
+        .arg("bad-meta")
+        .arg("v")
+        .arg("META")
+        .arg("not-json")
+        .query(&mut con)
+        .unwrap();
+    let res: redis::Value = redis::cmd("GETMETA")
+        .arg("bad-meta")
+        .query(&mut con)
+        .unwrap();
+    // Invalid JSON is silently dropped; GETMETA returns nil.
+    assert!(matches!(res, redis::Value::Nil));
+}
+
 // ── WATCH ─────────────────────────────────────────────────────────────────────
 
 // Minimal RESP3 client for testing push-based protocols.

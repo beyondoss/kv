@@ -308,6 +308,24 @@ pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -
             }
         }
 
+        Command::DelRev { key, revision } => match store.delrev(&state.ns, &key, revision).await {
+            Ok(Some(())) => r::integer(1),
+            Ok(None) => r::error("CONFLICT", "revision mismatch"),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
+
+        Command::GetMeta { key } => match store.get(&state.ns, &key).await {
+            Ok(Some(entry)) => match entry.metadata {
+                Some(meta) => match serde_json::to_string(meta.as_ref()) {
+                    Ok(json) => r::bulk(Bytes::from(json)),
+                    Err(e) => r::error("ERR", &e.to_string()),
+                },
+                None => r::nil(),
+            },
+            Ok(None) => r::nil(),
+            Err(e) => r::error("ERR", &e.to_string()),
+        },
+
         // Watch commands are intercepted in handle_conn before dispatch reaches here.
         Command::Watch { .. } | Command::PWatch { .. } | Command::Unwatch => r::error(
             "ERR",
@@ -866,9 +884,14 @@ fn ttl_duration_from_spec(ttl: &SetTtl) -> Duration {
 }
 
 fn set_opts_from_args(args: &SetArgs) -> SetOptions {
+    let metadata = args
+        .meta
+        .as_ref()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .map(std::sync::Arc::new);
     SetOptions {
         ttl: args.ttl.as_ref().map(ttl_duration_from_spec),
-        metadata: None,
+        metadata,
         keep_ttl: args.keep_ttl,
     }
 }
@@ -931,6 +954,8 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Unwatch => "UNWATCH",
         Command::Revision { .. } => "REVISION",
         Command::SetRev { .. } => "SETREV",
+        Command::DelRev { .. } => "DELREV",
+        Command::GetMeta { .. } => "GETMETA",
     }
 }
 
@@ -1074,6 +1099,7 @@ mod tests {
                     condition: SetCondition::Always,
                     get: false,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1101,6 +1127,7 @@ mod tests {
                     condition: SetCondition::Nx,
                     get: false,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1123,6 +1150,7 @@ mod tests {
                     condition: SetCondition::Nx,
                     get: false,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1151,6 +1179,7 @@ mod tests {
                     condition: SetCondition::Xx,
                     get: false,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1173,6 +1202,7 @@ mod tests {
                     condition: SetCondition::Xx,
                     get: false,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1203,6 +1233,7 @@ mod tests {
                     condition: SetCondition::Always,
                     get: true,
                     keep_ttl: false,
+                    meta: None,
                 },
             },
             &s,
@@ -1659,5 +1690,128 @@ mod tests {
             matches!(res, Value::Null),
             "key from default must be invisible in db3"
         );
+    }
+
+    // ── DELREV ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn delrev_correct_revision_deletes_key() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"dr-k", b"v");
+        let rev = match run(
+            Command::Revision {
+                key: Bytes::from_static(b"dr-k"),
+            },
+            &s,
+            &mut st,
+        ) {
+            Value::Integer(r) => r as u64,
+            other => panic!("expected revision integer, got {other:?}"),
+        };
+        let res = run(
+            Command::DelRev {
+                key: Bytes::from_static(b"dr-k"),
+                revision: rev,
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::Integer(1)));
+        let gone = run(
+            Command::Get {
+                key: Bytes::from_static(b"dr-k"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(gone, Value::Null));
+    }
+
+    #[test]
+    fn delrev_wrong_revision_returns_conflict() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"dr-mismatch", b"v");
+        let res = run(
+            Command::DelRev {
+                key: Bytes::from_static(b"dr-mismatch"),
+                revision: 9999,
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::SimpleError(..) | Value::BulkError(..)));
+        // key must still exist
+        let still = run(
+            Command::Get {
+                key: Bytes::from_static(b"dr-mismatch"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(still, Value::BulkString(_)));
+    }
+
+    // ── GETMETA / SET META ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_with_meta_then_getmeta_returns_json() {
+        let (s, _t) = store();
+        let mut st = state();
+        run(
+            Command::Set {
+                key: Bytes::from_static(b"meta-k"),
+                value: Bytes::from_static(b"v"),
+                args: SetArgs {
+                    ttl: None,
+                    condition: SetCondition::Always,
+                    get: false,
+                    keep_ttl: false,
+                    meta: Some(Bytes::from_static(b"{\"env\":\"test\"}")),
+                },
+            },
+            &s,
+            &mut st,
+        );
+        let res = run(
+            Command::GetMeta {
+                key: Bytes::from_static(b"meta-k"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(
+            matches!(res, Value::BulkString(ref b) if b.as_ref().contains(&b'e')),
+            "expected JSON metadata, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn getmeta_missing_key_returns_nil() {
+        let (s, _t) = store();
+        let res = run(
+            Command::GetMeta {
+                key: Bytes::from_static(b"no-such-key"),
+            },
+            &s,
+            &mut state(),
+        );
+        assert!(matches!(res, Value::Null));
+    }
+
+    #[test]
+    fn getmeta_key_without_meta_returns_nil() {
+        let (s, _t) = store();
+        let mut st = state();
+        set_key(&s, b"no-meta", b"v");
+        let res = run(
+            Command::GetMeta {
+                key: Bytes::from_static(b"no-meta"),
+            },
+            &s,
+            &mut st,
+        );
+        assert!(matches!(res, Value::Null));
     }
 }

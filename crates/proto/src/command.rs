@@ -25,6 +25,8 @@ pub struct SetArgs {
     pub condition: SetCondition,
     pub get: bool,
     pub keep_ttl: bool,
+    /// Raw JSON metadata string, passed via the META option.
+    pub meta: Option<Bytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,21 @@ pub enum Command {
         value: Bytes,
         revision: u64,
         ttl: Option<SetTtl>,
+    },
+    /// DELREV key revision
+    ///
+    /// Conditional delete: removes `key` only when its current revision equals
+    /// `revision`. Returns 1 on success, CONFLICT error on mismatch or missing key.
+    DelRev {
+        key: Bytes,
+        revision: u64,
+    },
+    /// GETMETA key
+    ///
+    /// Returns the metadata JSON string for `key`, or nil if the key has no
+    /// metadata or does not exist.
+    GetMeta {
+        key: Bytes,
     },
 }
 
@@ -564,6 +581,23 @@ impl Command {
                 })
             }
             b"SETREV" => parse_setrev(&args),
+            b"DELREV" => {
+                if args.len() != 3 {
+                    return Err(ProtoError::WrongArity { cmd: "DELREV" });
+                }
+                Ok(Command::DelRev {
+                    key: bulk(&args[1])?,
+                    revision: parse_u64(&args[2])?,
+                })
+            }
+            b"GETMETA" => {
+                if args.len() != 2 {
+                    return Err(ProtoError::WrongArity { cmd: "GETMETA" });
+                }
+                Ok(Command::GetMeta {
+                    key: bulk(&args[1])?,
+                })
+            }
             // Satisfy clients that probe server capabilities
             b"COMMAND" => Ok(Command::Ping { message: None }),
             _ => Err(ProtoError::UnknownCommand { cmd: name_bytes }),
@@ -581,6 +615,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
     let mut condition = SetCondition::Always;
     let mut get = false;
     let mut keep_ttl = false;
+    let mut meta: Option<Bytes> = None;
     let mut i = 3;
     while i < args.len() {
         let opt = bulk(&args[i])?;
@@ -646,6 +681,13 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
                 }
                 condition = SetCondition::Rev(parse_u64(&args[i])?);
             }
+            b"META" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtoError::WrongArity { cmd: "SET" });
+                }
+                meta = Some(bulk(&args[i])?);
+            }
             _ => return Err(ProtoError::Syntax { token: opt }),
         }
         i += 1;
@@ -658,6 +700,7 @@ fn parse_set(args: &[beyond_resp::Value]) -> Result<Command, ProtoError> {
             condition,
             get,
             keep_ttl,
+            meta,
         },
     })
 }
@@ -1473,6 +1516,67 @@ mod tests {
         assert!(matches!(
             Command::parse(arr(&[b"DECRBY", b"counter"])),
             Err(ProtoError::WrongArity { cmd: "DECRBY" })
+        ));
+    }
+
+    // --- DELREV ---
+
+    #[test]
+    fn delrev_ok() {
+        let cmd = Command::parse(arr(&[b"DELREV", b"mykey", b"42"])).unwrap();
+        assert!(matches!(cmd, Command::DelRev { revision: 42, .. }));
+    }
+
+    #[test]
+    fn delrev_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"DELREV", b"k"])),
+            Err(ProtoError::WrongArity { cmd: "DELREV" })
+        ));
+    }
+
+    #[test]
+    fn delrev_invalid_revision() {
+        assert!(matches!(
+            Command::parse(arr(&[b"DELREV", b"k", b"notanumber"])),
+            Err(ProtoError::InvalidInteger { .. })
+        ));
+    }
+
+    // --- GETMETA ---
+
+    #[test]
+    fn getmeta_ok() {
+        let cmd = Command::parse(arr(&[b"GETMETA", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::GetMeta { key } if key == "mykey"));
+    }
+
+    #[test]
+    fn getmeta_wrong_arity() {
+        assert!(matches!(
+            Command::parse(arr(&[b"GETMETA"])),
+            Err(ProtoError::WrongArity { cmd: "GETMETA" })
+        ));
+    }
+
+    // --- SET META ---
+
+    #[test]
+    fn set_with_meta() {
+        let cmd = Command::parse(arr(&[b"SET", b"k", b"v", b"META", b"{\"x\":1}"])).unwrap();
+        match cmd {
+            Command::Set { args, .. } => {
+                assert_eq!(args.meta.as_deref(), Some(b"{\"x\":1}".as_ref()))
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn set_meta_missing_value() {
+        assert!(matches!(
+            Command::parse(arr(&[b"SET", b"k", b"v", b"META"])),
+            Err(ProtoError::WrongArity { cmd: "SET" })
         ));
     }
 }
