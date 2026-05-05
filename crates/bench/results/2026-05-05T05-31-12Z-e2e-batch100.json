@@ -1,0 +1,999 @@
+{
+  "metadata": {
+    "timestamp": "2026-05-05T05:31:12Z",
+    "label": null,
+    "git_sha": "f0089ff",
+    "kernel": "Linux 6.12.54-linuxkit aarch64",
+    "cpu_count": 8,
+    "memory_bytes": 536870912,
+    "redis_version": "Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=5281cccdf7ef82d6"
+  },
+  "plan": {
+    "concurrency": 64,
+    "duration_secs": 30.0,
+    "warmup_secs": 5.0,
+    "populate": true,
+    "seed": 857655481838976751,
+    "batch": 100,
+    "workload": "Mixed { read_pct: 80 }",
+    "keys": 500000,
+    "value_size": 256,
+    "keydist": "Uniform",
+    "modes": [
+      {
+        "kind": "open",
+        "rate_per_sec": 1000.0
+      },
+      {
+        "kind": "open",
+        "rate_per_sec": 3000.0
+      },
+      {
+        "kind": "open",
+        "rate_per_sec": 6000.0
+      },
+      {
+        "kind": "open",
+        "rate_per_sec": 10000.0
+      },
+      {
+        "kind": "open",
+        "rate_per_sec": 15000.0
+      },
+      {
+        "kind": "open",
+        "rate_per_sec": 20000.0
+      }
+    ]
+  },
+  "reports": [
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 1000.0,
+      "elapsed_secs": 30.048706222,
+      "completed": 29978,
+      "errors": 0,
+      "throughput_ops_per_sec": 997.6469462120059,
+      "overall": {
+        "kind": "ALL",
+        "completed": 29978,
+        "keys": 2997800,
+        "throughput_ops_per_sec": 997.6469462120059,
+        "throughput_keys_per_sec": 99764.69462120059,
+        "service": {
+          "mean_us": 872.5083728067244,
+          "p50_us": 652,
+          "p90_us": 1503,
+          "p99_us": 3241,
+          "p999_us": 10903,
+          "max_us": 46207
+        },
+        "response": {
+          "mean_us": 2233.5892988191413,
+          "p50_us": 2077,
+          "p90_us": 3321,
+          "p99_us": 5455,
+          "p999_us": 28751,
+          "max_us": 49343
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 23930,
+          "keys": 2393000,
+          "throughput_ops_per_sec": 796.37372149087,
+          "throughput_keys_per_sec": 79637.372149087,
+          "service": {
+            "mean_us": 774.3114082741317,
+            "p50_us": 573,
+            "p90_us": 1347,
+            "p99_us": 2971,
+            "p999_us": 9743,
+            "max_us": 40863
+          },
+          "response": {
+            "mean_us": 2131.3618888424608,
+            "p50_us": 1988,
+            "p90_us": 3177,
+            "p99_us": 5171,
+            "p999_us": 17055,
+            "max_us": 47071
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 6048,
+          "keys": 604800,
+          "throughput_ops_per_sec": 201.27322472113588,
+          "throughput_keys_per_sec": 20127.32247211359,
+          "service": {
+            "mean_us": 1261.0423280423272,
+            "p50_us": 1046,
+            "p90_us": 1901,
+            "p99_us": 3947,
+            "p999_us": 25455,
+            "max_us": 46207
+          },
+          "response": {
+            "mean_us": 2638.070436507935,
+            "p50_us": 2409,
+            "p90_us": 3695,
+            "p99_us": 6491,
+            "p999_us": 42431,
+            "max_us": 49343
+          }
+        }
+      ]
+    },
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 3000.0,
+      "elapsed_secs": 30.051214305,
+      "completed": 90332,
+      "errors": 0,
+      "throughput_ops_per_sec": 3005.935104092294,
+      "overall": {
+        "kind": "ALL",
+        "completed": 90332,
+        "keys": 9033200,
+        "throughput_ops_per_sec": 3005.935104092294,
+        "throughput_keys_per_sec": 300593.5104092294,
+        "service": {
+          "mean_us": 743.9577447637591,
+          "p50_us": 587,
+          "p90_us": 1226,
+          "p99_us": 3347,
+          "p999_us": 11263,
+          "max_us": 26543
+        },
+        "response": {
+          "mean_us": 1940.526214409074,
+          "p50_us": 1734,
+          "p90_us": 2983,
+          "p99_us": 5975,
+          "p999_us": 17055,
+          "max_us": 31391
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 72158,
+          "keys": 7215800,
+          "throughput_ops_per_sec": 2401.1675291269066,
+          "throughput_keys_per_sec": 240116.75291269066,
+          "service": {
+            "mean_us": 706.2592228165971,
+            "p50_us": 546,
+            "p90_us": 1174,
+            "p99_us": 3297,
+            "p999_us": 11295,
+            "max_us": 26543
+          },
+          "response": {
+            "mean_us": 1901.3093350702634,
+            "p50_us": 1691,
+            "p90_us": 2929,
+            "p99_us": 5863,
+            "p999_us": 17087,
+            "max_us": 31391
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 18174,
+          "keys": 1817400,
+          "throughput_ops_per_sec": 604.7675749653871,
+          "throughput_keys_per_sec": 60476.75749653871,
+          "service": {
+            "mean_us": 893.6358534169701,
+            "p50_us": 736,
+            "p90_us": 1400,
+            "p99_us": 3607,
+            "p999_us": 10959,
+            "max_us": 25215
+          },
+          "response": {
+            "mean_us": 2096.232805106195,
+            "p50_us": 1890,
+            "p90_us": 3159,
+            "p99_us": 6643,
+            "p999_us": 16847,
+            "max_us": 30463
+          }
+        }
+      ]
+    },
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 6000.0,
+      "elapsed_secs": 30.050907765,
+      "completed": 180635,
+      "errors": 0,
+      "throughput_ops_per_sec": 6010.96650432583,
+      "overall": {
+        "kind": "ALL",
+        "completed": 180635,
+        "keys": 18063500,
+        "throughput_ops_per_sec": 6010.96650432583,
+        "throughput_keys_per_sec": 601096.650432583,
+        "service": {
+          "mean_us": 776.5367619785759,
+          "p50_us": 589,
+          "p90_us": 1176,
+          "p99_us": 4343,
+          "p999_us": 16351,
+          "max_us": 93119
+        },
+        "response": {
+          "mean_us": 2164.8821823013286,
+          "p50_us": 1631,
+          "p90_us": 2943,
+          "p99_us": 12319,
+          "p999_us": 84223,
+          "max_us": 105919
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 144241,
+          "keys": 14424100,
+          "throughput_ops_per_sec": 4799.88828051298,
+          "throughput_keys_per_sec": 479988.8280512979,
+          "service": {
+            "mean_us": 751.2736045923159,
+            "p50_us": 565,
+            "p90_us": 1149,
+            "p99_us": 4311,
+            "p999_us": 16399,
+            "max_us": 93119
+          },
+          "response": {
+            "mean_us": 2144.482914011966,
+            "p50_us": 1608,
+            "p90_us": 2915,
+            "p99_us": 12311,
+            "p999_us": 83711,
+            "max_us": 105023
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 36394,
+          "keys": 3639400,
+          "throughput_ops_per_sec": 1211.0782238128506,
+          "throughput_keys_per_sec": 121107.82238128505,
+          "service": {
+            "mean_us": 876.6626916524693,
+            "p50_us": 677,
+            "p90_us": 1258,
+            "p99_us": 4451,
+            "p999_us": 15911,
+            "max_us": 92927
+          },
+          "response": {
+            "mean_us": 2245.730972138266,
+            "p50_us": 1715,
+            "p90_us": 3049,
+            "p99_us": 12367,
+            "p999_us": 85567,
+            "max_us": 105919
+          }
+        }
+      ]
+    },
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 10000.0,
+      "elapsed_secs": 30.050528013,
+      "completed": 300209,
+      "errors": 0,
+      "throughput_ops_per_sec": 9990.14060152714,
+      "overall": {
+        "kind": "ALL",
+        "completed": 300209,
+        "keys": 30020900,
+        "throughput_ops_per_sec": 9990.14060152714,
+        "throughput_keys_per_sec": 999014.060152714,
+        "service": {
+          "mean_us": 1222.1201562911183,
+          "p50_us": 814,
+          "p90_us": 1926,
+          "p99_us": 5187,
+          "p999_us": 27007,
+          "max_us": 200831
+        },
+        "response": {
+          "mean_us": 5955.9061220682825,
+          "p50_us": 1756,
+          "p90_us": 3835,
+          "p99_us": 128895,
+          "p999_us": 200575,
+          "max_us": 220415
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 239970,
+          "keys": 23997000,
+          "throughput_ops_per_sec": 7985.550200521862,
+          "throughput_keys_per_sec": 798555.0200521862,
+          "service": {
+            "mean_us": 1201.6413676709617,
+            "p50_us": 793,
+            "p90_us": 1894,
+            "p99_us": 5175,
+            "p999_us": 26911,
+            "max_us": 200703
+          },
+          "response": {
+            "mean_us": 5924.680618410634,
+            "p50_us": 1734,
+            "p90_us": 3803,
+            "p99_us": 128895,
+            "p999_us": 200447,
+            "max_us": 218367
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 60239,
+          "keys": 6023900,
+          "throughput_ops_per_sec": 2004.5904010052775,
+          "throughput_keys_per_sec": 200459.04010052775,
+          "service": {
+            "mean_us": 1303.700111223627,
+            "p50_us": 894,
+            "p90_us": 2034,
+            "p99_us": 5255,
+            "p999_us": 27423,
+            "max_us": 200831
+          },
+          "response": {
+            "mean_us": 6080.297033483298,
+            "p50_us": 1840,
+            "p90_us": 3947,
+            "p99_us": 129279,
+            "p999_us": 201855,
+            "max_us": 220415
+          }
+        }
+      ]
+    },
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 15000.0,
+      "elapsed_secs": 32.99852489,
+      "completed": 449987,
+      "errors": 0,
+      "throughput_ops_per_sec": 13636.579256194746,
+      "overall": {
+        "kind": "ALL",
+        "completed": 449987,
+        "keys": 44998700,
+        "throughput_ops_per_sec": 13636.579256194746,
+        "throughput_keys_per_sec": 1363657.9256194746,
+        "service": {
+          "mean_us": 4641.853922446662,
+          "p50_us": 4331,
+          "p90_us": 4955,
+          "p99_us": 6255,
+          "p999_us": 110399,
+          "max_us": 179711
+        },
+        "response": {
+          "mean_us": 1748572.2439826033,
+          "p50_us": 1894399,
+          "p90_us": 2965503,
+          "p99_us": 3510271,
+          "p999_us": 3819519,
+          "max_us": 3905535
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 359803,
+          "keys": 35980300,
+          "throughput_ops_per_sec": 10903.608606730057,
+          "throughput_keys_per_sec": 1090360.8606730057,
+          "service": {
+            "mean_us": 4624.078743089952,
+            "p50_us": 4319,
+            "p90_us": 4943,
+            "p99_us": 6219,
+            "p999_us": 110079,
+            "max_us": 179711
+          },
+          "response": {
+            "mean_us": 1749396.9795665934,
+            "p50_us": 1896447,
+            "p90_us": 2965503,
+            "p99_us": 3510271,
+            "p999_us": 3819519,
+            "max_us": 3905535
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 90184,
+          "keys": 9018400,
+          "throughput_ops_per_sec": 2732.970649464689,
+          "throughput_keys_per_sec": 273297.0649464689,
+          "service": {
+            "mean_us": 4712.770746473875,
+            "p50_us": 4383,
+            "p90_us": 5007,
+            "p99_us": 6543,
+            "p999_us": 111103,
+            "max_us": 179583
+          },
+          "response": {
+            "mean_us": 1745281.8339616775,
+            "p50_us": 1886207,
+            "p90_us": 2967551,
+            "p99_us": 3508223,
+            "p999_us": 3815423,
+            "max_us": 3903487
+          }
+        }
+      ]
+    },
+    {
+      "target": "beyond",
+      "target_rate_per_sec": 20000.0,
+      "elapsed_secs": 44.198206811,
+      "completed": 599651,
+      "errors": 0,
+      "throughput_ops_per_sec": 13567.315130322426,
+      "overall": {
+        "kind": "ALL",
+        "completed": 599651,
+        "keys": 59965100,
+        "throughput_ops_per_sec": 13567.315130322426,
+        "throughput_keys_per_sec": 1356731.5130322427,
+        "service": {
+          "mean_us": 4664.727031223157,
+          "p50_us": 4315,
+          "p90_us": 4955,
+          "p99_us": 6427,
+          "p999_us": 130943,
+          "max_us": 222335
+        },
+        "response": {
+          "mean_us": 7150522.588285519,
+          "p50_us": 7262207,
+          "p90_us": 12394495,
+          "p99_us": 14106623,
+          "p999_us": 14606335,
+          "max_us": 14811135
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 479576,
+          "keys": 47957600,
+          "throughput_ops_per_sec": 10850.575953245318,
+          "throughput_keys_per_sec": 1085057.5953245317,
+          "service": {
+            "mean_us": 4654.076667723147,
+            "p50_us": 4303,
+            "p90_us": 4939,
+            "p99_us": 6423,
+            "p999_us": 131071,
+            "max_us": 222335
+          },
+          "response": {
+            "mean_us": 7153705.057807312,
+            "p50_us": 7266303,
+            "p90_us": 12394495,
+            "p99_us": 14106623,
+            "p999_us": 14614527,
+            "max_us": 14811135
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 120075,
+          "keys": 12007500,
+          "throughput_ops_per_sec": 2716.7391770771087,
+          "throughput_keys_per_sec": 271673.9177077109,
+          "service": {
+            "mean_us": 4707.264268165721,
+            "p50_us": 4371,
+            "p90_us": 5003,
+            "p99_us": 6443,
+            "p999_us": 128447,
+            "max_us": 222207
+          },
+          "response": {
+            "mean_us": 7137811.899104724,
+            "p50_us": 7254015,
+            "p90_us": 12386303,
+            "p99_us": 14098431,
+            "p999_us": 14589951,
+            "max_us": 14802943
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 1000.0,
+      "elapsed_secs": 30.04940943,
+      "completed": 29978,
+      "errors": 0,
+      "throughput_ops_per_sec": 997.6235995530511,
+      "overall": {
+        "kind": "ALL",
+        "completed": 29978,
+        "keys": 2997800,
+        "throughput_ops_per_sec": 997.6235995530511,
+        "throughput_keys_per_sec": 99762.35995530512,
+        "service": {
+          "mean_us": 1072.301354326505,
+          "p50_us": 927,
+          "p90_us": 1749,
+          "p99_us": 3041,
+          "p999_us": 14759,
+          "max_us": 24591
+        },
+        "response": {
+          "mean_us": 2417.5610781239584,
+          "p50_us": 2307,
+          "p90_us": 3557,
+          "p99_us": 5095,
+          "p999_us": 19695,
+          "max_us": 25359
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 23930,
+          "keys": 2393000,
+          "throughput_ops_per_sec": 796.3550849724636,
+          "throughput_keys_per_sec": 79635.50849724637,
+          "service": {
+            "mean_us": 1006.9334726284994,
+            "p50_us": 887,
+            "p90_us": 1650,
+            "p99_us": 2619,
+            "p999_us": 12271,
+            "max_us": 16511
+          },
+          "response": {
+            "mean_us": 2353.2626410363564,
+            "p50_us": 2255,
+            "p90_us": 3467,
+            "p99_us": 4787,
+            "p999_us": 18303,
+            "max_us": 24495
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 6048,
+          "keys": 604800,
+          "throughput_ops_per_sec": 201.26851458058755,
+          "throughput_keys_per_sec": 20126.851458058754,
+          "service": {
+            "mean_us": 1330.941137566138,
+            "p50_us": 1120,
+            "p90_us": 2109,
+            "p99_us": 3661,
+            "p999_us": 17839,
+            "max_us": 24591
+          },
+          "response": {
+            "mean_us": 2671.96941137566,
+            "p50_us": 2505,
+            "p90_us": 3905,
+            "p99_us": 5851,
+            "p999_us": 23023,
+            "max_us": 25359
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 3000.0,
+      "elapsed_secs": 30.050986639,
+      "completed": 90332,
+      "errors": 0,
+      "throughput_ops_per_sec": 3005.957877029157,
+      "overall": {
+        "kind": "ALL",
+        "completed": 90332,
+        "keys": 9033200,
+        "throughput_ops_per_sec": 3005.957877029157,
+        "throughput_keys_per_sec": 300595.78770291567,
+        "service": {
+          "mean_us": 894.0243767435683,
+          "p50_us": 726,
+          "p90_us": 1345,
+          "p99_us": 2775,
+          "p999_us": 33919,
+          "max_us": 104831
+        },
+        "response": {
+          "mean_us": 2267.7545166718332,
+          "p50_us": 1897,
+          "p90_us": 3179,
+          "p99_us": 5147,
+          "p999_us": 76543,
+          "max_us": 121343
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 72158,
+          "keys": 7215800,
+          "throughput_ops_per_sec": 2401.1857203501518,
+          "throughput_keys_per_sec": 240118.57203501515,
+          "service": {
+            "mean_us": 846.3079769394936,
+            "p50_us": 686,
+            "p90_us": 1288,
+            "p99_us": 2565,
+            "p999_us": 33343,
+            "max_us": 77631
+          },
+          "response": {
+            "mean_us": 2224.092782505057,
+            "p50_us": 1856,
+            "p90_us": 3133,
+            "p99_us": 4879,
+            "p999_us": 74751,
+            "max_us": 121343
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 18174,
+          "keys": 1817400,
+          "throughput_ops_per_sec": 604.7721566790052,
+          "throughput_keys_per_sec": 60477.21566790052,
+          "service": {
+            "mean_us": 1083.477440299329,
+            "p50_us": 870,
+            "p90_us": 1545,
+            "p99_us": 3603,
+            "p999_us": 40799,
+            "max_us": 104831
+          },
+          "response": {
+            "mean_us": 2441.1089468471396,
+            "p50_us": 2065,
+            "p90_us": 3339,
+            "p99_us": 6087,
+            "p999_us": 86079,
+            "max_us": 114751
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 6000.0,
+      "elapsed_secs": 30.052070472,
+      "completed": 180635,
+      "errors": 0,
+      "throughput_ops_per_sec": 6010.73394155323,
+      "overall": {
+        "kind": "ALL",
+        "completed": 180635,
+        "keys": 18063500,
+        "throughput_ops_per_sec": 6010.73394155323,
+        "throughput_keys_per_sec": 601073.394155323,
+        "service": {
+          "mean_us": 987.8616270379504,
+          "p50_us": 863,
+          "p90_us": 1540,
+          "p99_us": 4619,
+          "p999_us": 11423,
+          "max_us": 27919
+        },
+        "response": {
+          "mean_us": 2311.6219724859657,
+          "p50_us": 1979,
+          "p90_us": 3561,
+          "p99_us": 8695,
+          "p999_us": 35327,
+          "max_us": 70783
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 144241,
+          "keys": 14424100,
+          "throughput_ops_per_sec": 4799.7025740503195,
+          "throughput_keys_per_sec": 479970.25740503194,
+          "service": {
+            "mean_us": 925.7002239307869,
+            "p50_us": 819,
+            "p90_us": 1443,
+            "p99_us": 4291,
+            "p999_us": 9583,
+            "max_us": 27919
+          },
+          "response": {
+            "mean_us": 2250.2188559424826,
+            "p50_us": 1929,
+            "p90_us": 3475,
+            "p99_us": 8215,
+            "p999_us": 33855,
+            "max_us": 70783
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 36394,
+          "keys": 3639400,
+          "throughput_ops_per_sec": 1211.0313675029106,
+          "throughput_keys_per_sec": 121103.13675029106,
+          "service": {
+            "mean_us": 1234.227042919168,
+            "p50_us": 1066,
+            "p90_us": 1833,
+            "p99_us": 6783,
+            "p999_us": 14127,
+            "max_us": 24399
+          },
+          "response": {
+            "mean_us": 2554.9820574820055,
+            "p50_us": 2187,
+            "p90_us": 3865,
+            "p99_us": 10543,
+            "p999_us": 39903,
+            "max_us": 68287
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 10000.0,
+      "elapsed_secs": 30.054760722,
+      "completed": 300209,
+      "errors": 0,
+      "throughput_ops_per_sec": 9988.73365776783,
+      "overall": {
+        "kind": "ALL",
+        "completed": 300209,
+        "keys": 30020900,
+        "throughput_ops_per_sec": 9988.73365776783,
+        "throughput_keys_per_sec": 998873.3657767831,
+        "service": {
+          "mean_us": 1949.2923529940888,
+          "p50_us": 1297,
+          "p90_us": 4859,
+          "p99_us": 8535,
+          "p999_us": 11823,
+          "max_us": 43999
+        },
+        "response": {
+          "mean_us": 6408.198045361724,
+          "p50_us": 2447,
+          "p90_us": 15695,
+          "p99_us": 64191,
+          "p999_us": 101311,
+          "max_us": 159743
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 239970,
+          "keys": 23997000,
+          "throughput_ops_per_sec": 7984.425569701596,
+          "throughput_keys_per_sec": 798442.5569701595,
+          "service": {
+            "mean_us": 1796.091744801435,
+            "p50_us": 1229,
+            "p90_us": 4587,
+            "p99_us": 6895,
+            "p999_us": 9927,
+            "max_us": 42047
+          },
+          "response": {
+            "mean_us": 6253.121006792499,
+            "p50_us": 2369,
+            "p90_us": 15167,
+            "p99_us": 63711,
+            "p999_us": 101631,
+            "max_us": 158207
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 60239,
+          "keys": 6023900,
+          "throughput_ops_per_sec": 2004.308088066235,
+          "throughput_keys_per_sec": 200430.8088066235,
+          "service": {
+            "mean_us": 2559.587177741997,
+            "p50_us": 1633,
+            "p90_us": 6915,
+            "p99_us": 10335,
+            "p999_us": 13999,
+            "max_us": 43999
+          },
+          "response": {
+            "mean_us": 7025.96787795282,
+            "p50_us": 2825,
+            "p90_us": 17583,
+            "p99_us": 66047,
+            "p999_us": 100031,
+            "max_us": 159743
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 15000.0,
+      "elapsed_secs": 37.991540935,
+      "completed": 449987,
+      "errors": 0,
+      "throughput_ops_per_sec": 11844.399803890186,
+      "overall": {
+        "kind": "ALL",
+        "completed": 449987,
+        "keys": 44998700,
+        "throughput_ops_per_sec": 11844.399803890186,
+        "throughput_keys_per_sec": 1184439.9803890185,
+        "service": {
+          "mean_us": 5326.568636427275,
+          "p50_us": 4915,
+          "p90_us": 7155,
+          "p99_us": 10015,
+          "p999_us": 16703,
+          "max_us": 61759
+        },
+        "response": {
+          "mean_us": 3974027.7586330203,
+          "p50_us": 3928063,
+          "p90_us": 7176191,
+          "p99_us": 8171519,
+          "p999_us": 8462335,
+          "max_us": 8634367
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 359803,
+          "keys": 35980300,
+          "throughput_ops_per_sec": 9470.608223435567,
+          "throughput_keys_per_sec": 947060.8223435567,
+          "service": {
+            "mean_us": 4835.323999521969,
+            "p50_us": 4755,
+            "p90_us": 5615,
+            "p99_us": 8231,
+            "p999_us": 14847,
+            "max_us": 59263
+          },
+          "response": {
+            "mean_us": 3975268.09666957,
+            "p50_us": 3932159,
+            "p90_us": 7176191,
+            "p99_us": 8171519,
+            "p999_us": 8462335,
+            "max_us": 8626175
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 90184,
+          "keys": 9018400,
+          "throughput_ops_per_sec": 2373.7915804546187,
+          "throughput_keys_per_sec": 237379.15804546187,
+          "service": {
+            "mean_us": 7286.46500487891,
+            "p50_us": 7023,
+            "p90_us": 8415,
+            "p99_us": 12823,
+            "p999_us": 20687,
+            "max_us": 61759
+          },
+          "response": {
+            "mean_us": 3969079.2384236604,
+            "p50_us": 3917823,
+            "p90_us": 7180287,
+            "p99_us": 8175615,
+            "p999_us": 8470527,
+            "max_us": 8634367
+          }
+        }
+      ]
+    },
+    {
+      "target": "redis",
+      "target_rate_per_sec": 20000.0,
+      "elapsed_secs": 50.578835815,
+      "completed": 599651,
+      "errors": 0,
+      "throughput_ops_per_sec": 11855.769124329341,
+      "overall": {
+        "kind": "ALL",
+        "completed": 599651,
+        "keys": 59965100,
+        "throughput_ops_per_sec": 11855.769124329341,
+        "throughput_keys_per_sec": 1185576.912432934,
+        "service": {
+          "mean_us": 5334.997923792337,
+          "p50_us": 4963,
+          "p90_us": 7171,
+          "p99_us": 9807,
+          "p999_us": 15383,
+          "max_us": 25679
+        },
+        "response": {
+          "mean_us": 10352825.724623146,
+          "p50_us": 10354687,
+          "p90_us": 18530303,
+          "p99_us": 20512767,
+          "p999_us": 21020671,
+          "max_us": 21217279
+        }
+      },
+      "by_op": [
+        {
+          "kind": "MGET",
+          "completed": 479576,
+          "keys": 47957600,
+          "throughput_ops_per_sec": 9481.752441952682,
+          "throughput_keys_per_sec": 948175.2441952681,
+          "service": {
+            "mean_us": 4849.723916542931,
+            "p50_us": 4791,
+            "p90_us": 5683,
+            "p99_us": 8079,
+            "p999_us": 14183,
+            "max_us": 23135
+          },
+          "response": {
+            "mean_us": 10356849.930563651,
+            "p50_us": 10354687,
+            "p90_us": 18530303,
+            "p99_us": 20512767,
+            "p999_us": 21020671,
+            "max_us": 21217279
+          }
+        },
+        {
+          "kind": "MSET",
+          "completed": 120075,
+          "keys": 12007500,
+          "throughput_ops_per_sec": 2374.0166823766585,
+          "throughput_keys_per_sec": 237401.66823766584,
+          "service": {
+            "mean_us": 7273.167961690597,
+            "p50_us": 7043,
+            "p90_us": 8479,
+            "p99_us": 12167,
+            "p999_us": 18591,
+            "max_us": 25679
+          },
+          "response": {
+            "mean_us": 10336753.165071834,
+            "p50_us": 10346495,
+            "p90_us": 18530303,
+            "p99_us": 20496383,
+            "p999_us": 21004287,
+            "max_us": 21217279
+          }
+        }
+      ]
+    }
+  ]
+}
