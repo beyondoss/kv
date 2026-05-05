@@ -178,57 +178,93 @@ async fn route(
 ) -> http::Response<HttpBody> {
     let path = parts.uri.path();
     let method = &parts.method;
-
-    // Route: /namespaces/{ns}/values/{key}[/incr]
-    if let Some(rest) = path.strip_prefix("/namespaces/") {
-        if let Some((ns, rest)) = split_once(rest, '/') {
-            if let Some(key_encoded) = rest.strip_prefix("values/") {
-                // POST .../values/{key}/incr — atomic increment/decrement
-                if *method == http::Method::POST {
-                    if let Some(key_encoded) = key_encoded.strip_suffix("/incr") {
-                        let key = percent_decode(key_encoded);
-                        let query = parts.uri.query().unwrap_or("");
-                        let delta = query_param(query, "delta")
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(1);
-                        return handle_incr(ns, &key, delta, store).await;
-                    }
-                    return method_not_allowed();
-                }
-                let key = percent_decode(key_encoded);
-                return match *method {
-                    http::Method::GET => handle_get(ns, &key, store).await,
-                    http::Method::PUT => handle_put(ns, &key, body, parts, store).await,
-                    http::Method::DELETE => handle_delete(ns, &key, parts, store).await,
-                    _ => method_not_allowed(),
-                };
-            }
-            if rest == "keys" {
-                if *method == http::Method::GET {
-                    let query = parts.uri.query().unwrap_or("");
-                    return handle_list(
-                        ns,
-                        query,
-                        store,
-                        shard_idx,
-                        n_shards,
-                        cross_shard_txs,
-                        cross_shard_wakeups,
-                    )
-                    .await;
-                }
-                return method_not_allowed();
-            }
-        }
-    }
+    let query = parts.uri.query().unwrap_or("");
 
     if path == "/healthz" {
         return ok_text("ok");
     }
 
+    if path == "/v1/openapi.json" {
+        if *method != http::Method::GET {
+            return method_not_allowed();
+        }
+        return http::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(HttpBody::fixed_body(Some(openapi_json().clone())))
+            .unwrap_or_else(|_| fallback_500());
+    }
+
+    // GET /v1/kv → list endpoint (no key in path).
+    if path == "/v1/kv" || path == "/v1/kv/" {
+        if *method != http::Method::GET {
+            return method_not_allowed();
+        }
+        let ns = match parse_ns(query) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        return handle_list(
+            ns,
+            query,
+            store,
+            shard_idx,
+            n_shards,
+            cross_shard_txs,
+            cross_shard_wakeups,
+        )
+        .await;
+    }
+
+    // /v1/kv/{key}[/incr]
+    if let Some(rest) = path.strip_prefix("/v1/kv/") {
+        let ns = match parse_ns(query) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        // POST /v1/kv/{key}/incr
+        if *method == http::Method::POST {
+            if let Some(key_encoded) = rest.strip_suffix("/incr") {
+                let key = percent_decode(key_encoded);
+                if key.is_empty() {
+                    return not_found_json("not_found", "endpoint not found");
+                }
+                let delta = query_param(query, "delta")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1);
+                return handle_incr(ns, &key, delta, store).await;
+            }
+            return method_not_allowed();
+        }
+        // Reject /v1/kv/{key}/incr for non-POST
+        let key_encoded = rest.strip_suffix("/incr").unwrap_or(rest);
+        let key = percent_decode(key_encoded);
+        if key.is_empty() {
+            return not_found_json("not_found", "endpoint not found");
+        }
+        return match *method {
+            http::Method::GET => handle_get(ns, &key, store).await,
+            http::Method::PUT => handle_put(ns, &key, body, parts, store).await,
+            http::Method::DELETE => handle_delete(ns, &key, parts, store).await,
+            _ => method_not_allowed(),
+        };
+    }
+
     not_found_json("not_found", "endpoint not found")
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/kv/{key}",
+    params(
+        ("key" = String, Path, description = "Key to retrieve"),
+        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+    ),
+    responses(
+        (status = 200, description = "Value bytes", content_type = "application/octet-stream"),
+        (status = 404, body = ErrorResponse, description = "Key not found"),
+    )
+)]
 async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<HttpBody> {
     match store.get(ns, key).await {
         Err(e) => engine_error_response(e),
@@ -260,6 +296,27 @@ async fn handle_get(ns: &str, key: &[u8], store: &ShardStore) -> http::Response<
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/v1/kv/{key}",
+    params(
+        ("key" = String, Path, description = "Key to set"),
+        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+        ("nx" = Option<u8>, Query, description = "Set only if key does not exist (nx=1)"),
+        ("xx" = Option<u8>, Query, description = "Set only if key already exists (xx=1)"),
+        ("ttl" = Option<u64>, Query, description = "TTL seconds (overridden by X-KV-TTL header)"),
+        ("If-Match" = Option<u64>, Header, description = "Set only if current revision matches"),
+        ("X-KV-KeepTTL" = Option<String>, Header, description = "Preserve existing TTL (incompatible with TTL options)"),
+        ("X-KV-Return-Old" = Option<String>, Header, description = "Return old value atomically (incompatible with conditional writes)"),
+    ),
+    request_body(content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Old value (when X-KV-Return-Old is set and key existed)", content_type = "application/octet-stream"),
+        (status = 204, description = "Stored"),
+        (status = 400, body = ErrorResponse, description = "Conflicting options"),
+        (status = 409, body = ErrorResponse, description = "Conflict (NX/XX or revision mismatch)"),
+    )
+)]
 async fn handle_put(
     ns: &str,
     key: &[u8],
@@ -268,6 +325,8 @@ async fn handle_put(
     store: &ShardStore,
 ) -> http::Response<HttpBody> {
     let ttl = parse_ttl_from_request(parts);
+    let keep_ttl = parts.headers.contains_key("x-kv-keepttl");
+    let return_old = parts.headers.contains_key("x-kv-return-old");
     let metadata = parts
         .headers
         .get("x-kv-metadata")
@@ -285,11 +344,42 @@ async fn handle_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
+    if keep_ttl && ttl.is_some() {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "error": "invalid_request",
+                "message": "x-kv-keepttl cannot be combined with a TTL option"
+            }),
+        );
+    }
+    if return_old && (nx || xx || if_match.is_some() || keep_ttl) {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "error": "invalid_request",
+                "message": "x-kv-return-old cannot be combined with conditional writes or x-kv-keepttl"
+            }),
+        );
+    }
+
     let opts = SetOptions {
         ttl,
         metadata,
-        keep_ttl: false,
+        keep_ttl,
     };
+
+    if return_old {
+        return match store.getset(ns, key, body).await {
+            Ok(Some(old)) => http::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/octet-stream")
+                .body(HttpBody::fixed_body(Some(old.value)))
+                .unwrap_or_else(|_| internal_error("response build failed")),
+            Ok(None) => no_content(),
+            Err(e) => engine_error_response(e),
+        };
+    }
 
     if let Some(expected_rev) = if_match {
         match store.setrev(ns, key, body, opts, expected_rev).await {
@@ -330,6 +420,19 @@ async fn handle_put(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/kv/{key}",
+    params(
+        ("key" = String, Path, description = "Key to delete"),
+        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+        ("If-Match" = Option<u64>, Header, description = "Delete only if current revision matches"),
+    ),
+    responses(
+        (status = 204, description = "Deleted (or did not exist)"),
+        (status = 409, body = ErrorResponse, description = "Revision mismatch"),
+    )
+)]
 async fn handle_delete(
     ns: &str,
     key: &[u8],
@@ -359,6 +462,19 @@ async fn handle_delete(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/kv/{key}/incr",
+    params(
+        ("key" = String, Path, description = "Counter key"),
+        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+        ("delta" = Option<i64>, Query, description = "Increment delta (default 1)"),
+    ),
+    responses(
+        (status = 200, body = IncrResponse, description = "New counter value"),
+        (status = 400, body = ErrorResponse, description = "Stored value is not an integer or overflowed"),
+    )
+)]
 async fn handle_incr(
     ns: &str,
     key: &[u8],
@@ -375,6 +491,19 @@ async fn handle_incr(
 /// Distinct from the engine's `\x01` continuation cursor so we can detect which format is in use.
 const LIST_CURSOR_PREFIX: u8 = 0x02;
 
+#[utoipa::path(
+    get,
+    path = "/v1/kv",
+    params(
+        ("ns" = Option<u8>, Query, description = "Namespace 0-15, default 0"),
+        ("prefix" = Option<String>, Query, description = "Filter keys by prefix"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor from a previous response"),
+        ("limit" = Option<u64>, Query, description = "Max keys to return (default 100, max 1000)"),
+    ),
+    responses(
+        (status = 200, body = ListResponse, description = "Page of keys"),
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_list(
     ns: &str,
@@ -548,22 +677,25 @@ struct WatchParams {
 }
 
 fn parse_watch_params(path: &str, query: &str) -> Option<WatchParams> {
-    let rest = path.strip_prefix("/namespaces/")?;
-    let (ns, rest) = split_once(rest, '/')?;
+    // /v1/watch/{key} or /v1/watch (with ?prefix=)
+    let ns = parse_ns(query).ok()?.to_string();
 
-    if let Some(key_encoded) = rest.strip_prefix("watch/") {
+    if let Some(key_encoded) = path.strip_prefix("/v1/watch/") {
+        if key_encoded.is_empty() {
+            return None;
+        }
         return Some(WatchParams {
-            ns: ns.to_string(),
+            ns,
             key: percent_decode(key_encoded),
             is_prefix: false,
             since: query_param(query, "since").and_then(|s| s.parse().ok()),
         });
     }
 
-    if rest == "watch" {
+    if path == "/v1/watch" {
         let prefix_raw = query_param(query, "prefix")?;
         return Some(WatchParams {
-            ns: ns.to_string(),
+            ns,
             key: percent_decode(prefix_raw),
             is_prefix: true,
             since: query_param(query, "since").and_then(|s| s.parse().ok()),
@@ -805,9 +937,71 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn split_once(s: &str, delim: char) -> Option<(&str, &str)> {
-    let pos = s.find(delim)?;
-    Some((&s[..pos], &s[pos + 1..]))
+/// Maps the `?ns=N` query param (numeric u8 0–15) to a namespace name.
+static NS_NAMES: [&str; 16] = [
+    "default", "db1", "db2", "db3", "db4", "db5", "db6", "db7", "db8", "db9", "db10", "db11",
+    "db12", "db13", "db14", "db15",
+];
+
+fn parse_ns(query: &str) -> Result<&'static str, http::Response<HttpBody>> {
+    let n = query_param(query, "ns")
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    NS_NAMES.get(n as usize).copied().ok_or_else(|| {
+        json_response(
+            400,
+            &serde_json::json!({
+                "error": "invalid_namespace",
+                "message": "ns must be 0-15"
+            }),
+        )
+    })
+}
+
+// ── OpenAPI schemas ──────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+struct IncrResponse {
+    value: i64,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+struct KeyItem {
+    name: String,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+struct ListResponse {
+    keys: Vec<KeyItem>,
+    complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+struct ErrorResponse {
+    error: String,
+    message: String,
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(title = "beyond/kv", version = "1"),
+    paths(handle_get, handle_put, handle_delete, handle_incr, handle_list),
+    components(schemas(IncrResponse, KeyItem, ListResponse, ErrorResponse))
+)]
+pub struct ApiDoc;
+
+fn openapi_json() -> &'static Bytes {
+    static SPEC: std::sync::OnceLock<Bytes> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        use utoipa::OpenApi as _;
+        Bytes::from(ApiDoc::openapi().to_json().expect("valid OpenAPI spec"))
+    })
 }
 
 fn fallback_500() -> http::Response<HttpBody> {

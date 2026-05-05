@@ -82,7 +82,7 @@ fn delete_then_delete_again_is_ok() {
 fn put_nx_succeeds_on_fresh_key() {
     let srv = TestServer::start();
     let res = srv.put_opts(
-        "default",
+        0,
         "nx-key",
         b"v",
         PutOptions {
@@ -98,7 +98,7 @@ fn put_nx_returns_409_on_existing_key() {
     let srv = TestServer::start();
     srv.put("nx-dup", b"existing");
     let res = srv.put_opts(
-        "default",
+        0,
         "nx-dup",
         b"new",
         PutOptions {
@@ -115,7 +115,7 @@ fn put_nx_does_not_overwrite_value() {
     let srv = TestServer::start();
     srv.put("nx-safe", b"original");
     srv.put_opts(
-        "default",
+        0,
         "nx-safe",
         b"clobbered",
         PutOptions {
@@ -132,7 +132,7 @@ fn put_nx_does_not_overwrite_value() {
 fn put_with_ttl_header_reflects_in_get() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default",
+        0,
         "ttl-key",
         b"v",
         PutOptions {
@@ -150,7 +150,7 @@ fn put_with_ttl_header_reflects_in_get() {
 fn put_with_ttl_query_param_reflects_in_get() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default",
+        0,
         "ttl-q",
         b"v",
         PutOptions {
@@ -166,7 +166,7 @@ fn put_with_ttl_query_param_reflects_in_get() {
 fn key_expires_after_ttl() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default",
+        0,
         "expiring",
         b"soon-gone",
         PutOptions {
@@ -189,7 +189,7 @@ fn put_with_metadata_round_trips() {
     let srv = TestServer::start();
     let meta = serde_json::json!({"score": 42, "tags": ["a", "b"]});
     srv.put_opts(
-        "default",
+        0,
         "meta-key",
         b"data",
         PutOptions {
@@ -248,17 +248,17 @@ fn key_with_unicode_round_trips() {
 #[test]
 fn key_in_one_namespace_invisible_in_another() {
     let srv = TestServer::start();
-    srv.put_ns("default", "shared-name", b"in-default");
-    assert!(srv.get_ns("db1", "shared-name").is_not_found());
+    srv.put_ns(0, "shared-name", b"in-default");
+    assert!(srv.get_ns(1, "shared-name").is_not_found());
 }
 
 #[test]
 fn same_key_independent_values_per_namespace() {
     let srv = TestServer::start();
-    srv.put_ns("default", "k", b"default-val");
-    srv.put_ns("db2", "k", b"db2-val");
-    assert_eq!(srv.get_ns("default", "k").body, b"default-val");
-    assert_eq!(srv.get_ns("db2", "k").body, b"db2-val");
+    srv.put_ns(0, "k", b"default-val");
+    srv.put_ns(2, "k", b"db2-val");
+    assert_eq!(srv.get_ns(0, "k").body, b"default-val");
+    assert_eq!(srv.get_ns(2, "k").body, b"db2-val");
 }
 
 // ── Method routing ────────────────────────────────────────────────────────────
@@ -266,7 +266,7 @@ fn same_key_independent_values_per_namespace() {
 #[test]
 fn post_to_value_endpoint_is_405() {
     let srv = TestServer::start();
-    let url = srv.value_url("default", "k");
+    let url = srv.value_url(0, "k");
     let res = common::raw_call_url(ureq::post(&url));
     assert!(res.is_method_not_allowed());
     assert_eq!(res.json()["error"], "method_not_allowed");
@@ -285,7 +285,7 @@ fn unknown_route_is_404() {
 #[test]
 fn list_empty_namespace_returns_empty() {
     let srv = TestServer::start();
-    let body = srv.list("default").json();
+    let body = srv.list(0).json();
     assert_eq!(body["keys"], serde_json::json!([]));
     assert_eq!(body["complete"], true);
 }
@@ -296,7 +296,7 @@ fn list_returns_all_inserted_keys() {
     for k in ["alpha", "beta", "gamma"] {
         srv.put(k, b"v");
     }
-    let body = srv.list("default").json();
+    let body = srv.list(0).json();
     let names: Vec<String> = body["keys"]
         .as_array()
         .unwrap()
@@ -317,7 +317,7 @@ fn list_with_prefix_filters_keys() {
     }
     let body = srv
         .list_opts(
-            "default",
+            0,
             ListOptions {
                 prefix: Some("user:".into()),
                 ..Default::default()
@@ -342,7 +342,7 @@ fn list_with_limit_caps_page_size() {
     }
     let body = srv
         .list_opts(
-            "default",
+            0,
             ListOptions {
                 limit: Some(3),
                 ..Default::default()
@@ -375,7 +375,7 @@ fn list_pagination_covers_all_keys() {
             limit: Some(4),
             ..Default::default()
         };
-        let body = srv.list_opts("default", opts).json();
+        let body = srv.list_opts(0, opts).json();
         for e in body["keys"].as_array().unwrap() {
             all_names.push(e["name"].as_str().unwrap().to_owned());
         }
@@ -397,9 +397,9 @@ fn list_pagination_covers_all_keys() {
 #[test]
 fn expired_keys_not_returned_in_list() {
     let srv = TestServer::start();
-    srv.put_opts("default", "live", b"v", PutOptions::default());
+    srv.put_opts(0, "live", b"v", PutOptions::default());
     srv.put_opts(
-        "default",
+        0,
         "dead",
         b"v",
         PutOptions {
@@ -408,7 +408,7 @@ fn expired_keys_not_returned_in_list() {
         },
     );
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    let body = srv.list("default").json();
+    let body = srv.list(0).json();
     let names: Vec<&str> = body["keys"]
         .as_array()
         .unwrap()
@@ -428,7 +428,7 @@ fn expired_keys_not_returned_in_list() {
 fn malformed_ttl_header_is_silently_ignored_key_stored_without_ttl() {
     // X-KV-TTL with a non-numeric value is swallowed via .ok(); key lands with no TTL.
     let srv = TestServer::start();
-    let res = ureq::put(&srv.value_url("default", "bad-ttl-key"))
+    let res = ureq::put(&srv.value_url(0, "bad-ttl-key"))
         .set("Content-Type", "application/octet-stream")
         .set("X-KV-TTL", "not-a-number")
         .send_bytes(b"value")
@@ -448,7 +448,7 @@ fn malformed_ttl_header_is_silently_ignored_key_stored_without_ttl() {
 fn malformed_metadata_header_is_silently_ignored() {
     // X-KV-Metadata with invalid JSON is swallowed via .ok(); key is stored without metadata.
     let srv = TestServer::start();
-    let res = ureq::put(&srv.value_url("default", "bad-meta-key"))
+    let res = ureq::put(&srv.value_url(0, "bad-meta-key"))
         .set("Content-Type", "application/octet-stream")
         .set("X-KV-Metadata", "this-is-not-json{{{")
         .send_bytes(b"value")
@@ -469,7 +469,7 @@ fn invalid_limit_query_param_falls_back_to_default() {
     for i in 0..5 {
         srv.put(&format!("lim-key-{i}"), b"v");
     }
-    let url = format!("{}?limit=banana", srv.keys_url("default"));
+    let url = format!("{}&limit=banana", srv.keys_url(0));
     let res = common::raw_call_url(ureq::get(&url));
     assert_eq!(res.status, 200);
     let body = res.json();
@@ -483,7 +483,7 @@ fn zero_ttl_header_results_in_no_ttl() {
     // X-KV-TTL: 0 → Duration::from_secs(0) which may be treated as no TTL or immediate expiry.
     // Verify the key is stored and GET returns a result (implementation treats 0 as no TTL).
     let srv = TestServer::start();
-    let _ = ureq::put(&srv.value_url("default", "ttl-zero"))
+    let _ = ureq::put(&srv.value_url(0, "ttl-zero"))
         .set("Content-Type", "application/octet-stream")
         .set("X-KV-TTL", "0")
         .send_bytes(b"zero-ttl-value");
@@ -498,11 +498,19 @@ fn zero_ttl_header_results_in_no_ttl() {
 // ── INCR ──────────────────────────────────────────────────────────────────────
 
 fn incr_url(srv: &TestServer, key: &str) -> String {
-    format!("{}/incr", srv.value_url("default", key))
+    format!(
+        "http://127.0.0.1:{}/v1/kv/{}/incr?ns=0",
+        srv.http_port,
+        urlencoding::encode(key)
+    )
 }
 
 fn incr_url_delta(srv: &TestServer, key: &str, delta: i64) -> String {
-    format!("{}/incr?delta={delta}", srv.value_url("default", key))
+    format!(
+        "http://127.0.0.1:{}/v1/kv/{}/incr?ns=0&delta={delta}",
+        srv.http_port,
+        urlencoding::encode(key)
+    )
 }
 
 #[test]
@@ -553,7 +561,7 @@ fn incr_non_integer_value_returns_400() {
 fn incr_preserves_ttl() {
     let srv = TestServer::start();
     srv.put_opts(
-        "default",
+        0,
         "ctr",
         b"5",
         common::PutOptions {
@@ -588,7 +596,7 @@ fn incr_patch_returns_405() {
 #[test]
 fn watch_key_receives_set_event() {
     let srv = TestServer::start();
-    let sse = common::watch_key_sse(srv.http_port, "default", "sse-set-k", None);
+    let sse = common::watch_key_sse(srv.http_port, 0, "sse-set-k", None);
 
     // No existing key → first event is "ready".
     let ready = sse.recv_event().expect("expected ready event");
@@ -611,7 +619,7 @@ fn watch_key_receives_del_event() {
     let srv = TestServer::start();
     srv.put("sse-del-k", b"to-delete");
 
-    let sse = common::watch_key_sse(srv.http_port, "default", "sse-del-k", None);
+    let sse = common::watch_key_sse(srv.http_port, 0, "sse-del-k", None);
 
     // Key exists — initial state push (set), then ready.
     let init = sse.recv_event().expect("expected initial set event");
@@ -649,7 +657,7 @@ fn watch_since_replays_missed_event() {
     srv.put("sse-since-k", b"v2");
 
     // Watch with since=rev(v1): should get the v2 catch-up event, then ready.
-    let sse = common::watch_key_sse(srv.http_port, "default", "sse-since-k", Some(rev));
+    let sse = common::watch_key_sse(srv.http_port, 0, "sse-since-k", Some(rev));
 
     let catchup = sse.recv_event().expect("expected catch-up set event");
     assert_eq!(catchup["type"], "set", "expected set catch-up: {catchup}");
@@ -662,7 +670,7 @@ fn watch_since_replays_missed_event() {
 #[test]
 fn watch_prefix_receives_matching_events_only() {
     let srv = TestServer::start();
-    let sse = common::watch_prefix_sse(srv.http_port, "default", "pfx:", None);
+    let sse = common::watch_prefix_sse(srv.http_port, 0, "pfx:", None);
 
     // No existing keys with prefix → ready arrives immediately.
     let ready = sse.recv_event().expect("expected ready event");
@@ -684,27 +692,84 @@ fn watch_prefix_receives_matching_events_only() {
     assert_eq!(ev2["key"], "pfx:gamma");
 }
 
-// ── Namespace validation ──────────────────────────────────────────────────────
+// ── KEEPTTL ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn namespace_with_invalid_chars_returns_error() {
-    // Namespace names allow only ASCII alphanumeric, '_', and '-'.
-    // A period is not allowed; the store returns InvalidNamespace — the server
-    // must not respond with 2xx or panic.
+fn put_keepttl_preserves_existing_ttl() {
     let srv = TestServer::start();
-    let res = srv.get_ns("invalid.ns", "k");
-    assert_eq!(res.status, 400, "invalid namespace chars must return 400");
-    let body = res.json();
-    assert_eq!(body["error"], "invalid_namespace");
+    srv.put_opts(0, "keepttl-k", b"v1", PutOptions { ttl_header: Some(60), ..Default::default() });
+    let ttl_before = srv.get("keepttl-k").ttl.expect("x-kv-ttl missing before");
+    srv.put_opts(0, "keepttl-k", b"v2", PutOptions { keep_ttl: true, ..Default::default() });
+    let res = srv.get("keepttl-k");
+    assert_eq!(res.body, b"v2");
+    let ttl_after = res.ttl.expect("x-kv-ttl must be preserved");
+    assert!(ttl_after > 0 && ttl_after <= ttl_before, "TTL should be preserved");
 }
 
 #[test]
-fn namespace_too_long_returns_error() {
-    // is_valid_ns_name rejects names longer than 64 bytes.
+fn put_keepttl_on_key_without_ttl_stays_persistent() {
     let srv = TestServer::start();
-    let long_ns: String = "a".repeat(65);
-    let res = srv.get_ns(&long_ns, "k");
-    assert_eq!(res.status, 400, "namespace name >64 chars must return 400");
-    let body = res.json();
-    assert_eq!(body["error"], "invalid_namespace");
+    srv.put("no-ttl-k", b"v1");
+    srv.put_opts(0, "no-ttl-k", b"v2", PutOptions { keep_ttl: true, ..Default::default() });
+    let res = srv.get("no-ttl-k");
+    assert_eq!(res.body, b"v2");
+    assert!(res.ttl.is_none(), "key should remain persistent");
+}
+
+#[test]
+fn put_keepttl_with_ttl_option_returns_400() {
+    let srv = TestServer::start();
+    let res = common::raw_call_url(
+        ureq::put(&srv.value_url(0, "conflict-k"))
+            .set("x-kv-keepttl", "1")
+            .set("x-kv-ttl", "60")
+            .set("Content-Type", "application/octet-stream"),
+    );
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "invalid_request");
+}
+
+// ── Return-old (atomic swap) ──────────────────────────────────────────────────
+
+#[test]
+fn put_return_old_on_existing_key_returns_old_value() {
+    let srv = TestServer::start();
+    srv.put("swap-k", b"old");
+    let res = srv.put_opts(0, "swap-k", b"new", PutOptions { return_old: true, ..Default::default() });
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, b"old");
+    assert_eq!(srv.get("swap-k").body, b"new");
+}
+
+#[test]
+fn put_return_old_on_missing_key_returns_204() {
+    let srv = TestServer::start();
+    let res = srv.put_opts(0, "swap-new", b"v", PutOptions { return_old: true, ..Default::default() });
+    assert_eq!(res.status, 204, "no old value → 204");
+    assert_eq!(srv.get("swap-new").body, b"v");
+}
+
+#[test]
+fn put_return_old_with_nx_returns_400() {
+    let srv = TestServer::start();
+    let mut url = srv.value_url(0, "bad-combo");
+    url.push_str("&nx=1");
+    let res = common::raw_call_url(
+        ureq::put(&url)
+            .set("x-kv-return-old", "1")
+            .set("Content-Type", "application/octet-stream"),
+    );
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "invalid_request");
+}
+
+// ── Namespace validation ──────────────────────────────────────────────────────
+
+#[test]
+fn namespace_out_of_range_returns_400() {
+    let srv = TestServer::start();
+    let url = format!("http://127.0.0.1:{}/v1/kv/k?ns=99", srv.http_port);
+    let res = common::raw_call_url(ureq::get(&url));
+    assert_eq!(res.status, 400);
+    assert_eq!(res.json()["error"], "invalid_namespace");
 }

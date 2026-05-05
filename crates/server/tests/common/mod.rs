@@ -168,16 +168,16 @@ impl TestServer {
         format!("http://127.0.0.1:{}", self.http_port)
     }
 
-    pub fn value_url(&self, ns: &str, key: &str) -> String {
+    pub fn value_url(&self, ns: u8, key: &str) -> String {
         format!(
-            "{}/namespaces/{ns}/values/{}",
+            "{}/v1/kv/{}?ns={ns}",
             self.base(),
             urlencoding::encode(key)
         )
     }
 
-    pub fn keys_url(&self, ns: &str) -> String {
-        format!("{}/namespaces/{ns}/keys", self.base())
+    pub fn keys_url(&self, ns: u8) -> String {
+        format!("{}/v1/kv?ns={ns}", self.base())
     }
 
     pub fn healthz_url(&self) -> String {
@@ -187,33 +187,29 @@ impl TestServer {
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
     pub fn get(&self, key: &str) -> KvResponse {
-        self.get_ns("default", key)
+        self.get_ns(0, key)
     }
 
-    pub fn get_ns(&self, ns: &str, key: &str) -> KvResponse {
+    pub fn get_ns(&self, ns: u8, key: &str) -> KvResponse {
         raw_call(ureq::get(&self.value_url(ns, key)))
     }
 
     pub fn put(&self, key: &str, value: &[u8]) -> KvResponse {
-        self.put_opts("default", key, value, PutOptions::default())
+        self.put_opts(0, key, value, PutOptions::default())
     }
 
-    pub fn put_ns(&self, ns: &str, key: &str, value: &[u8]) -> KvResponse {
+    pub fn put_ns(&self, ns: u8, key: &str, value: &[u8]) -> KvResponse {
         self.put_opts(ns, key, value, PutOptions::default())
     }
 
-    pub fn put_opts(&self, ns: &str, key: &str, value: &[u8], opts: PutOptions) -> KvResponse {
+    pub fn put_opts(&self, ns: u8, key: &str, value: &[u8], opts: PutOptions) -> KvResponse {
+        // value_url already contains `?ns=N`, so additional params get appended with `&`.
         let mut url = self.value_url(ns, key);
-        let mut qp: Vec<String> = Vec::new();
         if opts.nx {
-            qp.push("nx=1".into());
+            url.push_str("&nx=1");
         }
         if let Some(t) = opts.ttl_query {
-            qp.push(format!("ttl={t}"));
-        }
-        if !qp.is_empty() {
-            url.push('?');
-            url.push_str(&qp.join("&"));
+            url.push_str(&format!("&ttl={t}"));
         }
 
         let mut req = ureq::put(&url).set("Content-Type", "application/octet-stream");
@@ -223,36 +219,38 @@ impl TestServer {
         if let Some(m) = &opts.metadata {
             req = req.set("x-kv-metadata", &serde_json::to_string(m).unwrap());
         }
+        if opts.keep_ttl {
+            req = req.set("x-kv-keepttl", "1");
+        }
+        if opts.return_old {
+            req = req.set("x-kv-return-old", "1");
+        }
         raw_send(req, value)
     }
 
     pub fn delete(&self, key: &str) -> KvResponse {
-        self.delete_ns("default", key)
+        self.delete_ns(0, key)
     }
 
-    pub fn delete_ns(&self, ns: &str, key: &str) -> KvResponse {
+    pub fn delete_ns(&self, ns: u8, key: &str) -> KvResponse {
         raw_call(ureq::delete(&self.value_url(ns, key)))
     }
 
-    pub fn list(&self, ns: &str) -> KvResponse {
+    pub fn list(&self, ns: u8) -> KvResponse {
         self.list_opts(ns, ListOptions::default())
     }
 
-    pub fn list_opts(&self, ns: &str, opts: ListOptions) -> KvResponse {
+    pub fn list_opts(&self, ns: u8, opts: ListOptions) -> KvResponse {
+        // keys_url already contains `?ns=N`, so additional params get appended with `&`.
         let mut url = self.keys_url(ns);
-        let mut qp: Vec<String> = Vec::new();
         if let Some(p) = &opts.prefix {
-            qp.push(format!("prefix={}", urlencoding::encode(p)));
+            url.push_str(&format!("&prefix={}", urlencoding::encode(p)));
         }
         if let Some(c) = &opts.cursor {
-            qp.push(format!("cursor={}", urlencoding::encode(c)));
+            url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
         }
         if let Some(l) = opts.limit {
-            qp.push(format!("limit={l}"));
-        }
-        if !qp.is_empty() {
-            url.push('?');
-            url.push_str(&qp.join("&"));
+            url.push_str(&format!("&limit={l}"));
         }
         raw_call(ureq::get(&url))
     }
@@ -275,6 +273,8 @@ pub struct PutOptions {
     pub ttl_header: Option<u64>,
     pub ttl_query: Option<u64>,
     pub metadata: Option<serde_json::Value>,
+    pub keep_ttl: bool,
+    pub return_old: bool,
 }
 
 #[derive(Default)]
@@ -369,23 +369,21 @@ impl SseReceiver {
 /// Open an SSE stream on `/namespaces/{ns}/watch/{key}`.
 ///
 /// Pass `since` to replay missed events (architecture: `tstamp_ms > since`).
-pub fn watch_key_sse(port: u16, ns: &str, key: &str, since: Option<u64>) -> SseReceiver {
+pub fn watch_key_sse(port: u16, ns: u8, key: &str, since: Option<u64>) -> SseReceiver {
     let mut url = format!(
-        "http://127.0.0.1:{port}/namespaces/{}/watch/{}",
-        urlencoding::encode(ns),
+        "http://127.0.0.1:{port}/v1/watch/{}?ns={ns}",
         urlencoding::encode(key),
     );
     if let Some(s) = since {
-        url.push_str(&format!("?since={s}"));
+        url.push_str(&format!("&since={s}"));
     }
     sse_stream(url)
 }
 
-/// Open an SSE stream on `/namespaces/{ns}/watch?prefix={prefix}`.
-pub fn watch_prefix_sse(port: u16, ns: &str, prefix: &str, since: Option<u64>) -> SseReceiver {
+/// Open an SSE stream on `/v1/watch?ns={ns}&prefix={prefix}`.
+pub fn watch_prefix_sse(port: u16, ns: u8, prefix: &str, since: Option<u64>) -> SseReceiver {
     let mut url = format!(
-        "http://127.0.0.1:{port}/namespaces/{}/watch?prefix={}",
-        urlencoding::encode(ns),
+        "http://127.0.0.1:{port}/v1/watch?ns={ns}&prefix={}",
         urlencoding::encode(prefix),
     );
     if let Some(s) = since {
