@@ -4,7 +4,7 @@
 //! thread that peeks each RESP frame's first key to route the connection to
 //! the right shard — same shape as `main.rs` but inside the test process.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -238,6 +238,78 @@ impl ShardedServer {
             Err(ureq::Error::Status(code, _)) => code,
             Err(e) => panic!("http_delete error: {e}"),
         }
+    }
+
+    /// List all keys via HTTP GET /namespaces/default/keys, following pagination cursors.
+    fn http_list_all(&self) -> Vec<String> {
+        self.http_list_paged(1000)
+    }
+
+    /// List keys via HTTP with a page size limit, following pagination.
+    fn http_list_paged(&self, limit: usize) -> Vec<String> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "http://127.0.0.1:{}/namespaces/default/keys?limit={limit}",
+                self.http_port
+            );
+            if let Some(ref c) = cursor {
+                url.push_str(&format!("&cursor={c}"));
+            }
+            let resp = ureq::get(&url).call().expect("http_list_paged GET failed");
+            let mut raw = Vec::new();
+            resp.into_reader().read_to_end(&mut raw).unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&raw).expect("http_list_paged JSON parse failed");
+            for entry in body["keys"].as_array().unwrap() {
+                all.push(entry["name"].as_str().unwrap().to_owned());
+            }
+            if body["complete"].as_bool().unwrap_or(true) {
+                break;
+            }
+            cursor = body["cursor"].as_str().map(str::to_owned);
+        }
+        all
+    }
+
+    /// Subscribe to SSE prefix watch; returns a channel that delivers raw JSON event objects.
+    fn http_watch_prefix_sse(&self, prefix: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
+        let url = format!(
+            "http://127.0.0.1:{}/namespaces/default/watch?prefix={}",
+            self.http_port,
+            urlencoding::encode(prefix)
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<serde_json::Value>(64);
+        std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(5))
+                .build();
+            let response = match agent.get(&url).call() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            use std::io::BufRead as _;
+            let mut reader = std::io::BufReader::new(response.into_reader());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if let Some(data) = trimmed.strip_prefix("data: ") {
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        rx
     }
 }
 
@@ -506,6 +578,141 @@ fn http_routing_consistent_with_resp() {
             v.as_deref(),
             Some(format!("x{i}").as_str()),
             "key[{i}] written via HTTP not visible via RESP MGET"
+        );
+    }
+}
+
+// ── HTTP LIST cross-shard tests ───────────────────────────────────────────────
+
+#[test]
+fn http_list_returns_keys_from_all_shards() {
+    // PUT one key per shard via HTTP. Each PUT is routed by the URI key to its
+    // owning shard. GET /keys must fan out and return all of them.
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+
+    for (i, k) in keys.iter().enumerate() {
+        let status = srv.http_put(k, format!("v{i}").as_bytes());
+        assert_eq!(status, 204, "PUT {k} returned {status}");
+    }
+
+    let found = srv.http_list_all();
+    for k in &keys {
+        assert!(
+            found.contains(k),
+            "GET /keys missing key {k} (found {found:?})"
+        );
+    }
+}
+
+#[test]
+fn http_list_pagination_covers_all_shards() {
+    // Use limit=1 so each page covers exactly one key, forcing the cursor to
+    // advance through every shard. The union must contain every written key.
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+
+    for (i, k) in keys.iter().enumerate() {
+        let status = srv.http_put(k, format!("v{i}").as_bytes());
+        assert_eq!(status, 204, "PUT {k} returned {status}");
+    }
+
+    let found = srv.http_list_paged(1);
+    // No duplicates across pages.
+    let mut deduped = found.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        found.len(),
+        "pagination produced duplicates: {found:?}"
+    );
+    // All written keys must appear.
+    for k in &keys {
+        assert!(
+            found.contains(k),
+            "paginated GET /keys missing {k} (found {found:?})"
+        );
+    }
+}
+
+#[test]
+fn http_list_after_mset_via_resp_covers_all_shards() {
+    // Write via RESP MSET (guaranteed cross-shard), read via HTTP GET /keys.
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+    let mut con = srv.resp();
+
+    let mut cmd = redis::cmd("MSET");
+    for (i, k) in keys.iter().enumerate() {
+        cmd.arg(k).arg(format!("v{i}"));
+    }
+    let _: () = cmd.query(&mut con).unwrap();
+
+    let found = srv.http_list_all();
+    for k in &keys {
+        assert!(
+            found.contains(k),
+            "HTTP GET /keys missing key {k} written via RESP MSET (found {found:?})"
+        );
+    }
+}
+
+// ── HTTP SSE prefix-watch cross-shard tests ───────────────────────────────────
+
+#[test]
+fn http_prefix_watch_sse_receives_events_from_all_shards() {
+    // Subscribe to prefix "k" via HTTP SSE. Then write one key per shard via
+    // RESP MSET. Every shard must deliver a "set" watch event to the subscriber.
+    let srv = ShardedServer::start();
+    let keys = keys_one_per_shard();
+    // All keys generated by keys_one_per_shard start with "k".
+
+    let sse = srv.http_watch_prefix_sse("k");
+
+    // Wait for the "ready" event before writing.
+    let ready = sse
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout waiting for SSE ready event");
+    assert_eq!(
+        ready["type"], "ready",
+        "first SSE event must be ready, got {ready}"
+    );
+
+    // Write one key per shard.
+    let port = srv.resp_port;
+    let keys_clone = keys.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        rx.recv().unwrap();
+        let mut con = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let mut cmd = redis::cmd("MSET");
+        for (i, k) in keys_clone.iter().enumerate() {
+            cmd.arg(k).arg(format!("v{i}"));
+        }
+        let _: () = cmd.query(&mut con).unwrap();
+    });
+    tx.send(()).unwrap();
+
+    // Collect set events until we've seen all N_SHARDS keys.
+    let mut received = std::collections::HashSet::new();
+    for _ in 0..N_SHARDS {
+        let event = sse
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timeout waiting for SSE set event");
+        if event["type"].as_str() == Some("set") {
+            if let Some(k) = event["key"].as_str() {
+                received.insert(k.to_owned());
+            }
+        }
+    }
+    for k in &keys {
+        assert!(
+            received.contains(k.as_str()),
+            "HTTP SSE prefix watch missing event for key {k} on its shard"
         );
     }
 }

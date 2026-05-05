@@ -136,7 +136,16 @@ async fn handle_conn(
             break;
         }
 
-        let response = route(&parts, body_bytes, &store).await;
+        let response = route(
+            &parts,
+            body_bytes,
+            &store,
+            shard_idx,
+            n_shards,
+            &cross_shard_txs,
+            &cross_shard_wakeups,
+        )
+        .await;
 
         let mut enc = GenericEncoder::new(&mut w);
         if Sink::send(&mut enc, response).await.is_err() {
@@ -162,6 +171,10 @@ async fn route(
     parts: &http::request::Parts,
     body: Bytes,
     store: &ShardStore,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
 ) -> http::Response<HttpBody> {
     let path = parts.uri.path();
     let method = &parts.method;
@@ -193,7 +206,16 @@ async fn route(
             if rest == "keys" {
                 if *method == http::Method::GET {
                     let query = parts.uri.query().unwrap_or("");
-                    return handle_list(ns, query, store).await;
+                    return handle_list(
+                        ns,
+                        query,
+                        store,
+                        shard_idx,
+                        n_shards,
+                        cross_shard_txs,
+                        cross_shard_wakeups,
+                    )
+                    .await;
                 }
                 return method_not_allowed();
             }
@@ -349,61 +371,171 @@ async fn handle_incr(
     }
 }
 
-async fn handle_list(ns: &str, query: &str, store: &ShardStore) -> http::Response<HttpBody> {
-    let prefix_pattern = query_param(query, "prefix").map(|raw| {
+/// Multi-shard cursor prefix used in HTTP LIST responses. Format: `\x02 + shard_byte + per_shard_cursor`.
+/// Distinct from the engine's `\x01` continuation cursor so we can detect which format is in use.
+const LIST_CURSOR_PREFIX: u8 = 0x02;
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_list(
+    ns: &str,
+    query: &str,
+    store: &ShardStore,
+    shard_idx: usize,
+    n_shards: usize,
+    cross_shard_txs: &ShardSenders,
+    cross_shard_wakeups: &[StdUnixStream],
+) -> http::Response<HttpBody> {
+    let prefix_pattern: Option<Vec<u8>> = query_param(query, "prefix").map(|raw| {
         let mut p = percent_decode(raw);
         p.push(b'*');
         p
     });
-    // Cursor is a base64-encoded key or "0" for start. Wrap in the \x01 prefix
-    // that store::scan uses to distinguish continuation cursors from the sentinel.
-    let cursor_bytes: Vec<u8> = match query_param(query, "cursor") {
-        None | Some("0") => b"0".to_vec(),
-        Some(s) => match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
-            Ok(key) => {
-                let mut v = Vec::with_capacity(1 + key.len());
-                v.push(0x01u8);
-                v.extend_from_slice(&key);
-                v
-            }
-            Err(_) => b"0".to_vec(), // invalid cursor: restart
-        },
-    };
     let limit: u64 = query_param(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100)
         .min(1000);
 
-    match store
-        .scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit)
-        .await
-    {
-        Err(e) => engine_error_response(e),
-        Ok(page) => {
-            let keys: Vec<serde_json::Value> = page
-                .keys
-                .iter()
-                .map(|k| {
-                    let name = String::from_utf8(k.to_vec())
-                        .unwrap_or_else(|e| percent_encode_bytes(e.as_bytes()));
-                    serde_json::json!({ "name": name })
-                })
-                .collect();
-            let complete = page.next_cursor == b"0".as_ref();
-            let mut body = serde_json::json!({ "keys": keys, "complete": complete });
-            if !complete {
-                // Cursor is b"\x01" + last_key — strip prefix, base64-encode the key.
-                let key = page
-                    .next_cursor
-                    .strip_prefix(b"\x01")
-                    .unwrap_or(&page.next_cursor);
-                body["cursor"] = serde_json::Value::String(
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+    // Single-shard fast path: no fan-out needed.
+    if n_shards <= 1 {
+        // Cursor is a base64-encoded key or "0" for start. Wrap in the \x01 prefix
+        // that store::scan uses to distinguish continuation cursors from the sentinel.
+        let cursor_bytes: Vec<u8> = match query_param(query, "cursor") {
+            None | Some("0") => b"0".to_vec(),
+            Some(s) => match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
+                Ok(key) => {
+                    let mut v = Vec::with_capacity(1 + key.len());
+                    v.push(0x01u8);
+                    v.extend_from_slice(&key);
+                    v
+                }
+                Err(_) => b"0".to_vec(),
+            },
+        };
+        return match store
+            .scan(ns, &cursor_bytes, prefix_pattern.as_deref(), limit)
+            .await
+        {
+            Err(e) => engine_error_response(e),
+            Ok(page) => build_list_response_single(page),
+        };
+    }
+
+    // Multi-shard path.
+    // Cursor blob: \x02 + shard_byte + per_shard_cursor (raw engine cursor).
+    let (target_shard, per_shard_cursor): (usize, Bytes) = {
+        let raw = query_param(query, "cursor").unwrap_or("0");
+        if raw == "0" {
+            (0, Bytes::from_static(b"0"))
+        } else {
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw) {
+                Ok(blob) if blob.first() == Some(&LIST_CURSOR_PREFIX) && blob.len() >= 2 => {
+                    (blob[1] as usize, Bytes::copy_from_slice(&blob[2..]))
+                }
+                _ => (0, Bytes::from_static(b"0")), // bad cursor → restart
+            }
+        }
+    };
+
+    // Clamp to valid shard range.
+    let target_shard = target_shard.min(n_shards - 1);
+
+    // Fetch one page from the target shard.
+    let page_result: Result<beyond_kv_engine::types::ScanPage, String> =
+        if target_shard == shard_idx {
+            store
+                .scan(ns, &per_shard_cursor, prefix_pattern.as_deref(), limit)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+            let req = CrossShardRequest::Scan {
+                ns: ns.to_string(),
+                cursor: per_shard_cursor,
+                pattern: prefix_pattern.as_deref().map(Bytes::copy_from_slice),
+                count: limit,
+                reply: reply_tx,
+            };
+            if cross_shard_txs[target_shard].clone().try_send(req).is_err() {
+                return json_response(
+                    503,
+                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
                 );
             }
-            json_response(200, &body)
+            let _ = (&cross_shard_wakeups[target_shard]).write_all(&[1u8]);
+            match reply_rx.await {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+    let page = match page_result {
+        Ok(p) => p,
+        Err(e) => return internal_error(&e),
+    };
+
+    // Build the outgoing cursor and determine completeness.
+    let shard_done = page.next_cursor == b"0".as_ref();
+    let (complete, cursor_out) = if shard_done {
+        let next_shard = target_shard + 1;
+        if next_shard >= n_shards {
+            (true, None)
+        } else {
+            // Advance to the next shard from its beginning.
+            let mut blob = vec![LIST_CURSOR_PREFIX, next_shard as u8];
+            blob.extend_from_slice(b"0");
+            (
+                false,
+                Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&blob)),
+            )
         }
+    } else {
+        let mut blob = vec![LIST_CURSOR_PREFIX, target_shard as u8];
+        blob.extend_from_slice(&page.next_cursor);
+        (
+            false,
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&blob)),
+        )
+    };
+
+    let keys: Vec<serde_json::Value> = page
+        .keys
+        .iter()
+        .map(|k| {
+            let name = String::from_utf8(k.to_vec())
+                .unwrap_or_else(|e| percent_encode_bytes(e.as_bytes()));
+            serde_json::json!({ "name": name })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({ "keys": keys, "complete": complete });
+    if let Some(cursor) = cursor_out {
+        body["cursor"] = serde_json::Value::String(cursor);
     }
+    json_response(200, &body)
+}
+
+fn build_list_response_single(page: beyond_kv_engine::types::ScanPage) -> http::Response<HttpBody> {
+    let keys: Vec<serde_json::Value> = page
+        .keys
+        .iter()
+        .map(|k| {
+            let name = String::from_utf8(k.to_vec())
+                .unwrap_or_else(|e| percent_encode_bytes(e.as_bytes()));
+            serde_json::json!({ "name": name })
+        })
+        .collect();
+    let complete = page.next_cursor == b"0".as_ref();
+    let mut body = serde_json::json!({ "keys": keys, "complete": complete });
+    if !complete {
+        // Cursor is b"\x01" + last_key — strip prefix, base64-encode the key.
+        let key = page
+            .next_cursor
+            .strip_prefix(b"\x01")
+            .unwrap_or(&page.next_cursor);
+        body["cursor"] =
+            serde_json::Value::String(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key));
+    }
+    json_response(200, &body)
 }
 
 // ── SSE watch ────────────────────────────────────────────────────────────────
