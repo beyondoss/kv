@@ -1,4 +1,4 @@
-import type { KvClient, KvHttpClientOptions } from "./client.js";
+import type { KvHttpClient, KvHttpClientOptions } from "./client.js";
 import { KvError } from "./errors.js";
 import type {
   BatchOp,
@@ -9,7 +9,7 @@ import type {
   Entry,
   ExpiryOptions,
   GetAndSetOptions,
-  KvResult,
+  KvHttpResult,
   ListKey,
   ListOptions,
   ListResult,
@@ -71,7 +71,7 @@ function toKvError(err: unknown): KvError {
   );
 }
 
-export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
+export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
   const base = opts.url.replace(/\/+$/, "");
   const nsIdx = nsToIndex(opts.namespace ?? "default");
   const retries = opts.retries ?? 2;
@@ -156,20 +156,20 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     } catch {
       /* ignore */
     }
-    return new KvError(code, message, res.status);
+    return new KvError(code, message, res.status, res);
   }
 
   async function batchRequest(
     ops: unknown[],
     keyCount: number,
-  ): Promise<(unknown | null)[]> {
+  ): Promise<[(unknown | null)[], Response]> {
     const res = await request("BATCH", keyCount, batchUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(ops),
     });
     if (!res.ok) throw await parseError(res);
-    return (await res.json()) as (unknown | null)[];
+    return [(await res.json()) as (unknown | null)[], res];
   }
 
   function parseEntryHeaders(
@@ -204,19 +204,19 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     return makeEntry(raw);
   }
 
-  async function _get(key: string): Promise<Entry | null> {
+  async function _get(key: string): Promise<[Entry | null, Response]> {
     const res = await request("GET", 1, valueUrl(key), {});
-    if (res.status === 404) return null;
+    if (res.status === 404) return [null, res];
     if (!res.ok) throw await parseError(res);
     const value = new Uint8Array(await res.arrayBuffer());
-    return parseEntryHeaders(res, key, value);
+    return [parseEntryHeaders(res, key, value), res];
   }
 
   async function _set(
     key: string,
     value: string | Uint8Array,
     setOpts?: SetOptions,
-  ): Promise<void> {
+  ): Promise<[undefined, Response]> {
     const headers: Record<string, string> = {};
     if (setOpts?.keepTtl) {
       headers["x-kv-keepttl"] = "1";
@@ -242,12 +242,13 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
 
     const res = await request("SET", 1, url, { method: "PUT", headers, body });
     if (!res.ok) throw await parseError(res);
+    return [undefined, res];
   }
 
-  async function _exists(key: string): Promise<boolean> {
+  async function _exists(key: string): Promise<[boolean, Response]> {
     const res = await request("EXISTS", 1, valueUrl(key), { method: "HEAD" });
-    if (res.status === 404) return false;
-    if (res.status === 200) return true;
+    if (res.status === 404) return [false, res];
+    if (res.status === 200) return [true, res];
     throw await parseError(res);
   }
 
@@ -255,7 +256,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     key: string,
     value: string | Uint8Array,
     getAndSetOpts?: GetAndSetOptions,
-  ): Promise<Entry | null> {
+  ): Promise<[Entry | null, Response]> {
     const headers: Record<string, string> = { "x-kv-return-old": "1" };
     if (getAndSetOpts?.ttl != null) {
       headers["x-kv-ttl"] = String(getAndSetOpts.ttl);
@@ -273,16 +274,16 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       headers,
       body,
     });
-    if (res.status === 204) return null;
+    if (res.status === 204) return [null, res];
     if (!res.ok) throw await parseError(res);
     const oldValue = new Uint8Array(await res.arrayBuffer());
-    return parseEntryHeaders(res, key, oldValue);
+    return [parseEntryHeaders(res, key, oldValue), res];
   }
 
   async function _expire(
     key: string,
     expireOpts: ExpiryOptions,
-  ): Promise<Entry | null> {
+  ): Promise<[Entry | null, Response]> {
     const url = new URL(`${base}/v1/kv/${encodeURIComponent(key)}`);
     url.searchParams.set("ns", String(nsIdx));
     if (expireOpts.ttl != null) {
@@ -307,12 +308,12 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       headers,
     });
     if (res.status === 404) {
-      throw new KvError("not_found", `key not found: ${key}`, 404);
+      throw new KvError("not_found", `key not found: ${key}`, 404, res);
     }
-    if (res.status === 204) return null;
+    if (res.status === 204) return [null, res];
     if (!res.ok) throw await parseError(res);
     const value = new Uint8Array(await res.arrayBuffer());
-    return parseEntryHeaders(res, key, value);
+    return [parseEntryHeaders(res, key, value), res];
   }
 
   async function _cas(
@@ -320,7 +321,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     value: string | Uint8Array,
     revision: number,
     casOpts?: CasOptions,
-  ): Promise<number> {
+  ): Promise<[number, Response]> {
     const headers: Record<string, string> = {
       "if-match": String(revision),
     };
@@ -337,25 +338,25 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     });
     if (!res.ok) throw await parseError(res);
     const revHeader = res.headers.get("x-kv-revision");
-    return revHeader != null ? Number(revHeader) : 0;
+    return [revHeader != null ? Number(revHeader) : 0, res];
   }
 
-  async function _getAndDelete(key: string): Promise<Entry | null> {
+  async function _getAndDelete(key: string): Promise<[Entry | null, Response]> {
     const headers: Record<string, string> = { "x-kv-return-old": "1" };
     const res = await request("GETDEL", 1, valueUrl(key), {
       method: "DELETE",
       headers,
     });
-    if (res.status === 204) return null;
+    if (res.status === 204) return [null, res];
     if (!res.ok) throw await parseError(res);
     const value = new Uint8Array(await res.arrayBuffer());
-    return parseEntryHeaders(res, key, value);
+    return [parseEntryHeaders(res, key, value), res];
   }
 
   async function _delete(
     key: string,
     opts?: DeleteOptions,
-  ): Promise<Entry | null | undefined> {
+  ): Promise<[Entry | null | undefined, Response]> {
     const headers: Record<string, string> = {};
     if (opts?.ifMatch != null) headers["if-match"] = String(opts.ifMatch);
     if (opts?.returnOld) headers["x-kv-return-old"] = "1";
@@ -366,60 +367,69 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     });
     if (!res.ok) throw await parseError(res);
     if (opts?.returnOld) {
-      if (res.status === 204) return null;
+      if (res.status === 204) return [null, res];
       const value = new Uint8Array(await res.arrayBuffer());
-      return parseEntryHeaders(res, key, value);
+      return [parseEntryHeaders(res, key, value), res];
     }
-    return undefined;
+    return [undefined, res];
   }
 
-  async function _incr(key: string, delta: number = 1): Promise<number> {
+  async function _incr(
+    key: string,
+    delta: number = 1,
+  ): Promise<[number, Response]> {
     const url = `${base}/v1/kv/${encodeURIComponent(key)}/incr?ns=${nsIdx}${
       delta !== 1 ? `&delta=${delta}` : ""
     }`;
     const res = await request("INCR", 1, url, { method: "POST" });
     if (!res.ok) throw await parseError(res);
     const body = (await res.json()) as components["schemas"]["IncrResponse"];
-    return body.value;
+    return [body.value, res];
   }
 
-  async function _list(listOpts?: ListOptions): Promise<ListResult> {
+  async function _list(
+    listOpts?: ListOptions,
+  ): Promise<[ListResult, Response]> {
     const res = await request("SCAN", 1, keysUrl(listOpts), {});
     if (!res.ok) throw await parseError(res);
     const body = (await res.json()) as components["schemas"]["ListResponse"];
     const result: ListResult = { keys: body.keys as ListKey[] };
     if (body.cursor) result.nextCursor = body.cursor;
-    return result;
+    return [result, res];
   }
 
-  async function _count(): Promise<number> {
+  async function _count(): Promise<[number, Response]> {
     const res = await request("DBSIZE", 1, countUrl(), {});
     if (!res.ok) throw await parseError(res);
     const body = (await res.json()) as components["schemas"]["CountResponse"];
-    return body.count;
+    return [body.count, res];
   }
 
-  async function _flush(): Promise<void> {
+  async function _flush(): Promise<[undefined, Response]> {
     const res = await request("FLUSHDB", 1, flushUrl(), { method: "DELETE" });
     if (!res.ok) throw await parseError(res);
+    return [undefined, res];
   }
 
-  async function _compact(): Promise<void> {
+  async function _compact(): Promise<[undefined, Response]> {
     const res = await request("BGREWRITEAOF", 1, compactUrl(), {
       method: "POST",
     });
     if (!res.ok) throw await parseError(res);
+    return [undefined, res];
   }
 
-  async function _mget(keys: string[]): Promise<(Entry | null)[]> {
-    if (keys.length === 0) return [];
+  async function _mget(keys: string[]): Promise<[(Entry | null)[], Response]> {
     const ops = keys.map((key) => ({ op: "get" as const, key }));
-    const results = await batchRequest(ops, keys.length);
-    return results.map((r) =>
-      r == null || typeof r !== "object" || !("value" in r)
-        ? null
-        : parseBatchEntry(r as BatchGetResult)
-    );
+    const [results, res] = await batchRequest(ops, keys.length);
+    return [
+      results.map((r) =>
+        r == null || typeof r !== "object" || !("value" in r)
+          ? null
+          : parseBatchEntry(r as BatchGetResult)
+      ),
+      res,
+    ];
   }
 
   function batchSetWireOp(
@@ -445,18 +455,17 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     };
   }
 
-  async function _mset(entries: MSetEntry[]): Promise<void> {
-    if (entries.length === 0) return;
+  async function _mset(entries: MSetEntry[]): Promise<[undefined, Response]> {
     const ops = entries.map(({ key, value, opts }) =>
       batchSetWireOp(key, value, opts)
     );
-    await batchRequest(ops, entries.length);
+    const [, res] = await batchRequest(ops, entries.length);
+    return [undefined, res];
   }
 
   async function _batch<T extends readonly BatchOp[]>(
     ops: T,
-  ): Promise<BatchResults<T>> {
-    if (ops.length === 0) return [] as unknown as BatchResults<T>;
+  ): Promise<[BatchResults<T>, Response]> {
     const wireOps = ops.map((op) => {
       if (op.op === "get") return { op: "get" as const, key: op.key };
       if (op.op === "set") {
@@ -475,7 +484,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       }
       return { op: "incr" as const, key: op.key, delta: op.delta ?? 1 };
     });
-    const raw = await batchRequest(wireOps, ops.length);
+    const [raw, res] = await batchRequest(wireOps, ops.length);
     const results = ops.map((op, i) => {
       const r = raw[i];
       if (op.op === "get") {
@@ -498,157 +507,182 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
       }
       return undefined;
     });
-    return results as unknown as BatchResults<T>;
+    return [results as unknown as BatchResults<T>, res];
+  }
+
+  function ok<T>(data: T, response: Response): KvHttpResult<T> {
+    return { data, error: undefined, response };
+  }
+
+  function fail(err: unknown): KvHttpResult<never> {
+    const error = toKvError(err);
+    return { data: undefined, error, response: error.response };
   }
 
   return {
     async get(key) {
       try {
-        return { data: await _get(key), error: undefined };
+        const [data, response] = await _get(key);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async set(key, value, opts) {
       try {
-        await _set(key, value, opts);
-        return { data: undefined, error: undefined };
+        const [, response] = await _set(key, value, opts);
+        return ok(undefined, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async exists(key) {
       try {
-        return { data: await _exists(key), error: undefined };
+        const [data, response] = await _exists(key);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async getAndSet(key, value, opts) {
       try {
-        return { data: await _getAndSet(key, value, opts), error: undefined };
+        const [data, response] = await _getAndSet(key, value, opts);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async expire(key, expireOpts) {
       try {
-        return { data: await _expire(key, expireOpts), error: undefined };
+        const [data, response] = await _expire(key, expireOpts);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async delete(key: string, opts?: DeleteOptions) {
       try {
-        const old = await _delete(key, opts);
+        const [old, response] = await _delete(key, opts);
         if (opts?.returnOld) {
-          return {
-            data: old ?? null,
-            error: undefined,
-          } as KvResult<Entry | null>;
+          return ok(old ?? null, response) as KvHttpResult<Entry | null>;
         }
-        return { data: undefined, error: undefined } as KvResult<void>;
+        return ok(undefined, response) as KvHttpResult<void>;
       } catch (err) {
-        return { data: undefined, error: toKvError(err) } as KvResult<never>;
+        return fail(err) as KvHttpResult<never>;
       }
     },
 
     async list(listOpts) {
       try {
-        return { data: await _list(listOpts), error: undefined };
+        const [data, response] = await _list(listOpts);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async count() {
       try {
-        return { data: await _count(), error: undefined };
+        const [data, response] = await _count();
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async flush() {
       try {
-        await _flush();
-        return { data: undefined, error: undefined };
+        const [, response] = await _flush();
+        return ok(undefined, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async compact() {
       try {
-        await _compact();
-        return { data: undefined, error: undefined };
+        const [, response] = await _compact();
+        return ok(undefined, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async multiGet(keys) {
+      if (keys.length === 0) return ok([], new Response(null, { status: 200 }));
       try {
-        return { data: await _mget(keys), error: undefined };
+        const [data, response] = await _mget(keys);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async multiSet(entries) {
+      if (entries.length === 0) {
+        return ok(undefined, new Response(null, { status: 200 }));
+      }
       try {
-        await _mset(entries);
-        return { data: undefined, error: undefined };
+        const [, response] = await _mset(entries);
+        return ok(undefined, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async incr(key, delta) {
       try {
-        return { data: await _incr(key, delta), error: undefined };
+        const [data, response] = await _incr(key, delta);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async decr(key, delta = 1) {
       try {
-        return { data: await _incr(key, -delta), error: undefined };
+        const [data, response] = await _incr(key, -delta);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async cas(key, value, revision, casOpts) {
       try {
-        return {
-          data: await _cas(key, value, revision, casOpts),
-          error: undefined,
-        };
+        const [data, response] = await _cas(key, value, revision, casOpts);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async getAndDelete(key) {
       try {
-        return { data: await _getAndDelete(key), error: undefined };
+        const [data, response] = await _getAndDelete(key);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
     async batch(ops) {
+      if (ops.length === 0) {
+        return ok(
+          [] as unknown as BatchResults<typeof ops>,
+          new Response(null, { status: 200 }),
+        );
+      }
       try {
-        return { data: await _batch(ops), error: undefined };
+        const [data, response] = await _batch(ops);
+        return ok(data, response);
       } catch (err) {
-        return { data: undefined, error: toKvError(err) };
+        return fail(err);
       }
     },
 
@@ -659,7 +693,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvClient {
     watch(key: string, watchOpts?: WatchOptions): AsyncGenerator<WatchEvent> {
       return watchSse(base, nsIdx, key, watchOpts, fetchFn);
     },
-  } as KvClient;
+  } as KvHttpClient;
 }
 
 async function* watchSse(

@@ -198,3 +198,8 @@ export type BatchResults<T extends readonly BatchOp[]> = {
 export type KvResult<T> =
   | { data: T; error: undefined }
   | { data: undefined; error: KvError };
+
+/** Result type returned by HTTP KvClient methods. Includes the raw HTTP response. */
+export type KvHttpResult<T> =
+  | { data: T; error: undefined; response: Response }
+  | { data: undefined; error: KvError; response: Response | undefined };

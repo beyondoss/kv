@@ -8,6 +8,7 @@ import type {
   Entry,
   ExpiryOptions,
   GetAndSetOptions,
+  KvHttpResult,
   KvResult,
   ListOptions,
   ListResult,
@@ -24,6 +25,7 @@ export type {
   CasOptions,
   ExpiryOptions,
   GetAndSetOptions,
+  KvHttpResult,
   KvResult,
 } from "./kv-types.js";
 export type { operations } from "./types.js";
@@ -143,6 +145,46 @@ export interface KvClient {
   close(): Promise<void>;
 }
 
+/** HTTP KvClient — same as {@link KvClient} but every result includes the raw HTTP `response`. */
+export interface KvHttpClient extends KvClient {
+  get(key: string): Promise<KvHttpResult<Entry | null>>;
+  set(
+    key: string,
+    value: string | Uint8Array,
+    opts?: SetOptions,
+  ): Promise<KvHttpResult<void>>;
+  exists(key: string): Promise<KvHttpResult<boolean>>;
+  getAndSet(
+    key: string,
+    value: string | Uint8Array,
+    opts?: GetAndSetOptions,
+  ): Promise<KvHttpResult<Entry | null>>;
+  expire(key: string, opts: ExpiryOptions): Promise<KvHttpResult<Entry | null>>;
+  delete(
+    key: string,
+    opts: DeleteOptions & { returnOld: true },
+  ): Promise<KvHttpResult<Entry | null>>;
+  delete(key: string, opts?: DeleteOptions): Promise<KvHttpResult<void>>;
+  list(opts?: ListOptions): Promise<KvHttpResult<ListResult>>;
+  count(): Promise<KvHttpResult<number>>;
+  flush(): Promise<KvHttpResult<void>>;
+  compact(): Promise<KvHttpResult<void>>;
+  multiGet(keys: string[]): Promise<KvHttpResult<(Entry | null)[]>>;
+  multiSet(entries: MSetEntry[]): Promise<KvHttpResult<void>>;
+  incr(key: string, delta?: number): Promise<KvHttpResult<number>>;
+  decr(key: string, delta?: number): Promise<KvHttpResult<number>>;
+  cas(
+    key: string,
+    value: string | Uint8Array,
+    revision: number,
+    opts?: CasOptions,
+  ): Promise<KvHttpResult<number>>;
+  getAndDelete(key: string): Promise<KvHttpResult<Entry | null>>;
+  batch<T extends readonly BatchOp[]>(
+    ops: T,
+  ): Promise<KvHttpResult<BatchResults<T>>>;
+}
+
 interface KvBaseClientOptions {
   /**
    * Server URL. Scheme determines the backend:
@@ -216,5 +258,5 @@ export function createKvClient(opts: KvClientOptions): KvClient {
   if (protocol === "redis:" || protocol === "rediss:") {
     return createRespKvClient(opts as KvRespClientOptions);
   }
-  return createHttpKvClient(opts as KvHttpClientOptions);
+  return createHttpKvClient(opts as KvHttpClientOptions) as KvClient;
 }
