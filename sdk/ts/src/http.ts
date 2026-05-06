@@ -20,12 +20,13 @@ import type {
 } from "./kv-types.js";
 import { makeEntry } from "./kv-types.js";
 import type { components } from "./types.js";
+import { camelize } from "./utils/camelize.js";
 
 interface BatchGetResult {
   value: string;
   revision?: number;
   ttl?: number;
-  ttl_ms?: number;
+  ttlMs?: number;
   metadata?: unknown;
 }
 
@@ -38,22 +39,23 @@ function encodeBase64(bytes: Uint8Array): string {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function parseBatchEntry(r: BatchGetResult): Entry {
+function parseBatchEntry(raw: unknown): Entry {
+  const r = camelize(raw) as BatchGetResult;
   const value = decodeBase64(r.value);
-  const raw: {
+  const entry: {
     value: Uint8Array;
     ttl?: number;
-    ttl_ms?: number;
+    ttlMs?: number;
     metadata?: unknown;
     revision: number;
   } = {
     value,
     revision: r.revision ?? 0,
   };
-  if (r.ttl != null) raw.ttl = r.ttl;
-  if (r.ttl_ms != null) raw.ttl_ms = r.ttl_ms;
-  if (r.metadata !== undefined) raw.metadata = r.metadata;
-  return makeEntry(raw);
+  if (r.ttl != null) entry.ttl = r.ttl;
+  if (r.ttlMs != null) entry.ttlMs = r.ttlMs;
+  if (r.metadata !== undefined) entry.metadata = r.metadata;
+  return makeEntry(entry);
 }
 
 function nsToIndex(ns: string): number {
@@ -185,7 +187,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     const raw: {
       value: Uint8Array;
       ttl?: number;
-      ttl_ms?: number;
+      ttlMs?: number;
       metadata?: unknown;
       revision: number;
     } = {
@@ -193,7 +195,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       revision: revHeader != null ? Number(revHeader) : 0,
     };
     if (ttlHeader != null) raw.ttl = Number(ttlHeader);
-    if (ttlMsHeader != null) raw.ttl_ms = Number(ttlMsHeader);
+    if (ttlMsHeader != null) raw.ttlMs = Number(ttlMsHeader);
     if (metaHeader != null) {
       try {
         raw.metadata = JSON.parse(metaHeader) as unknown;
@@ -288,12 +290,12 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     url.searchParams.set("ns", String(nsIdx));
     if (expireOpts.ttl != null) {
       url.searchParams.set("ttl", String(expireOpts.ttl));
-    } else if (expireOpts.ttl_ms != null) {
-      url.searchParams.set("ttl_ms", String(expireOpts.ttl_ms));
-    } else if (expireOpts.ttl_at != null) {
-      url.searchParams.set("ttl_at", String(expireOpts.ttl_at));
-    } else if (expireOpts.ttl_at_ms != null) {
-      url.searchParams.set("ttl_at_ms", String(expireOpts.ttl_at_ms));
+    } else if (expireOpts.ttlMs != null) {
+      url.searchParams.set("ttl_ms", String(expireOpts.ttlMs));
+    } else if (expireOpts.ttlAt != null) {
+      url.searchParams.set("ttl_at", String(expireOpts.ttlAt));
+    } else if (expireOpts.ttlAtMs != null) {
+      url.searchParams.set("ttl_at_ms", String(expireOpts.ttlAtMs));
     } else if (expireOpts.persist) {
       url.searchParams.set("persist", "1");
     }
@@ -426,7 +428,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       results.map((r) =>
         r == null || typeof r !== "object" || !("value" in r)
           ? null
-          : parseBatchEntry(r as BatchGetResult)
+          : parseBatchEntry(r)
       ),
       res,
     ];
@@ -444,8 +446,8 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       op: "set",
       key,
       value: encodeBase64(bytes),
-      ...(opts?.ttl_ms != null
-        ? { ttlMs: opts.ttl_ms }
+      ...(opts?.ttlMs != null
+        ? { ttlMs: opts.ttlMs }
         : opts?.ttl != null && { ttl: opts.ttl }),
       ...(opts?.metadata != null && { metadata: opts.metadata }),
       ...(opts?.ifAbsent === true && { nx: true }),

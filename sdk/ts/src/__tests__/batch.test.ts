@@ -101,12 +101,12 @@ describe("HTTP backend — new batch features", () => {
     expect(entry.ttl!).toBeLessThanOrEqual(before);
   });
 
-  it("batch set with ttl_ms sets expiry", async () => {
+  it("batch set with ttlMs sets expiry", async () => {
     const kv = httpClient();
     const key = uniqueKey("ttlms");
     await kv.batch(
       [
-        { op: "set", key, value: "v", opts: { ttl_ms: 30_000 } },
+        { op: "set", key, value: "v", opts: { ttlMs: 30_000 } },
       ] as const,
     );
     const entry = (await kv.get(key)).data!;
@@ -115,26 +115,26 @@ describe("HTTP backend — new batch features", () => {
     expect(entry.ttl!).toBeLessThanOrEqual(30);
   });
 
-  it("batch get returns ttl_ms when key has expiry", async () => {
+  it("batch get returns ttlMs when key has expiry", async () => {
     const kv = httpClient();
     const key = uniqueKey("getttlms");
     await kv.set(key, "v", { ttl: 60 });
 
     const { data: results } = await kv.batch([{ op: "get", key }] as const);
     const entry = results![0]!;
-    expect(entry.ttl_ms).toBeDefined();
-    expect(entry.ttl_ms!).toBeGreaterThan(0);
-    expect(entry.ttl_ms!).toBeLessThanOrEqual(60_000);
+    expect(entry.ttlMs).toBeDefined();
+    expect(entry.ttlMs!).toBeGreaterThan(0);
+    expect(entry.ttlMs!).toBeLessThanOrEqual(60_000);
   });
 
-  it("GET response includes ttl_ms header", async () => {
+  it("GET response includes ttlMs header", async () => {
     const kv = httpClient();
     const key = uniqueKey("hdrttlms");
     await kv.set(key, "v", { ttl: 60 });
     const { data: entry } = await kv.get(key);
-    expect(entry!.ttl_ms).toBeDefined();
-    expect(entry!.ttl_ms!).toBeGreaterThan(0);
-    expect(entry!.ttl_ms!).toBeLessThanOrEqual(60_000);
+    expect(entry!.ttlMs).toBeDefined();
+    expect(entry!.ttlMs!).toBeGreaterThan(0);
+    expect(entry!.ttlMs!).toBeLessThanOrEqual(60_000);
   });
 
   it("batch delete with returnOld returns previous entry", async () => {

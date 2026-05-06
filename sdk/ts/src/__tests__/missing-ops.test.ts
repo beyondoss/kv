@@ -138,7 +138,7 @@ describe("HTTP backend — expire()", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "v");
-    await kv.expire(key, { ttl_ms: 60_000 });
+    await kv.expire(key, { ttlMs: 60_000 });
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -149,7 +149,7 @@ describe("HTTP backend — expire()", () => {
     const key = uniqueKey();
     await kv.set(key, "v");
     const futureTs = Math.floor(Date.now() / 1000) + 60;
-    await kv.expire(key, { ttl_at: futureTs });
+    await kv.expire(key, { ttlAt: futureTs });
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -211,7 +211,7 @@ describe("RESP backend — expire()", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "v");
-    await kv.expire(key, { ttl_ms: 60_000 });
+    await kv.expire(key, { ttlMs: 60_000 });
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -413,7 +413,7 @@ describe("HTTP backend — mset with BatchSetOpts", () => {
   it("respects ttl_ms per entry", async () => {
     const kv = httpClient();
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttl_ms: 60_000 } }]);
+    await kv.multiSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -441,7 +441,7 @@ describe("RESP backend — mset with BatchSetOpts", () => {
   it("respects ttl_ms per entry", async () => {
     const kv = respClient();
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttl_ms: 60_000 } }]);
+    await kv.multiSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);

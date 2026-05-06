@@ -188,12 +188,12 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
           getexArgs.push("PERSIST");
         } else if (expireOpts.ttl != null) {
           getexArgs.push("EX", expireOpts.ttl);
-        } else if (expireOpts.ttl_ms != null) {
-          getexArgs.push("PX", expireOpts.ttl_ms);
-        } else if (expireOpts.ttl_at != null) {
-          getexArgs.push("EXAT", expireOpts.ttl_at);
-        } else if (expireOpts.ttl_at_ms != null) {
-          getexArgs.push("PXAT", expireOpts.ttl_at_ms);
+        } else if (expireOpts.ttlMs != null) {
+          getexArgs.push("PX", expireOpts.ttlMs);
+        } else if (expireOpts.ttlAt != null) {
+          getexArgs.push("EXAT", expireOpts.ttlAt);
+        } else if (expireOpts.ttlAtMs != null) {
+          getexArgs.push("PXAT", expireOpts.ttlAtMs);
         }
 
         const pipeline = redis.pipeline();
@@ -223,12 +223,12 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
         affected = await redis.persist(key);
       } else if (expireOpts.ttl != null) {
         affected = await redis.expire(key, expireOpts.ttl);
-      } else if (expireOpts.ttl_ms != null) {
-        affected = await redis.pexpire(key, expireOpts.ttl_ms);
-      } else if (expireOpts.ttl_at != null) {
-        affected = await redis.expireat(key, expireOpts.ttl_at);
-      } else if (expireOpts.ttl_at_ms != null) {
-        affected = await redis.pexpireat(key, expireOpts.ttl_at_ms);
+      } else if (expireOpts.ttlMs != null) {
+        affected = await redis.pexpire(key, expireOpts.ttlMs);
+      } else if (expireOpts.ttlAt != null) {
+        affected = await redis.expireat(key, expireOpts.ttlAt);
+      } else if (expireOpts.ttlAtMs != null) {
+        affected = await redis.pexpireat(key, expireOpts.ttlAtMs);
       } else {
         throw new KvError(
           "invalid_request",
@@ -381,8 +381,8 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     const buf = value instanceof Uint8Array
       ? Buffer.from(value)
       : Buffer.from(value);
-    const ttl = opts?.ttl_ms != null ? null : (opts?.ttl ?? null); // ttl_ms takes priority
-    const ttlMs = opts?.ttl_ms ?? null;
+    const ttl = opts?.ttlMs != null ? null : (opts?.ttl ?? null); // ttl_ms takes priority
+    const ttlMs = opts?.ttlMs ?? null;
 
     if (opts?.ifMatch != null) {
       const args: (string | Buffer)[] = [key, buf, String(opts.ifMatch)];
@@ -611,7 +611,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
             (e) =>
               e.opts == null
               || (e.opts.ttl == null
-                && e.opts.ttl_ms == null
+                && e.opts.ttlMs == null
                 && !e.opts.ifAbsent
                 && !e.opts.ifPresent
                 && e.opts.ifMatch == null
@@ -621,7 +621,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
             (e) =>
               e.opts != null
               && (e.opts.ttl != null
-                || e.opts.ttl_ms != null
+                || e.opts.ttlMs != null
                 || e.opts.ifAbsent
                 || e.opts.ifPresent
                 || e.opts.ifMatch != null

@@ -11,7 +11,7 @@ export interface Entry {
   /** Remaining TTL in seconds. Absent if the key has no expiry. */
   ttl?: number;
   /** Remaining TTL in milliseconds. Absent if the key has no expiry. */
-  ttl_ms?: number;
+  ttlMs?: number;
   /**
    * Arbitrary JSON metadata attached to the entry.
    * [HTTP only] — always `undefined` when using the RESP backend.
@@ -27,7 +27,7 @@ export interface Entry {
 export function makeEntry(raw: {
   value: Uint8Array;
   ttl?: number;
-  ttl_ms?: number;
+  ttlMs?: number;
   metadata?: unknown;
   revision: number;
 }): Entry {
@@ -70,7 +70,7 @@ export interface SetOptions {
 
 export type BatchSetOpts = SetOptions & {
   /** TTL in milliseconds. Takes priority over `ttl` (seconds) when both are set. */
-  ttl_ms?: number;
+  ttlMs?: number;
 };
 
 /** Options for {@link KvClient.expire}. Exactly one TTL option must be supplied. */
@@ -78,11 +78,11 @@ export interface ExpiryOptions {
   /** New TTL in seconds from now. */
   ttl?: number;
   /** New TTL in milliseconds from now. */
-  ttl_ms?: number;
+  ttlMs?: number;
   /** Absolute expiry as a Unix timestamp in seconds. */
-  ttl_at?: number;
+  ttlAt?: number;
   /** Absolute expiry as a Unix timestamp in milliseconds. */
-  ttl_at_ms?: number;
+  ttlAtMs?: number;
   /** Remove the TTL entirely. Mutually exclusive with all other options. */
   persist?: boolean;
   /**
