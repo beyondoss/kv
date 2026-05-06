@@ -563,7 +563,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
       }
     },
 
-    async multiGet(keys) {
+    async batchGet(keys) {
       if (keys.length === 0) return { data: [], error: undefined };
       try {
         const result = await track("MGET", keys.length, async () => {
@@ -601,7 +601,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
       }
     },
 
-    async multiSet(entries) {
+    async batchSet(entries) {
       if (entries.length === 0) return { data: undefined, error: undefined };
       try {
         await track("MSET", entries.length, async () => {

@@ -30,24 +30,3 @@ export class KvError extends Error {
     this.hint = hint;
   }
 }
-
-/**
- * Returned in the `error` field when the requested key does not exist.
- *
- * @example
- * ```ts
- * const { data, error } = await kv.get("my-key")
- * if (error instanceof KvNotFoundError) {
- *   return new Response("Not Found", { status: 404 })
- * }
- * ```
- */
-export class KvNotFoundError extends KvError {
-  readonly key: string;
-
-  constructor(key: string) {
-    super("not_found", `key not found: ${key}`, 404);
-    this.name = "KvNotFoundError";
-    this.key = key;
-  }
-}

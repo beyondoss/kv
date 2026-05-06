@@ -413,7 +413,7 @@ describe("HTTP backend — mset with BatchSetOpts", () => {
   it("respects ttl_ms per entry", async () => {
     const kv = httpClient();
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
+    await kv.batchSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -423,7 +423,7 @@ describe("HTTP backend — mset with BatchSetOpts", () => {
     const kv = httpClient();
     const key = uniqueKey();
     const meta = { src: "mset-test" };
-    await kv.multiSet([{ key, value: "v", opts: { metadata: meta } }]);
+    await kv.batchSet([{ key, value: "v", opts: { metadata: meta } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.metadata).toEqual(meta);
   });
@@ -432,7 +432,7 @@ describe("HTTP backend — mset with BatchSetOpts", () => {
     const kv = httpClient();
     const key = uniqueKey();
     await kv.set(key, "original");
-    await kv.multiSet([{ key, value: "new", opts: { ifAbsent: true } }]);
+    await kv.batchSet([{ key, value: "new", opts: { ifAbsent: true } }]);
     expect(dec((await kv.get(key)).data!.value)).toBe("original");
   });
 });
@@ -441,7 +441,7 @@ describe("RESP backend — mset with BatchSetOpts", () => {
   it("respects ttl_ms per entry", async () => {
     const kv = respClient();
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
+    await kv.batchSet([{ key, value: "v", opts: { ttlMs: 60_000 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -452,7 +452,7 @@ describe("RESP backend — mset with BatchSetOpts", () => {
     const kv = respClient();
     const key = uniqueKey();
     await kv.set(key, "original");
-    await kv.multiSet([{ key, value: "new", opts: { ifAbsent: true } }]);
+    await kv.batchSet([{ key, value: "new", opts: { ifAbsent: true } }]);
     expect(dec((await kv.get(key)).data!.value)).toBe("original");
     await kv.close();
   });
@@ -461,7 +461,7 @@ describe("RESP backend — mset with BatchSetOpts", () => {
     const kv = respClient();
     const k1 = uniqueKey();
     const k2 = uniqueKey();
-    await kv.multiSet([
+    await kv.batchSet([
       { key: k1, value: "plain" },
       { key: k2, value: "with-ttl", opts: { ttl: 60 } },
     ]);

@@ -81,10 +81,6 @@ export interface KvClient {
   flush(): Promise<KvResult<void>>;
   /** Trigger a background log compaction (equivalent to BGREWRITEAOF). Returns immediately. */
   compact(): Promise<KvResult<void>>;
-  /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: batch request. */
-  multiGet(keys: string[]): Promise<KvResult<(Entry | null)[]>>;
-  /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: batch request. */
-  multiSet(entries: MSetEntry[]): Promise<KvResult<void>>;
   /**
    * Atomically increment the integer stored at `key` by `delta` (default 1).
    * Missing keys are treated as 0. Returns the new value.
@@ -131,6 +127,10 @@ export interface KvClient {
   batch<T extends readonly BatchOp[]>(
     ops: T,
   ): Promise<KvResult<BatchResults<T>>>;
+  /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: batch request. */
+  batchGet(keys: string[]): Promise<KvResult<(Entry | null)[]>>;
+  /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: batch request. */
+  batchSet(entries: MSetEntry[]): Promise<KvResult<void>>;
   /**
    * Subscribe to changes on a key or prefix.
    *
@@ -169,8 +169,8 @@ export interface KvHttpClient extends KvClient {
   count(): Promise<KvHttpResult<number>>;
   flush(): Promise<KvHttpResult<void>>;
   compact(): Promise<KvHttpResult<void>>;
-  multiGet(keys: string[]): Promise<KvHttpResult<(Entry | null)[]>>;
-  multiSet(entries: MSetEntry[]): Promise<KvHttpResult<void>>;
+  batchGet(keys: string[]): Promise<KvHttpResult<(Entry | null)[]>>;
+  batchSet(entries: MSetEntry[]): Promise<KvHttpResult<void>>;
   incr(key: string, delta?: number): Promise<KvHttpResult<number>>;
   decr(key: string, delta?: number): Promise<KvHttpResult<number>>;
   cas(

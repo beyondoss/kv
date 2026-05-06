@@ -15,7 +15,7 @@ export {
   type operations,
   type paths,
 } from "./client.js";
-export { KvError, KvNotFoundError } from "./errors.js";
+export { KvError } from "./errors.js";
 export { createHttpKvClient } from "./http.js";
 export type {
   BatchOp,

@@ -124,7 +124,7 @@ describe("RESP backend — list / scan", () => {
   it("filters by prefix", async () => {
     const prefix = `pfx:${crypto.randomUUID()}`;
     const matching = [`${prefix}:a`, `${prefix}:b`];
-    await kv.multiSet(matching.map((key) => ({ key, value: "v" })));
+    await kv.batchSet(matching.map((key) => ({ key, value: "v" })));
 
     const { data: result } = await kv.list({ prefix });
     const names = result!.keys.map((k) => k.name).sort();
@@ -135,7 +135,7 @@ describe("RESP backend — list / scan", () => {
     const prefix = `page:${crypto.randomUUID()}`;
     const total = 5;
     const allKeys = Array.from({ length: total }, (_, i) => `${prefix}:${i}`);
-    await kv.multiSet(allKeys.map((key) => ({ key, value: "v" })));
+    await kv.batchSet(allKeys.map((key) => ({ key, value: "v" })));
 
     const seen: string[] = [];
     let cursor: string | undefined;
@@ -159,24 +159,24 @@ describe("RESP backend — mget / mset", () => {
     const existing = uniqueKey();
     const missing = uniqueKey();
     await kv.set(existing, "hi");
-    const { data: results } = await kv.multiGet([existing, missing]);
+    const { data: results } = await kv.batchGet([existing, missing]);
     expect(results).toHaveLength(2);
     expect(dec(results![0]!.value)).toBe("hi");
     expect(results![1]).toBeNull();
   });
 
   it("mget with empty array returns empty array", async () => {
-    expect((await kv.multiGet([])).data).toEqual([]);
+    expect((await kv.batchGet([])).data).toEqual([]);
   });
 
   it("mget returns ttl for keys that have one", async () => {
     const withTtl = uniqueKey();
     const noTtl = uniqueKey();
-    await kv.multiSet([
+    await kv.batchSet([
       { key: withTtl, value: "timed", opts: { ttl: 60 } },
       { key: noTtl, value: "forever" },
     ]);
-    const { data: results } = await kv.multiGet([withTtl, noTtl]);
+    const { data: results } = await kv.batchGet([withTtl, noTtl]);
     const [a, b] = results!;
     expect(a?.ttl).toBeGreaterThan(0);
     expect(a?.ttl).toBeLessThanOrEqual(60);
@@ -189,21 +189,21 @@ describe("RESP backend — mget / mset", () => {
       { key: uniqueKey(), value: "two" },
       { key: uniqueKey(), value: enc("three") },
     ];
-    await kv.multiSet(entries);
-    const { data: results } = await kv.multiGet(entries.map((e) => e.key));
+    await kv.batchSet(entries);
+    const { data: results } = await kv.batchGet(entries.map((e) => e.key));
     expect(dec(results![0]!.value)).toBe("one");
     expect(dec(results![1]!.value)).toBe("two");
     expect(dec(results![2]!.value)).toBe("three");
   });
 
   it("mset with empty array is a no-op", async () => {
-    const { error } = await kv.multiSet([]);
+    const { error } = await kv.batchSet([]);
     expect(error).toBeUndefined();
   });
 
   it("mset respects per-entry ttl", async () => {
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttl: 60 } }]);
+    await kv.batchSet([{ key, value: "v", opts: { ttl: 60 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);
@@ -212,7 +212,7 @@ describe("RESP backend — mget / mset", () => {
   it("mset handles mixed ttl and non-ttl entries", async () => {
     const withTtl = uniqueKey();
     const noTtl = uniqueKey();
-    await kv.multiSet([
+    await kv.batchSet([
       { key: withTtl, value: "timed", opts: { ttl: 60 } },
       { key: noTtl, value: "forever" },
     ]);
@@ -304,7 +304,7 @@ describe("RESP backend — observability hooks", () => {
 
   it("MGET reports the correct keyCount", async () => {
     const keys = [uniqueKey(), uniqueKey(), uniqueKey()];
-    await tracked3.multiGet(keys);
+    await tracked3.batchGet(keys);
     expect(mgetCounts[0]).toBe(3);
   });
 });

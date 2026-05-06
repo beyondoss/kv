@@ -136,7 +136,7 @@ describe("HTTP backend — list", () => {
   it("returns all keys inserted into the namespace", async () => {
     const kv = httpClient();
     const keys = [uniqueKey("a"), uniqueKey("b"), uniqueKey("c")];
-    await kv.multiSet(keys.map((key) => ({ key, value: "v" })));
+    await kv.batchSet(keys.map((key) => ({ key, value: "v" })));
 
     const { data: result } = await kv.list();
     const names = result!.keys.map((k) => k.name);
@@ -151,7 +151,7 @@ describe("HTTP backend — list", () => {
     const prefix = `pfx:${crypto.randomUUID()}`;
     const matching = [`${prefix}:a`, `${prefix}:b`];
     const other = [uniqueKey("other")];
-    await kv.multiSet(
+    await kv.batchSet(
       [...matching, ...other].map((key) => ({ key, value: "v" })),
     );
 
@@ -165,7 +165,7 @@ describe("HTTP backend — list", () => {
     const prefix = `page:${crypto.randomUUID()}`;
     const total = 5;
     const allKeys = Array.from({ length: total }, (_, i) => `${prefix}:${i}`);
-    await kv.multiSet(allKeys.map((key) => ({ key, value: "v" })));
+    await kv.batchSet(allKeys.map((key) => ({ key, value: "v" })));
 
     const seen: string[] = [];
     let cursor: string | undefined;
@@ -190,7 +190,7 @@ describe("HTTP backend — mget / mset", () => {
     const existing = uniqueKey();
     const missing = uniqueKey();
     await kv.set(existing, "hi");
-    const { data: results } = await kv.multiGet([existing, missing]);
+    const { data: results } = await kv.batchGet([existing, missing]);
     expect(results).toHaveLength(2);
     expect(dec(results![0]!.value)).toBe("hi");
     expect(results![1]).toBeNull();
@@ -198,7 +198,7 @@ describe("HTTP backend — mget / mset", () => {
 
   it("mget with empty array returns empty array", async () => {
     const kv = httpClient();
-    const { data: results } = await kv.multiGet([]);
+    const { data: results } = await kv.batchGet([]);
     expect(results).toEqual([]);
   });
 
@@ -209,8 +209,8 @@ describe("HTTP backend — mget / mset", () => {
       { key: uniqueKey(), value: "two" },
       { key: uniqueKey(), value: enc("three") },
     ];
-    await kv.multiSet(entries);
-    const { data: results } = await kv.multiGet(entries.map((e) => e.key));
+    await kv.batchSet(entries);
+    const { data: results } = await kv.batchGet(entries.map((e) => e.key));
     expect(dec(results![0]!.value)).toBe("one");
     expect(dec(results![1]!.value)).toBe("two");
     expect(dec(results![2]!.value)).toBe("three");
@@ -218,14 +218,14 @@ describe("HTTP backend — mget / mset", () => {
 
   it("mset with empty array is a no-op", async () => {
     const kv = httpClient();
-    const { error } = await kv.multiSet([]);
+    const { error } = await kv.batchSet([]);
     expect(error).toBeUndefined();
   });
 
   it("mset respects per-entry ttl", async () => {
     const kv = httpClient();
     const key = uniqueKey();
-    await kv.multiSet([{ key, value: "v", opts: { ttl: 60 } }]);
+    await kv.batchSet([{ key, value: "v", opts: { ttl: 60 } }]);
     const { data: entry } = await kv.get(key);
     expect(entry?.ttl).toBeGreaterThan(0);
     expect(entry?.ttl).toBeLessThanOrEqual(60);

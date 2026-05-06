@@ -33,11 +33,10 @@ export interface paths {
     };
     /**
      * List keys in a namespace, optionally filtered by prefix. Results are returned in
-     *     lexicographic order. Pagination is cursor-based: when `complete` is `false`, pass the
-     *     returned `cursor` value as the `cursor` query parameter on the next request to fetch
-     *     the subsequent page. Omit `cursor` (or pass `0`) to start from the beginning.
-     *     Across multiple shards, the cursor encodes per-shard positions so fan-out is handled
-     *     transparently by the server.
+     *     lexicographic order. Pagination is cursor-based: pass the returned `next_cursor` value
+     *     as the `cursor` query parameter on the next request to fetch the subsequent page.
+     *     Omit `cursor` (or pass `0`) to start from the beginning. When `next_cursor` is absent,
+     *     all matching keys have been returned.
      * @description Pass `count=1` to return only the total key count instead of a key listing.
      */
     get: operations["list_keys"];
@@ -202,15 +201,10 @@ export interface components {
     };
     ListResponse: {
       /**
-       * @description `true` when all matching keys have been returned and there are no further pages.
-       *     `false` means a `cursor` is present and more results may be fetched.
-       */
-      complete: boolean;
-      /**
        * @description Opaque pagination cursor. Pass as the `cursor` query parameter on the next request
-       *     to fetch the subsequent page. Absent when `complete` is `true`.
+       *     to fetch the subsequent page. Absent when there are no further pages.
        */
-      cursor?: string | null;
+      next_cursor?: string | null;
       /** @description Matching keys in lexicographic order. */
       keys: components["schemas"]["KeyItem"][];
     };

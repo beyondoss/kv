@@ -400,7 +400,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     if (!res.ok) throw await parseError(res);
     const body = (await res.json()) as components["schemas"]["ListResponse"];
     const result: ListResult = { keys: body.keys as ListKey[] };
-    if (body.cursor) result.nextCursor = body.cursor;
+    if (body.next_cursor) result.nextCursor = body.next_cursor;
     return [result, res];
   }
 
@@ -619,7 +619,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       }
     },
 
-    async multiGet(keys) {
+    async batchGet(keys) {
       if (keys.length === 0) return ok([], new Response(null, { status: 200 }));
       try {
         const [data, response] = await _mget(keys);
@@ -629,7 +629,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       }
     },
 
-    async multiSet(entries) {
+    async batchSet(entries) {
       if (entries.length === 0) {
         return ok(undefined, new Response(null, { status: 200 }));
       }

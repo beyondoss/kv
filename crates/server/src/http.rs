@@ -1613,9 +1613,9 @@ async fn handle_list(
         })
         .collect();
 
-    let mut body = serde_json::json!({ "keys": keys, "complete": complete });
+    let mut body = serde_json::json!({ "keys": keys });
     if let Some(cursor) = cursor_out {
-        body["cursor"] = serde_json::Value::String(cursor);
+        body["next_cursor"] = serde_json::Value::String(cursor);
     }
     json_response(200, &body)
 }
@@ -1630,15 +1630,15 @@ fn build_list_response_single(page: beyond_kv_engine::types::ScanPage) -> http::
             serde_json::json!({ "name": name })
         })
         .collect();
-    let complete = page.next_cursor == b"0".as_ref();
-    let mut body = serde_json::json!({ "keys": keys, "complete": complete });
-    if !complete {
+    let done = page.next_cursor == b"0".as_ref();
+    let mut body = serde_json::json!({ "keys": keys });
+    if !done {
         // Cursor is b"\x01" + last_key — strip prefix, base64-encode the key.
         let key = page
             .next_cursor
             .strip_prefix(b"\x01")
             .unwrap_or(&page.next_cursor);
-        body["cursor"] =
+        body["next_cursor"] =
             serde_json::Value::String(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key));
     }
     json_response(200, &body)
@@ -1996,14 +1996,11 @@ struct KeyItem {
 struct ListResponse {
     /// Matching keys in lexicographic order.
     keys: Vec<KeyItem>,
-    /// `true` when all matching keys have been returned and there are no further pages.
-    /// `false` means a `cursor` is present and more results may be fetched.
-    complete: bool,
     /// Opaque pagination cursor. Pass as the `cursor` query parameter on the next request
-    /// to fetch the subsequent page. Absent when `complete` is `true`.
+    /// to fetch the subsequent page. Absent when there are no further pages.
     #[schema(nullable)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    cursor: Option<String>,
+    next_cursor: Option<String>,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
