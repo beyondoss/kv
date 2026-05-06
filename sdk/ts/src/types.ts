@@ -178,14 +178,16 @@ export interface components {
        */
       count: number;
     };
-    ErrorResponse: {
-      /**
-       * @description Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,
-       *     `invalid_namespace`, `engine_error`).
-       */
-      error: string;
-      /** @description Human-readable description of what went wrong. */
+    ErrorBody: {
+      /** @description Machine-readable error code, e.g. `"not_found"`, `"conflict"`, `"invalid_request"`. */
+      code: string;
+      /** @description Optional actionable guidance. */
+      hint?: string | null;
+      /** @description Human-readable description. */
       message: string;
+    };
+    ErrorResponse: {
+      error: components["schemas"]["ErrorBody"];
     };
     IncrResponse: {
       /**

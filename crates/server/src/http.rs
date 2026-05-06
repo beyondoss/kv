@@ -2090,10 +2090,20 @@ fn no_content() -> http::Response<HttpBody> {
 }
 
 fn err(status: u16, code: &str, msg: impl Into<String>) -> http::Response<HttpBody> {
-    json_response(
-        status,
-        &serde_json::json!({ "error": { "code": code, "message": msg.into() } }),
-    )
+    err_hint(status, code, msg, None)
+}
+
+fn err_hint(
+    status: u16,
+    code: &str,
+    msg: impl Into<String>,
+    hint: Option<&str>,
+) -> http::Response<HttpBody> {
+    let mut body = serde_json::json!({ "error": { "code": code, "message": msg.into() } });
+    if let Some(h) = hint {
+        body["error"]["hint"] = serde_json::Value::String(h.to_owned());
+    }
+    json_response(status, &body)
 }
 
 fn payload_too_large() -> http::Response<HttpBody> {
@@ -2113,7 +2123,12 @@ fn engine_error_response(e: EngineError) -> http::Response<HttpBody> {
         EngineError::InvalidNamespace { .. } => err(400, "invalid_namespace", e.to_string()),
         EngineError::CapacityExceeded { .. } => err(400, "capacity_exceeded", e.to_string()),
         EngineError::InvalidInput { .. } => err(400, "invalid_value", e.to_string()),
-        EngineError::Conflict { .. } => err(409, "conflict", e.to_string()),
+        EngineError::Conflict { .. } => err_hint(
+            409,
+            "conflict",
+            e.to_string(),
+            Some("read the current revision from the X-KV-Revision response header and retry"),
+        ),
         _ => internal_error(&e.to_string()),
     }
 }

@@ -42,14 +42,14 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
   (redis as any).addBuiltinCommand("revision");
   (redis as any).addBuiltinCommand("setrev");
 
-  const { onCommand, onResponse } = opts;
+  const { onRequest, onResponse } = opts;
 
   function track<T>(
     command: string,
     keyCount: number,
     fn: () => Promise<T>,
   ): Promise<T> {
-    onCommand?.({ command, keyCount });
+    onRequest?.({ command, keyCount });
     const start = Date.now();
     return fn().then(
       (v) => {

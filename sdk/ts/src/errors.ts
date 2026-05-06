@@ -13,18 +13,21 @@ export class KvError extends Error {
   readonly code: string;
   readonly status: number;
   readonly response: Response | undefined;
+  readonly hint: string | undefined;
 
   constructor(
     code: string,
     message: string,
     status: number,
     response?: Response,
+    hint?: string,
   ) {
     super(message);
     this.name = "KvError";
     this.code = code;
     this.status = status;
     this.response = response;
+    this.hint = hint;
   }
 }
 

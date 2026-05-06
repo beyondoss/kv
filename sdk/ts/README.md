@@ -43,7 +43,7 @@ const kv = createKvClient({
   url: "redis://localhost:6379", // or http://localhost:4869
   timeout: 5000, // per-command timeout in ms
   retries: 2, // retry attempts on failure
-  onCommand: (e) => {}, // called before each command
+  onRequest: (e) => {}, // called before each request
   onResponse: (e) => {}, // called after each command
 });
 ```
@@ -269,7 +269,7 @@ try {
 ```ts
 const kv = createKvClient({
   url: "...",
-  onCommand: ({ command, keyCount }) => {
+  onRequest: ({ command, keyCount }) => {
     metrics.increment(`kv.command.${command.toLowerCase()}`, keyCount);
   },
   onResponse: ({ command, keyCount, durationMs }) => {

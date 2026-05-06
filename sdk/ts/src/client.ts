@@ -30,7 +30,7 @@ export type {
 } from "./kv-types.js";
 export type { operations } from "./types.js";
 
-export interface KvCommandEvent {
+export interface KvRequestEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`, `"BATCH"`. */
   command: string;
   keyCount: number;
@@ -199,9 +199,9 @@ interface KvBaseClientOptions {
    * RESP: maps to `maxRetriesPerRequest`. HTTP: exponential backoff.
    */
   retries?: number;
-  /** Called before each command. */
-  onCommand?: (event: KvCommandEvent) => void;
-  /** Called after each command response. */
+  /** Called before each request. */
+  onRequest?: (event: KvRequestEvent) => void;
+  /** Called after each response. */
   onResponse?: (event: KvResponseEvent) => void;
 }
 

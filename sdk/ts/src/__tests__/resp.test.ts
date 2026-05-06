@@ -266,7 +266,7 @@ describe("RESP backend — observability hooks", () => {
     tracked1 = createKvClient({
       url: getRespUrl(),
       db: 0,
-      onCommand: (e) => commands.push(e.command),
+      onRequest: (e) => commands.push(e.command),
       onResponse: (e) => responses.push(e.command),
     });
     tracked2 = createKvClient({
@@ -277,7 +277,7 @@ describe("RESP backend — observability hooks", () => {
     tracked3 = createKvClient({
       url: getRespUrl(),
       db: 0,
-      onCommand: (e) => {
+      onRequest: (e) => {
         if (e.command === "MGET") mgetCounts.push(e.keyCount);
       },
     });
@@ -287,7 +287,7 @@ describe("RESP backend — observability hooks", () => {
     Promise.all([tracked1.close(), tracked2.close(), tracked3.close()])
   );
 
-  it("fires onCommand and onResponse for each operation", async () => {
+  it("fires onRequest and onResponse for each operation", async () => {
     const key = uniqueKey();
     await tracked1.set(key, "v");
     await tracked1.get(key);

@@ -248,14 +248,14 @@ describe("HTTP backend — namespace isolation", () => {
 });
 
 describe("HTTP backend — observability hooks", () => {
-  it("fires onCommand and onResponse for each operation", async () => {
+  it("fires onRequest and onResponse for each operation", async () => {
     const commands: string[] = [];
     const responses: string[] = [];
     const { createKvClient } = await import("../client.js");
     const kv = createKvClient({
       url: getHttpUrl(),
       namespace: uniqueNs(),
-      onCommand: (e) => commands.push(e.command),
+      onRequest: (e) => commands.push(e.command),
       onResponse: (e) => responses.push(e.command),
     });
 

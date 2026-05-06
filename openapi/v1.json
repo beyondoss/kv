@@ -847,20 +847,38 @@
           }
         }
       },
-      "ErrorResponse": {
+      "ErrorBody": {
         "type": "object",
         "required": [
-          "error",
+          "code",
           "message"
         ],
         "properties": {
-          "error": {
+          "code": {
             "type": "string",
-            "description": "Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,\n`invalid_namespace`, `engine_error`)."
+            "description": "Machine-readable error code, e.g. `\"not_found\"`, `\"conflict\"`, `\"invalid_request\"`."
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional actionable guidance."
           },
           "message": {
             "type": "string",
-            "description": "Human-readable description of what went wrong."
+            "description": "Human-readable description."
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
           }
         }
       },

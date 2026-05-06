@@ -77,7 +77,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
   const base = opts.url.replace(/\/+$/, "");
   const nsIdx = nsToIndex(opts.namespace ?? "default");
   const retries = opts.retries ?? 2;
-  const { timeout, onCommand, onResponse, onMetadataParseError } = opts;
+  const { timeout, onRequest, onResponse, onMetadataParseError } = opts;
   const fetchFn = opts.fetch ?? globalThis.fetch;
 
   function valueUrl(key: string): string {
@@ -117,7 +117,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     url: string,
     init: RequestInit,
   ): Promise<Response> {
-    onCommand?.({ command, keyCount });
+    onRequest?.({ command, keyCount });
     const start = Date.now();
 
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -151,16 +151,18 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
   async function parseError(res: Response): Promise<KvError> {
     let code = "internal_error";
     let message = res.statusText;
+    let hint: string | undefined;
     try {
       const body = (await res.json()) as {
-        error?: { code?: string; message?: string };
+        error?: { code?: string; message?: string; hint?: string };
       };
       if (body.error?.code) code = body.error.code;
       if (body.error?.message) message = body.error.message;
+      if (body.error?.hint) hint = body.error.hint;
     } catch {
       /* ignore */
     }
-    return new KvError(code, message, res.status, res);
+    return new KvError(code, message, res.status, res, hint);
   }
 
   async function batchRequest(
