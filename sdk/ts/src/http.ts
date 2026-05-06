@@ -152,9 +152,11 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     let code = "internal_error";
     let message = res.statusText;
     try {
-      const body = (await res.json()) as components["schemas"]["ErrorResponse"];
-      if (body.error) code = body.error;
-      if (body.message) message = body.message;
+      const body = (await res.json()) as {
+        error?: { code?: string; message?: string };
+      };
+      if (body.error?.code) code = body.error.code;
+      if (body.error?.message) message = body.error.message;
     } catch {
       /* ignore */
     }

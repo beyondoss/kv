@@ -19,7 +19,7 @@ fn get_missing_key_is_404() {
     let res = srv.get("no-such-key");
     assert!(res.is_not_found());
     let body = res.json();
-    assert_eq!(body["error"], "not_found");
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 // ── PUT + GET roundtrip ───────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ fn put_nx_returns_409_on_existing_key() {
         },
     );
     assert!(res.is_conflict());
-    assert_eq!(res.json()["error"], "conflict");
+    assert_eq!(res.json()["error"]["code"], "conflict");
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn post_to_value_endpoint_is_405() {
     let url = srv.value_url(0, "k");
     let res = common::raw_call_url(ureq::post(&url));
     assert!(res.is_method_not_allowed());
-    assert_eq!(res.json()["error"], "method_not_allowed");
+    assert_eq!(res.json()["error"]["code"], "method_not_allowed");
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn incr_non_integer_value_returns_400() {
     srv.put("bad", b"hello");
     let res = common::raw_call_url(ureq::post(&incr_url(&srv, "bad")));
     assert_eq!(res.status, 400);
-    assert_eq!(res.json()["error"], "invalid_value");
+    assert_eq!(res.json()["error"]["code"], "invalid_value");
 }
 
 #[test]
@@ -753,7 +753,7 @@ fn put_keepttl_with_ttl_option_returns_400() {
             .set("Content-Type", "application/octet-stream"),
     );
     assert_eq!(res.status, 400);
-    assert_eq!(res.json()["error"], "invalid_request");
+    assert_eq!(res.json()["error"]["code"], "invalid_request");
 }
 
 // ── Return-old (atomic swap) ──────────────────────────────────────────────────
@@ -803,7 +803,7 @@ fn put_return_old_with_nx_returns_400() {
             .set("Content-Type", "application/octet-stream"),
     );
     assert_eq!(res.status, 400);
-    assert_eq!(res.json()["error"], "invalid_request");
+    assert_eq!(res.json()["error"]["code"], "invalid_request");
 }
 
 // ── Namespace validation ──────────────────────────────────────────────────────
@@ -814,7 +814,7 @@ fn namespace_out_of_range_returns_400() {
     let url = format!("http://127.0.0.1:{}/v1/kv/k?ns=99", srv.http_port);
     let res = common::raw_call_url(ureq::get(&url));
     assert_eq!(res.status, 400);
-    assert_eq!(res.json()["error"], "invalid_namespace");
+    assert_eq!(res.json()["error"]["code"], "invalid_namespace");
 }
 
 // ── HEAD ──────────────────────────────────────────────────────────────────────
@@ -958,7 +958,7 @@ fn patch_no_option_returns_400() {
     let url = patch_url(&srv, 0, "pk-bad", "");
     let res = common::raw_call_url(ureq::patch(&url));
     assert_eq!(res.status, 400);
-    assert_eq!(res.json()["error"], "invalid_request");
+    assert_eq!(res.json()["error"]["code"], "invalid_request");
 }
 
 #[test]
@@ -1264,7 +1264,7 @@ fn batch_set_nx_conflict_returns_409() {
         serde_json::json!([{"op": "set", "key": "bk-nx", "value": b64(b"new"), "nx": true}]),
     );
     assert_eq!(res.status, 409);
-    assert_eq!(res.json()["error"], "conflict");
+    assert_eq!(res.json()["error"]["code"], "conflict");
     assert_eq!(
         srv.get("bk-nx").body,
         b"existing",
@@ -1281,7 +1281,7 @@ fn batch_set_xx_conflict_returns_409() {
         serde_json::json!([{"op": "set", "key": "bk-xx-miss", "value": b64(b"v"), "xx": true}]),
     );
     assert_eq!(res.status, 409);
-    assert_eq!(res.json()["error"], "conflict");
+    assert_eq!(res.json()["error"]["code"], "conflict");
 }
 
 #[test]
@@ -1294,7 +1294,7 @@ fn batch_set_if_match_conflict_returns_409() {
         serde_json::json!([{"op": "set", "key": "bk-cas", "value": b64(b"v2"), "ifMatch": 9999}]),
     );
     assert_eq!(res.status, 409);
-    assert_eq!(res.json()["error"], "conflict");
+    assert_eq!(res.json()["error"]["code"], "conflict");
 }
 
 #[test]
@@ -1320,7 +1320,7 @@ fn batch_malformed_body_returns_400() {
     };
     assert_eq!(status, 400);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "invalid_request");
+    assert_eq!(json["error"]["code"], "invalid_request");
 }
 
 #[test]

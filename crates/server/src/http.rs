@@ -511,12 +511,10 @@ async fn handle_patch(
     } else {
         // TTL-only update: no value read.
         match getex_op {
-            None => json_response(
+            None => err(
                 400,
-                &serde_json::json!({
-                    "error": "invalid_request",
-                    "message": "supply exactly one of: ttl, ttl_ms, ttl_at, ttl_at_ms, persist=1"
-                }),
+                "invalid_request",
+                "supply exactly one of: ttl, ttl_ms, ttl_at, ttl_at_ms, persist=1",
             ),
             Some(beyond_kv_engine::types::GetExOp::Persist) => match store.persist(ns, key).await {
                 Ok(true) => no_content(),
@@ -615,21 +613,17 @@ async fn handle_put(
         .and_then(|s| s.parse().ok());
 
     if keep_ttl && ttl.is_some() {
-        return json_response(
+        return err(
             400,
-            &serde_json::json!({
-                "error": "invalid_request",
-                "message": "x-kv-keepttl cannot be combined with a TTL option"
-            }),
+            "invalid_request",
+            "x-kv-keepttl cannot be combined with a TTL option",
         );
     }
     if return_old && (nx || xx || if_match.is_some() || keep_ttl) {
-        return json_response(
+        return err(
             400,
-            &serde_json::json!({
-                "error": "invalid_request",
-                "message": "x-kv-return-old cannot be combined with conditional writes or x-kv-keepttl"
-            }),
+            "invalid_request",
+            "x-kv-return-old cannot be combined with conditional writes or x-kv-keepttl",
         );
     }
 
@@ -658,28 +652,19 @@ async fn handle_put(
                 .header("X-KV-Revision", new_rev.to_string())
                 .body(HttpBody::fixed_body(None))
                 .unwrap_or_else(|_| internal_error("response build failed")),
-            Ok(None) => json_response(
-                409,
-                &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
-            ),
+            Ok(None) => err(409, "conflict", "revision mismatch"),
             Err(e) => engine_error_response(e),
         }
     } else if nx {
         match store.setnx(ns, key, body, opts).await {
             Ok(true) => no_content(),
-            Ok(false) => json_response(
-                409,
-                &serde_json::json!({ "error": "conflict", "message": "key already exists" }),
-            ),
+            Ok(false) => err(409, "conflict", "key already exists"),
             Err(e) => engine_error_response(e),
         }
     } else if xx {
         match store.setxx(ns, key, body, opts).await {
             Ok(true) => no_content(),
-            Ok(false) => json_response(
-                409,
-                &serde_json::json!({ "error": "conflict", "message": "key does not exist" }),
-            ),
+            Ok(false) => err(409, "conflict", "key does not exist"),
             Err(e) => engine_error_response(e),
         }
     } else {
@@ -738,10 +723,7 @@ async fn handle_delete(
     if let Some(expected_rev) = if_match {
         return match store.delrev(ns, key, expected_rev).await {
             Ok(Some(())) => no_content(),
-            Ok(None) => json_response(
-                409,
-                &serde_json::json!({ "error": "conflict", "message": "revision mismatch" }),
-            ),
+            Ok(None) => err(409, "conflict", "revision mismatch"),
             Err(e) => engine_error_response(e),
         };
     }
@@ -846,10 +828,7 @@ async fn handle_dbsize(
                 reply: reply_tx,
             };
             if cross_shard_txs[shard].clone().try_send(req).is_err() {
-                return json_response(
-                    503,
-                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                );
+                return err(503, "shard_unavailable", "shard inbox full");
             }
             let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
             reply_rxs.push(reply_rx);
@@ -910,10 +889,7 @@ async fn handle_flushdb(
                 reply: reply_tx,
             };
             if cross_shard_txs[shard].clone().try_send(req).is_err() {
-                return json_response(
-                    503,
-                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                );
+                return err(503, "shard_unavailable", "shard inbox full");
             }
             let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
             reply_rxs.push(reply_rx);
@@ -1052,10 +1028,7 @@ async fn handle_batch(
     let ops: Vec<BatchOp> = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return json_response(
-                400,
-                &serde_json::json!({"error":"invalid_request","message": e.to_string()}),
-            );
+            return err(400, "invalid_request", e.to_string());
         }
     };
 
@@ -1077,10 +1050,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1151,10 +1121,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1173,10 +1140,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1195,10 +1159,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1217,10 +1178,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1236,10 +1194,7 @@ async fn handle_batch(
                 match outcome {
                     BatchSetOutcome::Ok => serde_json::Value::Null,
                     BatchSetOutcome::Conflict(msg) => {
-                        return json_response(
-                            409,
-                            &serde_json::json!({"error":"conflict","message":msg}),
-                        );
+                        return err(409, "conflict", msg);
                     }
                     BatchSetOutcome::Err(e) => return internal_error(&e),
                 }
@@ -1268,10 +1223,7 @@ async fn handle_batch(
                                     reply: reply_tx,
                                 };
                                 if cross_shard_txs[target].clone().try_send(req).is_err() {
-                                    return json_response(
-                                        503,
-                                        &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                                    );
+                                    return err(503, "shard_unavailable", "shard inbox full");
                                 }
                                 let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                                 match reply_rx.await {
@@ -1331,10 +1283,7 @@ async fn handle_batch(
                                 reply: reply_tx,
                             };
                             if cross_shard_txs[target].clone().try_send(req).is_err() {
-                                return json_response(
-                                    503,
-                                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                                );
+                                return err(503, "shard_unavailable", "shard inbox full");
                             }
                             let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                             match reply_rx.await {
@@ -1349,10 +1298,7 @@ async fn handle_batch(
                                 reply: reply_tx,
                             };
                             if cross_shard_txs[target].clone().try_send(req).is_err() {
-                                return json_response(
-                                    503,
-                                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                                );
+                                return err(503, "shard_unavailable", "shard inbox full");
                             }
                             let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                             match reply_rx.await {
@@ -1377,10 +1323,7 @@ async fn handle_batch(
                     match del_result {
                         Err(e) => return internal_error(&e),
                         Ok(false) => {
-                            return json_response(
-                                409,
-                                &serde_json::json!({"error":"conflict","message":"revision mismatch"}),
-                            );
+                            return err(409, "conflict", "revision mismatch");
                         }
                         Ok(true) => serde_json::Value::Null,
                     }
@@ -1404,10 +1347,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1446,10 +1386,7 @@ async fn handle_batch(
                             reply: reply_tx,
                         };
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
-                            return json_response(
-                                503,
-                                &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                            );
+                            return err(503, "shard_unavailable", "shard inbox full");
                         }
                         let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
                         match reply_rx.await {
@@ -1628,10 +1565,7 @@ async fn handle_list(
                 reply: reply_tx,
             };
             if cross_shard_txs[target_shard].clone().try_send(req).is_err() {
-                return json_response(
-                    503,
-                    &serde_json::json!({"error":"shard_unavailable","message":"shard inbox full"}),
-                );
+                return err(503, "shard_unavailable", "shard inbox full");
             }
             let _ = (&cross_shard_wakeups[target_shard]).write_all(&[1u8]);
             match reply_rx.await {
@@ -2028,15 +1962,10 @@ fn parse_ns(query: &str) -> Result<&'static str, http::Response<HttpBody>> {
     let n = query_param(query, "ns")
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
-    NS_NAMES.get(n as usize).copied().ok_or_else(|| {
-        json_response(
-            400,
-            &serde_json::json!({
-                "error": "invalid_namespace",
-                "message": "ns must be 0-15"
-            }),
-        )
-    })
+    NS_NAMES
+        .get(n as usize)
+        .copied()
+        .ok_or_else(|| err(400, "invalid_namespace", "ns must be 0-15"))
 }
 
 // ── OpenAPI schemas ──────────────────────────────────────────────────────────
@@ -2078,13 +2007,19 @@ struct ListResponse {
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
-#[allow(dead_code)]
-struct ErrorResponse {
-    /// Machine-readable error code (e.g. `not_found`, `conflict`, `invalid_request`,
-    /// `invalid_namespace`, `engine_error`).
-    error: String,
-    /// Human-readable description of what went wrong.
+struct ErrorBody {
+    /// Machine-readable error code, e.g. `"not_found"`, `"conflict"`, `"invalid_request"`.
+    code: String,
+    /// Human-readable description.
     message: String,
+    /// Optional actionable guidance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct ErrorResponse {
+    error: ErrorBody,
 }
 
 #[derive(utoipa::OpenApi)]
@@ -2103,7 +2038,7 @@ struct ErrorResponse {
         handle_incr, handle_list, handle_flushdb,
         handle_compact, handle_batch,
     ),
-    components(schemas(IncrResponse, CountResponse, KeyItem, ListResponse, ErrorResponse)),
+    components(schemas(IncrResponse, CountResponse, KeyItem, ListResponse, ErrorBody, ErrorResponse)),
     tags(
         (name = "kv", description = "Key-value operations: get, put, delete, increment, list, and batch."),
         (name = "admin", description = "Administrative operations: compaction."),
@@ -2154,52 +2089,39 @@ fn no_content() -> http::Response<HttpBody> {
         .unwrap_or_else(|_| fallback_500())
 }
 
-fn payload_too_large() -> http::Response<HttpBody> {
+fn err(status: u16, code: &str, msg: impl Into<String>) -> http::Response<HttpBody> {
     json_response(
+        status,
+        &serde_json::json!({ "error": { "code": code, "message": msg.into() } }),
+    )
+}
+
+fn payload_too_large() -> http::Response<HttpBody> {
+    err(
         413,
-        &serde_json::json!({
-            "error": "payload_too_large",
-            "message": "request body exceeds maximum allowed size"
-        }),
+        "payload_too_large",
+        "request body exceeds maximum allowed size",
     )
 }
 
 fn not_found_json(code: &str, msg: &str) -> http::Response<HttpBody> {
-    json_response(404, &serde_json::json!({ "error": code, "message": msg }))
+    err(404, code, msg)
 }
 
 fn engine_error_response(e: EngineError) -> http::Response<HttpBody> {
     match e {
-        EngineError::InvalidNamespace { .. } => json_response(
-            400,
-            &serde_json::json!({ "error": "invalid_namespace", "message": e.to_string() }),
-        ),
-        EngineError::CapacityExceeded { .. } => json_response(
-            400,
-            &serde_json::json!({ "error": "capacity_exceeded", "message": e.to_string() }),
-        ),
-        EngineError::InvalidInput { .. } => json_response(
-            400,
-            &serde_json::json!({ "error": "invalid_value", "message": e.to_string() }),
-        ),
-        EngineError::Conflict { .. } => json_response(
-            409,
-            &serde_json::json!({ "error": "conflict", "message": e.to_string() }),
-        ),
+        EngineError::InvalidNamespace { .. } => err(400, "invalid_namespace", e.to_string()),
+        EngineError::CapacityExceeded { .. } => err(400, "capacity_exceeded", e.to_string()),
+        EngineError::InvalidInput { .. } => err(400, "invalid_value", e.to_string()),
+        EngineError::Conflict { .. } => err(409, "conflict", e.to_string()),
         _ => internal_error(&e.to_string()),
     }
 }
 
 fn internal_error(msg: &str) -> http::Response<HttpBody> {
-    json_response(
-        500,
-        &serde_json::json!({ "error": "internal_error", "message": msg }),
-    )
+    err(500, "internal_error", msg)
 }
 
 fn method_not_allowed() -> http::Response<HttpBody> {
-    json_response(
-        405,
-        &serde_json::json!({ "error": "method_not_allowed", "message": "method not allowed" }),
-    )
+    err(405, "method_not_allowed", "method not allowed")
 }
