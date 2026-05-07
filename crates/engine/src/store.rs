@@ -2136,8 +2136,7 @@ mod tests {
                 set(&s, b"survive", b"yes").await;
                 // Drop without seal — simulates crash (no footer written).
                 let nslog = s.get_ns("default").unwrap();
-                let p = nslog.active.borrow().path.clone();
-                p
+                nslog.active.borrow().path.clone()
             };
             // Append garbage shorter than HEADER_LEN so replay breaks cleanly.
             let garbage = vec![0xdeu8; 20];

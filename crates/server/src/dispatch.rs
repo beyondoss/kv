@@ -345,13 +345,16 @@ fn fan_out_txs(state: &ConnState) -> Option<&[futures_channel::mpsc::Sender<Cros
 }
 
 /// Write a single wakeup byte to the target shard's pipe so its `io_uring_enter`
-/// sleep is interrupted. A single-byte write to a unix socket pair is atomic and
-/// effectively instant — it cannot block unless the 64 KiB kernel buffer is full,
-/// which would require thousands of unprocessed wakeups.
+/// sleep is interrupted. The write-end is non-blocking; WouldBlock means a wakeup
+/// is already queued, which is fine — we just need at least one to land.
 #[inline]
 fn poke_wakeup(wakeups: &[StdUnixStream], shard: usize) {
     if let Some(w) = wakeups.get(shard) {
-        let _ = (&*w).write_all(&[1u8]);
+        match (&*w).write(&[1u8]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => tracing::warn!(shard, error = %e, "cross-shard wakeup write failed"),
+        }
     }
 }
 
@@ -376,22 +379,21 @@ async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, S
     };
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
-    let futs: Vec<_> = txs
-        .iter()
-        .enumerate()
-        .map(|(shard, tx)| {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let req = CrossShardRequest::DbSize {
-                ns: ns.clone(),
-                reply: reply_tx,
-            };
-            let _ = tx.clone().try_send(req);
-            if let Some(w) = wakeups {
-                poke_wakeup(w, shard);
-            }
-            reply_rx
-        })
-        .collect();
+    let mut futs: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::with_capacity(txs.len());
+    for (shard, tx) in txs.iter().enumerate() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::DbSize {
+            ns: ns.clone(),
+            reply: reply_tx,
+        };
+        if tx.clone().try_send(req).is_err() {
+            return Err(format!("shard {shard} unavailable"));
+        }
+        if let Some(w) = wakeups {
+            poke_wakeup(w, shard);
+        }
+        futs.push(reply_rx);
+    }
     let results = join_all(futs).await;
     let mut total = 0u64;
     for r in results {
@@ -407,22 +409,21 @@ async fn dispatch_flushdb(store: &ShardStore, state: &ConnState) -> Result<(), S
     };
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
-    let futs: Vec<_> = txs
-        .iter()
-        .enumerate()
-        .map(|(shard, tx)| {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let req = CrossShardRequest::FlushDb {
-                ns: ns.clone(),
-                reply: reply_tx,
-            };
-            let _ = tx.clone().try_send(req);
-            if let Some(w) = wakeups {
-                poke_wakeup(w, shard);
-            }
-            reply_rx
-        })
-        .collect();
+    let mut futs: Vec<oneshot::Receiver<Result<(), String>>> = Vec::with_capacity(txs.len());
+    for (shard, tx) in txs.iter().enumerate() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::FlushDb {
+            ns: ns.clone(),
+            reply: reply_tx,
+        };
+        if tx.clone().try_send(req).is_err() {
+            return Err(format!("shard {shard} unavailable"));
+        }
+        if let Some(w) = wakeups {
+            poke_wakeup(w, shard);
+        }
+        futs.push(reply_rx);
+    }
     let results = join_all(futs).await;
     for r in results {
         r.map_err(|e| e.to_string())??;
@@ -458,23 +459,23 @@ async fn dispatch_keys(
     };
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
-    let futs: Vec<_> = txs
-        .iter()
-        .enumerate()
-        .map(|(shard, tx)| {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let req = CrossShardRequest::AllKeys {
-                ns: ns.clone(),
-                pattern: pattern.clone(),
-                reply: reply_tx,
-            };
-            let _ = tx.clone().try_send(req);
-            if let Some(w) = wakeups {
-                poke_wakeup(w, shard);
-            }
-            reply_rx
-        })
-        .collect();
+    let mut futs: Vec<oneshot::Receiver<Result<Vec<Bytes>, String>>> =
+        Vec::with_capacity(txs.len());
+    for (shard, tx) in txs.iter().enumerate() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CrossShardRequest::AllKeys {
+            ns: ns.clone(),
+            pattern: pattern.clone(),
+            reply: reply_tx,
+        };
+        if tx.clone().try_send(req).is_err() {
+            return Err(format!("shard {shard} unavailable"));
+        }
+        if let Some(w) = wakeups {
+            poke_wakeup(w, shard);
+        }
+        futs.push(reply_rx);
+    }
     let results = join_all(futs).await;
     let mut all = Vec::new();
     for r in results {
@@ -530,7 +531,9 @@ async fn dispatch_scan(
             count,
             reply: reply_tx,
         };
-        let _ = txs[target_shard].clone().try_send(req);
+        if txs[target_shard].clone().try_send(req).is_err() {
+            return Err(format!("shard {target_shard} unavailable"));
+        }
         if let Some(w) = state.cross_shard_wakeups.as_deref() {
             poke_wakeup(w, target_shard);
         }

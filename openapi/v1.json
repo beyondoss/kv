@@ -4,8 +4,8 @@
     "title": "beyond/kv",
     "description": "Low-latency key-value store with namespaces, TTL, revision-based conditional writes, atomic increment, cursor-paginated key listing, and batch operations. All keys and values are raw bytes; values are transmitted as `application/octet-stream`. Namespaces (0–15) are independent keyspaces sharing the same physical store.",
     "license": {
-      "name": "UNLICENSED",
-      "identifier": "UNLICENSED"
+      "name": "MIT",
+      "identifier": "MIT"
     },
     "version": "1"
   },
@@ -910,27 +910,22 @@
       "ListResponse": {
         "type": "object",
         "required": [
-          "keys",
-          "complete"
+          "keys"
         ],
         "properties": {
-          "complete": {
-            "type": "boolean",
-            "description": "`true` when all matching keys have been returned and there are no further pages.\n`false` means a `cursor` is present and more results may be fetched."
-          },
-          "cursor": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Opaque pagination cursor. Pass as the `cursor` query parameter on the next request\nto fetch the subsequent page. Absent when `complete` is `true`."
-          },
           "keys": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/KeyItem"
             },
             "description": "Matching keys in lexicographic order."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque pagination cursor. Pass as the `cursor` query parameter on the next request\nto fetch the subsequent page. Absent when there are no further pages."
           }
         }
       }

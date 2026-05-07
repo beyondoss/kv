@@ -17,6 +17,9 @@ pub struct ReclaimReport {
     pub live_keys: u64,
     pub live_bytes: u64,
     pub dead_files_dropped: u32,
+    /// Files whose unlink failed after compaction; disk space is not freed until
+    /// a subsequent reclaim or manual cleanup.
+    pub dead_files_leaked: u32,
     pub new_file_id: u16,
 }
 
@@ -44,6 +47,9 @@ pub async fn reclaim_namespace(
     }
 
     let new_file = LogFile::open_rw(tmp_path.clone(), next_file_id).await?;
+    // Always start from a clean slate: if the prior remove failed and a stale
+    // .tmp exists, open_rw inherits its content without this truncate.
+    new_file.truncate_to(0).await?;
 
     // Build an owned-Rc map so read futures can capture file handles without borrowing.
     let file_map: FxHashMap<u16, Rc<LogFile>> = sealed_files
@@ -105,14 +111,18 @@ pub async fn reclaim_namespace(
         .collect();
     let unlink_results = join_all(unlink_futures).await;
     let mut dead_files_dropped = 0u32;
+    let mut dead_files_leaked = 0u32;
     for (f, res) in sealed_files.iter().zip(unlink_results) {
         match res {
             Ok(()) => dead_files_dropped += 1,
-            Err(e) => warn!(
-                path = %f.path.display(),
-                error = %e,
-                "failed to unlink old sealed file after reclaim; disk space not freed"
-            ),
+            Err(e) => {
+                dead_files_leaked += 1;
+                warn!(
+                    path = %f.path.display(),
+                    error = %e,
+                    "failed to unlink old sealed file after reclaim; disk space not freed"
+                );
+            }
         }
     }
 
@@ -120,6 +130,7 @@ pub async fn reclaim_namespace(
         live_keys,
         live_bytes,
         dead_files_dropped,
+        dead_files_leaked,
         new_file_id: next_file_id,
     };
     info!(?report, "reclaim complete");

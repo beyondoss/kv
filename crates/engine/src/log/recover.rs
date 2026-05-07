@@ -80,9 +80,19 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
                 offset: 0,
                 reason: "file_id overflow on clean-shutdown recovery",
             })?;
+            if next_id >= u16::MAX - 100 {
+                warn!(
+                    file_id = next_id,
+                    remaining = u16::MAX - next_id,
+                    "file_id nearing u16::MAX; compact sealed files to reclaim IDs"
+                );
+            }
             let new_path = active_path
                 .parent()
-                .expect("namespace dir has a parent")
+                .ok_or(EngineError::BadRecord {
+                    offset: 0,
+                    reason: "namespace data_dir has no parent; cannot compute next-file path",
+                })?
                 .join(crate::log::file::data_filename(next_id));
             LogFile::open_rw(new_path, next_id).await?
         }

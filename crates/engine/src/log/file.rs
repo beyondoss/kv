@@ -33,6 +33,11 @@ fn pool_acquire(size: usize) -> Vec<u8> {
         if let Some(pos) = pool.iter().position(|b| b.capacity() == size) {
             let mut buf = pool.swap_remove(pos);
             buf.resize(size, 0);
+            debug_assert_eq!(
+                buf.capacity(),
+                size,
+                "pool_acquire: capacity invariant violated; monoio will over-read"
+            );
             return buf;
         }
         vec![0u8; size]

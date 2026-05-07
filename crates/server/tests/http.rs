@@ -287,7 +287,10 @@ fn list_empty_namespace_returns_empty() {
     let srv = TestServer::start();
     let body = srv.list(0).json();
     assert_eq!(body["keys"], serde_json::json!([]));
-    assert_eq!(body["complete"], true);
+    assert!(
+        body["next_cursor"].is_null(),
+        "empty list should have no next_cursor"
+    );
 }
 
 #[test]
@@ -306,7 +309,10 @@ fn list_returns_all_inserted_keys() {
     for k in ["alpha", "beta", "gamma"] {
         assert!(names.contains(&k.to_owned()), "expected {k} in list");
     }
-    assert_eq!(body["complete"], true);
+    assert!(
+        body["next_cursor"].is_null(),
+        "small list should have no next_cursor"
+    );
 }
 
 #[test]
@@ -351,10 +357,9 @@ fn list_with_limit_caps_page_size() {
         .json();
     let keys = body["keys"].as_array().unwrap();
     assert_eq!(keys.len(), 3);
-    assert_eq!(body["complete"], false);
     assert!(
-        body["cursor"].as_str().is_some(),
-        "expect a cursor for the next page"
+        body["next_cursor"].as_str().is_some(),
+        "expect a next_cursor for the next page"
     );
 }
 
@@ -379,10 +384,10 @@ fn list_pagination_covers_all_keys() {
         for e in body["keys"].as_array().unwrap() {
             all_names.push(e["name"].as_str().unwrap().to_owned());
         }
-        if body["complete"].as_bool().unwrap_or(false) {
+        cursor = body["next_cursor"].as_str().map(|s| s.to_owned());
+        if cursor.is_none() {
             break;
         }
-        cursor = body["cursor"].as_str().map(|s| s.to_owned());
     }
 
     all_names.sort();

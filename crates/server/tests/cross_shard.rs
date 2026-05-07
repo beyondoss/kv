@@ -265,10 +265,10 @@ impl ShardedServer {
             for entry in body["keys"].as_array().unwrap() {
                 all.push(entry["name"].as_str().unwrap().to_owned());
             }
-            if body["complete"].as_bool().unwrap_or(true) {
+            cursor = body["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
                 break;
             }
-            cursor = body["cursor"].as_str().map(str::to_owned);
         }
         all
     }

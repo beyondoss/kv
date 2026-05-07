@@ -1,6 +1,19 @@
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
+
+/// Non-blocking wakeup: write one byte to the target shard's pipe so its
+/// io_uring sleep is interrupted. WouldBlock means a wakeup is already queued.
+#[inline]
+fn poke_wakeup(wakeups: &[StdUnixStream], shard: usize) {
+    if let Some(w) = wakeups.get(shard) {
+        match (&*w).write(&[1u8]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => tracing::warn!(shard, error = %e, "cross-shard wakeup write failed"),
+        }
+    }
+}
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -63,6 +76,7 @@ pub async fn serve_routed(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
     stream: TcpStream,
     store: Rc<ShardStore>,
@@ -830,7 +844,7 @@ async fn handle_dbsize(
             if cross_shard_txs[shard].clone().try_send(req).is_err() {
                 return err(503, "shard_unavailable", "shard inbox full");
             }
-            let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
+            poke_wakeup(cross_shard_wakeups, shard);
             reply_rxs.push(reply_rx);
         }
     }
@@ -891,7 +905,7 @@ async fn handle_flushdb(
             if cross_shard_txs[shard].clone().try_send(req).is_err() {
                 return err(503, "shard_unavailable", "shard inbox full");
             }
-            let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
+            poke_wakeup(cross_shard_wakeups, shard);
             reply_rxs.push(reply_rx);
         }
     }
@@ -1052,7 +1066,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(Ok(mut v)) => Ok(v.pop().and_then(|(_, e)| e)),
                             Ok(Err(e)) => Err(e),
@@ -1123,7 +1137,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(Ok(Some(_))) => BatchSetOutcome::Ok,
                             Ok(Ok(None)) => BatchSetOutcome::Conflict("revision mismatch"),
@@ -1142,7 +1156,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(Ok(true)) => BatchSetOutcome::Ok,
                             Ok(Ok(false)) => BatchSetOutcome::Conflict("key already exists"),
@@ -1161,7 +1175,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(Ok(true)) => BatchSetOutcome::Ok,
                             Ok(Ok(false)) => BatchSetOutcome::Conflict("key does not exist"),
@@ -1180,7 +1194,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(Ok(())) => BatchSetOutcome::Ok,
                             Ok(Err(e)) => BatchSetOutcome::Err(e),
@@ -1225,7 +1239,7 @@ async fn handle_batch(
                                 if cross_shard_txs[target].clone().try_send(req).is_err() {
                                     return err(503, "shard_unavailable", "shard inbox full");
                                 }
-                                let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                                poke_wakeup(cross_shard_wakeups, target);
                                 match reply_rx.await {
                                     Ok(Ok((_, e))) => Ok(e),
                                     Ok(Err(e)) => Err(e),
@@ -1285,7 +1299,7 @@ async fn handle_batch(
                             if cross_shard_txs[target].clone().try_send(req).is_err() {
                                 return err(503, "shard_unavailable", "shard inbox full");
                             }
-                            let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                            poke_wakeup(cross_shard_wakeups, target);
                             match reply_rx.await {
                                 Ok(r) => r.map(|opt| opt.is_some()),
                                 Err(e) => Err(e.to_string()),
@@ -1300,7 +1314,7 @@ async fn handle_batch(
                             if cross_shard_txs[target].clone().try_send(req).is_err() {
                                 return err(503, "shard_unavailable", "shard inbox full");
                             }
-                            let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                            poke_wakeup(cross_shard_wakeups, target);
                             match reply_rx.await {
                                 Ok(r) => r.map(|_| true),
                                 Err(e) => Err(e.to_string()),
@@ -1349,7 +1363,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(r) => r,
                             Err(e) => Err(e.to_string()),
@@ -1388,7 +1402,7 @@ async fn handle_batch(
                         if cross_shard_txs[target].clone().try_send(req).is_err() {
                             return err(503, "shard_unavailable", "shard inbox full");
                         }
-                        let _ = (&cross_shard_wakeups[target]).write_all(&[1u8]);
+                        poke_wakeup(cross_shard_wakeups, target);
                         match reply_rx.await {
                             Ok(r) => r,
                             Err(e) => Err(e.to_string()),
@@ -1420,6 +1434,7 @@ enum BatchSetOutcome {
     Err(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn batch_set_local(
     ns: &str,
     key: &[u8],
@@ -1567,7 +1582,7 @@ async fn handle_list(
             if cross_shard_txs[target_shard].clone().try_send(req).is_err() {
                 return err(503, "shard_unavailable", "shard inbox full");
             }
-            let _ = (&cross_shard_wakeups[target_shard]).write_all(&[1u8]);
+            poke_wakeup(cross_shard_wakeups, target_shard);
             match reply_rx.await {
                 Ok(r) => r,
                 Err(e) => Err(e.to_string()),
@@ -1581,7 +1596,7 @@ async fn handle_list(
 
     // Build the outgoing cursor and determine completeness.
     let shard_done = page.next_cursor == b"0".as_ref();
-    let (complete, cursor_out) = if shard_done {
+    let (_complete, cursor_out) = if shard_done {
         let next_shard = target_shard + 1;
         if next_shard >= n_shards {
             (true, None)
@@ -1727,7 +1742,7 @@ async fn handle_watch_sse(
                     let _ = w.write_all(msg.to_vec()).await;
                     return;
                 }
-                let _ = (&cross_shard_wakeups[shard]).write_all(&[1u8]);
+                poke_wakeup(cross_shard_wakeups, shard);
                 match reply_rx.await {
                     Ok(r) => r,
                     Err(e) => Err(e.to_string()),
@@ -1821,7 +1836,8 @@ fn sse_event_json(event: &WatchEvent) -> String {
             expires_at_ms,
             revision,
         } => {
-            let key_str = String::from_utf8_lossy(key);
+            let key_str = String::from_utf8(key.to_vec())
+                .unwrap_or_else(|e| percent_encode_bytes(e.as_bytes()));
             let value_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
             let mut obj = serde_json::json!({
                 "type": "set",
@@ -1840,7 +1856,7 @@ fn sse_event_json(event: &WatchEvent) -> String {
         }
         WatchEvent::Del { key, revision } => serde_json::json!({
             "type": "del",
-            "key": String::from_utf8_lossy(key),
+            "key": String::from_utf8(key.to_vec()).unwrap_or_else(|e| percent_encode_bytes(e.as_bytes())),
             "revision": revision,
         })
         .to_string(),
@@ -1958,6 +1974,7 @@ static NS_NAMES: [&str; 16] = [
     "db12", "db13", "db14", "db15",
 ];
 
+#[allow(clippy::result_large_err)]
 fn parse_ns(query: &str) -> Result<&'static str, http::Response<HttpBody>> {
     let n = query_param(query, "ns")
         .and_then(|s| s.parse::<u8>().ok())

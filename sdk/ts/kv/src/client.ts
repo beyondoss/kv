@@ -130,7 +130,7 @@ export interface KvClient {
     ops: T,
   ): Promise<KvResult<BatchResults<T>>>;
   /** Fetch multiple keys in one round-trip. RESP: pipelined GET+TTL. HTTP: batch request. */
-  batchGet(keys: string[]): Promise<KvResult<(Entry | null)[]>>;
+  batchGet(keys: readonly string[]): Promise<KvResult<(Entry | null)[]>>;
   /** Set multiple entries in one round-trip. RESP: pipelined MSET/SET. HTTP: batch request. */
   batchSet(entries: MSetEntry[]): Promise<KvResult<void>>;
   /**
@@ -171,7 +171,7 @@ export interface KvHttpClient extends KvClient {
   count(): Promise<KvHttpResult<number>>;
   flush(): Promise<KvHttpResult<void>>;
   compact(): Promise<KvHttpResult<void>>;
-  batchGet(keys: string[]): Promise<KvHttpResult<(Entry | null)[]>>;
+  batchGet(keys: readonly string[]): Promise<KvHttpResult<(Entry | null)[]>>;
   batchSet(entries: MSetEntry[]): Promise<KvHttpResult<void>>;
   incr(key: string, delta?: number): Promise<KvHttpResult<number>>;
   decr(key: string, delta?: number): Promise<KvHttpResult<number>>;
@@ -381,7 +381,7 @@ export interface KvSchemaClient<Map extends KvSchemaMap> extends
 /** Options for {@link createClient}. */
 export interface KvRawClientOptions {
   /** Base URL of the KV HTTP server, e.g. `http://kv:4869`. Trailing slash is stripped. */
-  baseUrl: string;
+  url: string;
 }
 
 /**
@@ -392,7 +392,7 @@ export interface KvRawClientOptions {
  */
 export function createClient(opts: KvRawClientOptions): Client<paths> {
   return createFetchClient<paths>({
-    baseUrl: opts.baseUrl.replace(/\/+$/, ""),
+    baseUrl: opts.url.replace(/\/+$/, ""),
   });
 }
 
@@ -426,7 +426,7 @@ export function createKvClient<Map extends KvSchemaMap>(
   const { protocol } = new URL(opts.url);
   const base: KvClient = protocol === "redis:" || protocol === "rediss:"
     ? createRespKvClient(opts as KvRespClientOptions)
-    : (createHttpKvClient(opts as KvHttpClientOptions) as KvClient);
+    : createHttpKvClient(opts as KvHttpClientOptions);
 
   const { schema: schemaMap, ttl: defaultTtl } = opts;
 
@@ -504,12 +504,15 @@ export function createKvClient<Map extends KvSchemaMap>(
       return parseEntry(key, result.data);
     },
     async delete(key: string, opts?: DeleteOptions) {
-      const result = await (base.delete as (
-        k: string,
-        o?: DeleteOptions,
-      ) => Promise<KvResult<Entry | null | void>>)(key, opts);
-      if (!opts?.returnOld || result.error || !result.data) return result;
-      return parseEntry(key, result.data as Entry);
+      if (opts?.returnOld) {
+        const result = await base.delete(
+          key,
+          opts as DeleteOptions & { returnOld: true },
+        );
+        if (result.error || !result.data) return result;
+        return parseEntry(key, result.data);
+      }
+      return base.delete(key, opts);
     },
     async cas(
       key: string,
@@ -520,7 +523,7 @@ export function createKvClient<Map extends KvSchemaMap>(
       return base.cas(key, serializeValue(key, value), revision, casOpts);
     },
     async batchGet(keys: readonly string[]) {
-      const result = await base.batchGet(keys as string[]);
+      const result = await base.batchGet(keys);
       if (result.error) return result;
       const parsed: unknown[] = [];
       for (let i = 0; i < result.data.length; i++) {
@@ -566,7 +569,7 @@ export function createKvClient<Map extends KvSchemaMap>(
       return base.batchSet(wire);
     },
     async batch(ops: readonly BatchOp[]) {
-      const wireOps = ops.map((op) => {
+      const wireOps: BatchOp[] = ops.map((op) => {
         if (op.op === "set") {
           const ttl = op.opts?.ttl ?? defaultTtl;
           if (ttl == null) return op;
@@ -574,7 +577,7 @@ export function createKvClient<Map extends KvSchemaMap>(
         }
         return op;
       });
-      const result = await base.batch(wireOps as unknown as BatchOp[]);
+      const result = await base.batch(wireOps);
       if (result.error) return result;
       const parsed: unknown[] = [];
       for (let i = 0; i < result.data.length; i++) {

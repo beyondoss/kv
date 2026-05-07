@@ -53,7 +53,7 @@ run = "cargo run -p beyond-kv -- generate-openapi"
 
 [tasks."generate:types"]
 description = "Generate TypeScript types from the OpenAPI spec"
-run = "cd ts && node scripts/generate-types.mjs"
+run = "cd ts/kv && node scripts/generate-types.mjs"
 dir = "sdk"
 depends = ["install:ts", "generate:openapi"]
 

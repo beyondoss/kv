@@ -175,7 +175,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       body: JSON.stringify(ops),
     });
     if (!res.ok) throw await parseError(res);
-    return [(await res.json()) as (unknown | null)[], res];
+    return [(await res.json()) as unknown[], res];
   }
 
   function parseEntryHeaders(
@@ -202,7 +202,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     if (ttlMsHeader != null) raw.ttlMs = Number(ttlMsHeader);
     if (metaHeader != null) {
       try {
-        raw.metadata = JSON.parse(metaHeader) as unknown;
+        raw.metadata = JSON.parse(metaHeader);
       } catch (err) {
         onMetadataParseError?.(key, metaHeader, err);
       }
@@ -425,7 +425,9 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     return [undefined, res];
   }
 
-  async function _mget(keys: string[]): Promise<[(Entry | null)[], Response]> {
+  async function _mget(
+    keys: readonly string[],
+  ): Promise<[(Entry | null)[], Response]> {
     const ops = keys.map((key) => ({ op: "get" as const, key }));
     const [results, res] = await batchRequest(ops, keys.length);
     return [

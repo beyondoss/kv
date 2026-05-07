@@ -163,6 +163,7 @@ pub enum CrossShardRequest {
 /// - `txs[i]` and `wakeup_writes[i]` go into the shared `Arc<[_]>` so any
 ///   shard can send a request and interrupt shard `i`'s io_uring sleep.
 /// - `rxs[i]` and `wakeup_reads[i]` go to worker `i`'s `serve()` call.
+#[allow(clippy::type_complexity)]
 pub fn build_channels(
     n: usize,
 ) -> (
@@ -179,6 +180,11 @@ pub fn build_channels(
         let (tx, rx) = mpsc::channel(CROSS_SHARD_CHAN_BOUND);
         let (wake_read, wake_write) =
             StdUnixStream::pair().expect("cross-shard wakeup unix socket pair");
+        // Non-blocking so callers in async context never block on a full pipe.
+        // A WouldBlock result means a wakeup is already queued — that's fine.
+        wake_write
+            .set_nonblocking(true)
+            .expect("cross-shard wakeup set_nonblocking");
         txs.push(tx);
         wake_writes.push(wake_write);
         rxs.push(rx);
@@ -208,7 +214,7 @@ pub async fn serve(
         }
     };
     let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(&waker);
+    let mut cx = std::task::Context::from_waker(waker);
     let mut buf = vec![0u8; 64];
     loop {
         let res;
@@ -375,7 +381,6 @@ async fn handle(store: Rc<ShardStore>, req: CrossShardRequest) {
             let res = store
                 .setrev(&ns, &key, value, opts, revision)
                 .await
-                .map(|opt| opt.map(|r| r))
                 .map_err(|e| e.to_string());
             let _ = reply.send(res);
         }

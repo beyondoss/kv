@@ -213,6 +213,7 @@ fn main() -> anyhow::Result<()> {
         beyond_kv::cross_shard::build_channels(n_threads);
     let cross_shard_txs: Arc<[_]> = Arc::from(cross_shard_tx_vec);
     let cross_shard_wakeups: Arc<[_]> = Arc::from(cross_shard_wake_writes);
+    let shutdown_error = Arc::new(AtomicBool::new(false));
 
     let handles: Vec<_> = (0..n_threads)
         .zip(worker_inboxes)
@@ -226,6 +227,7 @@ fn main() -> anyhow::Result<()> {
                 let data_dir = data_dir.clone();
                 let cross_shard_txs = cross_shard_txs.clone();
                 let cross_shard_wakeups = cross_shard_wakeups.clone();
+                let shutdown_error = shutdown_error.clone();
                 std::thread::Builder::new()
                     .name(format!("kv-worker-{i}"))
                     .spawn(move || {
@@ -350,9 +352,10 @@ fn main() -> anyhow::Result<()> {
                             }
                             // Seal active files so the next startup reads footers
                             // instead of replaying records.
-                            store.seal_all_for_shutdown().await.unwrap_or_else(|e| {
+                            if let Err(e) = store.seal_all_for_shutdown().await {
                                 tracing::error!(error = %e, "seal on shutdown failed");
-                            });
+                                shutdown_error.store(true, Ordering::Relaxed);
+                            }
                         })
                     })
                     .expect("failed to spawn worker thread")
@@ -429,5 +432,8 @@ fn main() -> anyhow::Result<()> {
     }
     tracing::info!("shutdown complete");
 
+    if shutdown_error.load(Ordering::Relaxed) {
+        anyhow::bail!("one or more workers failed to seal log files on shutdown");
+    }
     Ok(())
 }
