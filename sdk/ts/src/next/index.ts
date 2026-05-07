@@ -29,8 +29,8 @@ export function createServerKvClient(): KvClient {
   const url = process.env["KV_URL"];
   if (!url) {
     throw new Error(
-      "KV_URL environment variable is not set. "
-        + "Set it to your beyond-kv endpoint, e.g. redis://localhost:6379",
+      "KV_URL environment variable is not set. " +
+        "Set it to your beyond-kv endpoint, e.g. redis://localhost:6379",
     );
   }
 
