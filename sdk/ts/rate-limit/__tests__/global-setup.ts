@@ -46,7 +46,7 @@ export async function setup(): Promise<void> {
   tempDataDir = mkdtempSync(join(tmpdir(), "beyond-kv-rl-test-"));
 
   const binaryPath = process.env["BEYOND_KV_BINARY"]
-    ?? resolve(__dirname, "../../../../../target/debug/beyond-kv");
+    ?? resolve(__dirname, "../../../../target/debug/beyond-kv");
 
   serverProcess = spawn(binaryPath, ["serve"], {
     env: {

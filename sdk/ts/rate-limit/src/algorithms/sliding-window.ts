@@ -49,9 +49,15 @@ export async function limitSlidingWindow(
     const decrResult = await kv.decr(currentKey);
     if (decrResult.error) throw decrResult.error;
 
+    // prevCount > 0: time until the weighted estimate drops to exactly `limit`
+    // in the current bucket (formula derived by solving for elapsed).
+    // prevCount == 0: estimate = newCurrentCount. After rollback, storedCurrent
+    // = newCurrentCount-1 becomes prevCount for bucket B+1, so estimated in B+1
+    // stays above limit until B+1 itself expires. Point to the start of B+2
+    // (where prevBucket=B+1 was fully rolled back and prevCount=0).
     const retryAfter = prevCount > 0
       ? Math.ceil(((estimated - limit) / prevCount) * windowMs)
-      : reset - now;
+      : Math.ceil(reset - now + windowMs);
 
     return {
       allowed: false,

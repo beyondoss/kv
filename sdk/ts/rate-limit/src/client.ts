@@ -25,6 +25,12 @@ export function fixedWindow(opts: {
   /** Fallback poll interval (ms) for {@link RateLimiter.blockFor}. Default: 50. */
   delay?: number;
 }): Algorithm {
+  if (opts.limit < 1) {
+    throw new RangeError(`fixedWindow: limit must be >= 1, got ${opts.limit}`);
+  }
+  if (opts.window <= 0) {
+    throw new RangeError(`fixedWindow: window must be > 0, got ${opts.window}`);
+  }
   return {
     type: "fixedWindow",
     limit: opts.limit,
@@ -42,6 +48,16 @@ export function slidingWindow(opts: {
   /** Fallback poll interval (ms) for {@link RateLimiter.blockFor}. Default: 50. */
   delay?: number;
 }): Algorithm {
+  if (opts.limit < 1) {
+    throw new RangeError(
+      `slidingWindow: limit must be >= 1, got ${opts.limit}`,
+    );
+  }
+  if (opts.window <= 0) {
+    throw new RangeError(
+      `slidingWindow: window must be > 0, got ${opts.window}`,
+    );
+  }
   return {
     type: "slidingWindow",
     limit: opts.limit,
@@ -60,6 +76,16 @@ export function tokenBucket(opts: {
   /** Fallback poll interval (ms) for {@link RateLimiter.blockFor}. Default: 50. */
   delay?: number;
 }): Algorithm {
+  if (opts.capacity < 1) {
+    throw new RangeError(
+      `tokenBucket: capacity must be >= 1, got ${opts.capacity}`,
+    );
+  }
+  if (opts.refillRate <= 0) {
+    throw new RangeError(
+      `tokenBucket: refillRate must be > 0, got ${opts.refillRate}`,
+    );
+  }
   return {
     type: "tokenBucket",
     capacity: opts.capacity,
