@@ -106,6 +106,21 @@ for (const { name, make } of backends) {
       const { data } = await rl.limit(key);
       expect(data?.allowed).toBe(true);
     });
+
+    it("under concurrent load, never allows more than limit requests", async () => {
+      const limit = 5;
+      rl = make(slidingWindow({ limit, window: 5_000 }));
+      const key = uniqueKey();
+
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => rl.limit(key)),
+      );
+
+      const allowed = results.filter((r) => r.data?.allowed).length;
+      // increment-first guarantees no over-allowing; some false denies are possible
+      // but never false allows.
+      expect(allowed).toBeLessThanOrEqual(limit);
+    });
   });
 
   describe(`token bucket [${name}]`, () => {
@@ -145,6 +160,21 @@ for (const { name, make } of backends) {
       await sleep(150);
       const refilled = await rl.limit(key);
       expect(refilled.data?.allowed).toBe(true);
+    });
+
+    it("under concurrent load, allows exactly capacity requests", async () => {
+      const capacity = 5;
+      rl = make(tokenBucket({ capacity, refillRate: 0.1 }));
+      const key = uniqueKey();
+
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => rl.limit(key)),
+      );
+
+      const allowed = results.filter((r) => r.data?.allowed).length;
+      const denied = results.filter((r) => r.data?.allowed === false).length;
+      expect(allowed).toBe(capacity);
+      expect(denied).toBe(10 - capacity);
     });
   });
 

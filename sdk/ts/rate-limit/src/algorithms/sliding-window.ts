@@ -21,29 +21,36 @@ export async function limitSlidingWindow(
   const prevKey = `${prefix}:sw:${key}:${prevBucket}`;
   const reset = (currentBucket + 1) * windowMs;
 
-  // Read both buckets in one round-trip.
-  const batchResult = await kv.batch(
-    [
-      { op: "get", key: currentKey },
-      { op: "get", key: prevKey },
-    ] as const,
-  );
-  if (batchResult.error) throw batchResult.error;
+  // Increment first — atomically claim a slot. If over limit, we roll back.
+  // This eliminates false-allow races: each concurrent request gets a unique
+  // count value; decisions are based on that value, not a stale read.
+  const incrResult = await kv.incr(currentKey);
+  if (incrResult.error) throw incrResult.error;
+  const newCurrentCount = incrResult.data;
 
-  const currentCount = batchResult.data[0] != null
-    ? Number(batchResult.data[0].text())
+  if (newCurrentCount === 1) {
+    // First write to this bucket — set TTL covering current and next window.
+    const expireResult = await kv.expire(currentKey, { ttlMs: windowMs * 2 });
+    if (expireResult.error) throw expireResult.error;
+  }
+
+  // Read previous bucket to compute weighted estimate.
+  const prevResult = await kv.get(prevKey);
+  if (prevResult.error) throw prevResult.error;
+  const prevCount = prevResult.data != null
+    ? Number(prevResult.data.text())
     : 0;
-  const prevCount = batchResult.data[1] != null
-    ? Number(batchResult.data[1].text())
-    : 0;
 
-  // Weighted estimate of requests in the sliding window.
-  const estimated = prevCount * (1 - elapsed) + currentCount;
+  // Weighted estimate including this request.
+  const estimated = prevCount * (1 - elapsed) + newCurrentCount;
 
-  if (estimated >= limit) {
-    // Time until the weighted estimate drops below limit.
+  if (estimated > limit) {
+    // Over limit — roll back our increment and deny.
+    const decrResult = await kv.decr(currentKey);
+    if (decrResult.error) throw decrResult.error;
+
     const retryAfter = prevCount > 0
-      ? Math.ceil(((estimated - limit + 1) / prevCount) * windowMs)
+      ? Math.ceil(((estimated - limit) / prevCount) * windowMs)
       : reset - now;
 
     return {
@@ -55,19 +62,9 @@ export async function limitSlidingWindow(
     };
   }
 
-  // Under the limit — increment the current bucket.
-  const incrResult = await kv.incr(currentKey);
-  if (incrResult.error) throw incrResult.error;
-
-  if (incrResult.data === 1) {
-    // First write to this bucket — set TTL covering both current and next window.
-    const expireResult = await kv.expire(currentKey, { ttlMs: windowMs * 2 });
-    if (expireResult.error) throw expireResult.error;
-  }
-
   return {
     allowed: true,
-    remaining: Math.max(0, limit - Math.floor(estimated) - 1),
+    remaining: Math.max(0, limit - Math.floor(estimated)),
     limit,
     reset,
   };

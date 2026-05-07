@@ -26,18 +26,15 @@ export async function limitTokenBucket(
     const getResult = await kv.get(kvKey);
     if (getResult.error) throw getResult.error;
 
-    let tokens: number;
-    let revision: number | undefined;
-
     if (getResult.data == null) {
-      // Key absent — first request, initialize with full bucket minus one token.
+      // Key absent — first request ever. Initialize with full bucket minus one token.
       const state: BucketState = { tokens: capacity - 1, lastRefill: now };
       const setResult = await kv.set(kvKey, JSON.stringify(state), {
         ifAbsent: true,
       });
       if (setResult.error) {
-        // Another writer beat us — retry.
-        continue;
+        if (setResult.error.status === 409) continue; // another writer beat us
+        throw setResult.error;
       }
       return {
         allowed: true,
@@ -48,9 +45,9 @@ export async function limitTokenBucket(
     }
 
     const raw = getResult.data.json<BucketState>();
-    revision = getResult.data.revision;
+    const revision = getResult.data.revision;
     const elapsed = (now - raw.lastRefill) / 1000;
-    tokens = Math.min(capacity, raw.tokens + elapsed * refillRate);
+    const tokens = Math.min(capacity, raw.tokens + elapsed * refillRate);
 
     if (tokens < 1) {
       const retryAfter = Math.ceil((1 - tokens) / refillRate * 1000);
@@ -64,14 +61,9 @@ export async function limitTokenBucket(
     }
 
     const newState: BucketState = { tokens: tokens - 1, lastRefill: now };
-    const casResult = await kv.set(kvKey, JSON.stringify(newState), {
-      ifMatch: revision,
-    });
+    const casResult = await kv.cas(kvKey, JSON.stringify(newState), revision);
     if (casResult.error) {
-      if (casResult.error.status === 409) {
-        // Revision conflict — another writer updated the bucket; retry.
-        continue;
-      }
+      if (casResult.error.status === 409) continue; // revision conflict — retry
       throw casResult.error;
     }
 
