@@ -271,6 +271,19 @@ type SetValue<K extends string, Map extends KvSchemaMap> =
   [MatchedPattern<K, Map>] extends [never] ? string | Uint8Array
     : KvSchemaType<K, Map>;
 
+/** Watch event with value typed by schema for key K. */
+export type SchemaAwareWatchEvent<K extends string, Map extends KvSchemaMap> =
+  | { type: "ready" }
+  | {
+    type: "set";
+    key: string;
+    value: KvSchemaType<K, Map>;
+    metadata?: unknown;
+    ttl?: number;
+    revision: number;
+  }
+  | { type: "del"; key: string; revision: number };
+
 /** Batch op result typed by schema — get ops return schema type, others unchanged. */
 type SchemaAwareBatchOpResult<T extends BatchOp, Map extends KvSchemaMap> =
   T extends { op: "get"; key: infer K extends string }
@@ -294,8 +307,20 @@ export type SchemaAwareBatchResults<
  * pattern return/accept the schema's type; unmatched keys fall back to
  * `Entry` / `string | Uint8Array`.
  */
-export interface KvSchemaClient<Map extends KvSchemaMap>
-  extends Omit<KvClient, "get" | "set" | "batchGet" | "batchSet" | "batch">
+export interface KvSchemaClient<Map extends KvSchemaMap> extends
+  Omit<
+    KvClient,
+    | "get"
+    | "set"
+    | "getAndSet"
+    | "getAndDelete"
+    | "delete"
+    | "cas"
+    | "batchGet"
+    | "batchSet"
+    | "batch"
+    | "watch"
+  >
 {
   get<K extends string>(key: K): Promise<KvResult<KvSchemaType<K, Map> | null>>;
   set<K extends string>(
@@ -303,6 +328,28 @@ export interface KvSchemaClient<Map extends KvSchemaMap>
     value: SetValue<K, Map>,
     opts?: SetOptions,
   ): Promise<KvResult<void>>;
+  getAndSet<K extends string>(
+    key: K,
+    value: SetValue<K, Map>,
+    opts?: GetAndSetOptions,
+  ): Promise<KvResult<KvSchemaType<K, Map> | null>>;
+  getAndDelete<K extends string>(
+    key: K,
+  ): Promise<KvResult<KvSchemaType<K, Map> | null>>;
+  delete<K extends string>(
+    key: K,
+    opts: DeleteOptions & { returnOld: true },
+  ): Promise<KvResult<KvSchemaType<K, Map> | null>>;
+  delete<K extends string>(
+    key: K,
+    opts?: DeleteOptions,
+  ): Promise<KvResult<void>>;
+  cas<K extends string>(
+    key: K,
+    value: SetValue<K, Map>,
+    revision: number,
+    opts?: CasOptions,
+  ): Promise<KvResult<number>>;
   batchGet<const Keys extends readonly string[]>(
     keys: Keys,
   ): Promise<
@@ -320,6 +367,15 @@ export interface KvSchemaClient<Map extends KvSchemaMap>
   batch<T extends readonly BatchOp[]>(
     ops: T,
   ): Promise<KvResult<SchemaAwareBatchResults<T, Map>>>;
+  /** Watch a prefix — event values are typed by the matching schema for each emitted key. */
+  watch<K extends string>(
+    key: K,
+    opts: WatchOptions & { prefix: true },
+  ): AsyncGenerator<SchemaAwareWatchEvent<`${K}${string}`, Map>>;
+  watch<K extends string>(
+    key: K,
+    opts?: WatchOptions,
+  ): AsyncGenerator<SchemaAwareWatchEvent<K, Map>>;
 }
 
 /** Options for {@link createClient}. */
@@ -390,35 +446,78 @@ export function createKvClient<Map extends KvSchemaMap>(
     return undefined;
   }
 
+  function schemaError(err: unknown): KvResult<never> {
+    return {
+      data: undefined,
+      error: new KvError(
+        "schema_error",
+        err instanceof Error ? err.message : String(err),
+        422,
+      ),
+    };
+  }
+
+  function parseEntry(key: string, entry: Entry): KvResult<unknown> {
+    const schema = findSchema(key);
+    if (!schema) return { data: entry, error: undefined };
+    try {
+      return { data: schema.parse(entry.json()), error: undefined };
+    } catch (err) {
+      return schemaError(err);
+    }
+  }
+
+  function serializeValue(key: string, value: unknown): string | Uint8Array {
+    return findSchema(key)
+      ? JSON.stringify(value)
+      : (value as string | Uint8Array);
+  }
+
   return {
     ...base,
     async get(key: string) {
       const result = await base.get(key);
       if (result.error || result.data === null) return result;
-      const schema = findSchema(key);
-      if (!schema) return result;
-      try {
-        return { data: schema.parse(result.data.json()), error: undefined };
-      } catch (err) {
-        return {
-          data: undefined,
-          error: new KvError(
-            "schema_error",
-            err instanceof Error ? err.message : String(err),
-            422,
-          ),
-        };
-      }
+      return parseEntry(key, result.data);
     },
     async set(key: string, value: unknown, setOpts?: SetOptions) {
       const ttl = setOpts?.ttl ?? defaultTtl;
       const mergedOpts = ttl != null ? { ...setOpts, ttl } : setOpts;
-      const schema = findSchema(key);
-      return base.set(
+      return base.set(key, serializeValue(key, value), mergedOpts);
+    },
+    async getAndSet(
+      key: string,
+      value: unknown,
+      getAndSetOpts?: GetAndSetOptions,
+    ) {
+      const result = await base.getAndSet(
         key,
-        schema ? JSON.stringify(value) : (value as string | Uint8Array),
-        mergedOpts,
+        serializeValue(key, value),
+        getAndSetOpts,
       );
+      if (result.error || result.data === null) return result;
+      return parseEntry(key, result.data);
+    },
+    async getAndDelete(key: string) {
+      const result = await base.getAndDelete(key);
+      if (result.error || result.data === null) return result;
+      return parseEntry(key, result.data);
+    },
+    async delete(key: string, opts?: DeleteOptions) {
+      const result = await (base.delete as (
+        k: string,
+        o?: DeleteOptions,
+      ) => Promise<KvResult<Entry | null | void>>)(key, opts);
+      if (!opts?.returnOld || result.error || !result.data) return result;
+      return parseEntry(key, result.data as Entry);
+    },
+    async cas(
+      key: string,
+      value: unknown,
+      revision: number,
+      casOpts?: CasOptions,
+    ) {
+      return base.cas(key, serializeValue(key, value), revision, casOpts);
     },
     async batchGet(keys: readonly string[]) {
       const result = await base.batchGet(keys as string[]);
@@ -502,6 +601,28 @@ export function createKvClient<Map extends KvSchemaMap>(
         parsed.push(item);
       }
       return { data: parsed, error: undefined };
+    },
+    async *watch(key: string, watchOpts?: WatchOptions) {
+      const dec = new TextDecoder();
+      for await (const event of base.watch(key, watchOpts)) {
+        if (event.type !== "set") {
+          yield event;
+          continue;
+        }
+        const schema = findSchema(event.key);
+        if (!schema) {
+          yield event;
+          continue;
+        }
+        try {
+          yield {
+            ...event,
+            value: schema.parse(JSON.parse(dec.decode(event.value))),
+          };
+        } catch {
+          yield event;
+        }
+      }
     },
   } as unknown as KvSchemaClient<Map>;
 }

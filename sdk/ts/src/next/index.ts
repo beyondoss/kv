@@ -1,4 +1,9 @@
-import { createKvClient, type KvClient } from "../client.js";
+import {
+  createKvClient,
+  type KvClient,
+  type KvSchemaClient,
+  type KvSchemaMap,
+} from "../client.js";
 
 /**
  * Creates a KV client configured from environment variables. Intended for
@@ -25,7 +30,15 @@ import { createKvClient, type KvClient } from "../client.js";
  * }
  * ```
  */
-export function createServerKvClient(): KvClient {
+export function createServerKvClient(): KvClient;
+export function createServerKvClient<Map extends KvSchemaMap>(opts: {
+  schema: Map;
+  ttl?: number;
+}): KvSchemaClient<Map>;
+export function createServerKvClient<Map extends KvSchemaMap>(opts?: {
+  schema?: Map;
+  ttl?: number;
+}): KvClient | KvSchemaClient<Map> {
   const url = process.env["KV_URL"];
   if (!url) {
     throw new Error(
@@ -37,9 +50,13 @@ export function createServerKvClient(): KvClient {
   const dbStr = process.env["KV_DB"];
   const namespace = process.env["KV_NAMESPACE"];
 
-  return createKvClient({
-    url,
-    ...(dbStr != null && { db: Number(dbStr) }),
-    ...(namespace != null && { namespace }),
-  });
+  return createKvClient(
+    {
+      url,
+      ...(dbStr != null && { db: Number(dbStr) }),
+      ...(namespace != null && { namespace }),
+      ...(opts?.schema != null && { schema: opts.schema }),
+      ...(opts?.ttl != null && { ttl: opts.ttl }),
+    } as Parameters<typeof createKvClient>[0],
+  );
 }

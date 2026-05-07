@@ -19,6 +19,7 @@ export {
   type operations,
   type paths,
   type SchemaAwareBatchResults,
+  type SchemaAwareWatchEvent,
 } from "./client.js";
 export { KvError } from "./errors.js";
 export { createHttpKvClient } from "./http.js";

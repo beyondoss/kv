@@ -1,6 +1,40 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createKvClient } from "../client.js";
+import type { KvSchemaMap, SchemaAwareWatchEvent } from "../client.js";
 import { getHttpUrl, getRespUrl, uniqueKey, uniqueNs } from "./harness.js";
+
+async function watchCollect<Map extends KvSchemaMap, K extends string>(
+  factory: (
+    signal: AbortSignal,
+  ) => AsyncGenerator<SchemaAwareWatchEvent<K, Map>>,
+  predicate: (events: SchemaAwareWatchEvent<K, Map>[]) => boolean,
+  act: () => Promise<unknown>,
+): Promise<SchemaAwareWatchEvent<K, Map>[]> {
+  const ac = new AbortController();
+  const gen = factory(ac.signal);
+  const events: SchemaAwareWatchEvent<K, Map>[] = [];
+  let readyResolve!: () => void;
+  const ready = new Promise<void>((r) => {
+    readyResolve = r;
+  });
+  const timeout = setTimeout(() => ac.abort(), 5_000);
+  const collect = (async () => {
+    for await (const ev of gen) {
+      events.push(ev);
+      if (ev.type === "ready") readyResolve();
+      if (predicate(events)) {
+        ac.abort();
+        break;
+      }
+    }
+  })();
+  collect.then(readyResolve, readyResolve);
+  await ready;
+  await act();
+  await collect.catch(() => {});
+  clearTimeout(timeout);
+  return events;
+}
 
 const schema = {
   "users:*": {
@@ -157,9 +191,10 @@ for (const backend of ["http", "resp"] as const) {
 
     it("batchSet serializes typed values", async () => {
       const kv = createKvClient({ ...baseOpts(), schema });
-      await kv.batchSet(
-        [{ key: `users:${key}`, value: { username: "bob" } }] as const,
-      );
+      // dynamic key loses literal inference — cast required at call site
+      await kv.batchSet([
+        { key: `users:${key}`, value: { username: "bob" } } as any,
+      ]);
       const { data } = await kv.get(`users:${key}`);
       expect(data).toEqual({ username: "bob" });
       await kv.close();
@@ -192,5 +227,67 @@ for (const backend of ["http", "resp"] as const) {
       expect(entry?.ttl).toBeLessThanOrEqual(60);
       await kv.close();
     });
+
+    if (backend === "http") {
+      it("watch emits typed set event for matched key", async () => {
+        const kv = createKvClient({ ...baseOpts(), schema });
+        const events = await watchCollect(
+          (signal) => kv.watch(`users:${key}`, { signal }),
+          (evs) => evs.some((e) => e.type === "set"),
+          async () => kv.set(`users:${key}`, { username: "watchUser" } as any),
+        );
+        const setEvent = events.find((e) => e.type === "set");
+        expect(setEvent).toBeDefined();
+        if (setEvent!.type === "set") {
+          expect(setEvent!.value).toEqual({ username: "watchUser" });
+        }
+        await kv.close();
+      });
+
+      it("watch emits raw entry for unmatched key", async () => {
+        const opts = baseOpts();
+        const kv = createKvClient({ ...opts, schema });
+        const rawKey = `raw:${key}`;
+        const raw = createKvClient(opts);
+        const events = await watchCollect(
+          (signal) => kv.watch(rawKey, { signal }),
+          (evs) => evs.some((e) => e.type === "set"),
+          async () => {
+            await raw.set(rawKey, "hello");
+          },
+        );
+        await raw.delete(rawKey);
+        await raw.close();
+        const setEvent = events.find((e) => e.type === "set");
+        expect(setEvent).toBeDefined();
+        if (setEvent!.type === "set") {
+          expect(setEvent!.value).toBeInstanceOf(Uint8Array);
+        }
+        await kv.close();
+      });
+
+      it("prefix watch emits typed set events", async () => {
+        const opts = baseOpts();
+        const kv = createKvClient({ ...opts, schema });
+        const k2 = uniqueKey();
+        const events = await watchCollect(
+          (signal) => kv.watch("users:", { prefix: true, signal }),
+          (evs) => evs.filter((e) => e.type === "set").length >= 2,
+          async () => {
+            await kv.set(`users:${key}`, { username: "pfxA" } as any);
+            await kv.set(`users:${k2}`, { username: "pfxB" } as any);
+          },
+        );
+        const setEvents = events.filter((e) => e.type === "set");
+        expect(setEvents.length).toBeGreaterThanOrEqual(2);
+        for (const ev of setEvents) {
+          if (ev.type === "set") {
+            expect(ev.value).toHaveProperty("username");
+          }
+        }
+        await kv.delete(`users:${k2}`);
+        await kv.close();
+      });
+    }
   });
 }
