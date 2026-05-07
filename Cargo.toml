@@ -4,8 +4,7 @@ members = ["crates/bench", "crates/engine", "crates/proto", "crates/server"]
 
 [workspace.package]
 edition = "2024"
-license = "UNLICENSED"
-rust-version = "1.85"
+license = "MIT"
 
 [workspace.dependencies]
 beyond-kv-engine = { path = "crates/engine" }

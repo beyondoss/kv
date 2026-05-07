@@ -47,7 +47,7 @@ export async function setup(): Promise<void> {
 
   // Allow overriding the binary path via env for CI (e.g. release build).
   const binaryPath = process.env["BEYOND_KV_BINARY"]
-    ?? resolve(__dirname, "../../../../target/debug/beyond-kv");
+    ?? resolve(__dirname, "../../../../../target/debug/beyond-kv");
 
   serverProcess = spawn(binaryPath, ["serve"], {
     env: {

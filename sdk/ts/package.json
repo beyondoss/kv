@@ -1,49 +1,9 @@
 {
-  "name": "@beyond.dev/kv",
-  "version": "0.1.0-dev",
-  "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
-  "files": [
-    "dist"
-  ],
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    },
-    "./next": {
-      "import": "./dist/next/index.js",
-      "types": "./dist/next/index.d.ts"
-    }
-  },
+  "private": true,
+  "workspaces": ["kv", "rate-limit"],
   "scripts": {
-    "build": "tsdown",
-    "generate-types": "node scripts/generate-types.mjs",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "next": "^16.2.4",
-    "openapi-typescript": "^7.6.1",
-    "oxfmt": "^0.46.0",
-    "tsdown": "^0.21.10",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.5"
-  },
-  "peerDependencies": {
-    "next": ">=14"
-  },
-  "peerDependenciesMeta": {
-    "next": {
-      "optional": true
-    }
-  },
-  "dependencies": {
-    "ioredis": "^5.10.1",
-    "openapi-fetch": "^0.17.0"
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
   }
 }
