@@ -284,7 +284,7 @@ describe("RESP backend — observability hooks", () => {
   });
 
   afterAll(() =>
-    Promise.all([tracked1.close(), tracked2.close(), tracked3.close()]),
+    Promise.all([tracked1.close(), tracked2.close(), tracked3.close()])
   );
 
   it("fires onRequest and onResponse for each operation", async () => {

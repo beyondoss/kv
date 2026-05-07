@@ -12,8 +12,13 @@ export {
   type KvRespClientOptions,
   type KvResponseEvent,
   type KvResult,
+  type KvSchema,
+  type KvSchemaClient,
+  type KvSchemaMap,
+  type KvSchemaType,
   type operations,
   type paths,
+  type SchemaAwareBatchResults,
 } from "./client.js";
 export { KvError } from "./errors.js";
 export { createHttpKvClient } from "./http.js";

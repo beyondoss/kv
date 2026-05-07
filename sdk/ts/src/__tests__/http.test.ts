@@ -370,8 +370,9 @@ describe("HTTP backend — timeout", () => {
     // Fetch that hangs forever until aborted.
     const hangingFetch: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          reject(new DOMException("aborted", "AbortError")),
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
         );
       });
 

@@ -1,8 +1,10 @@
 import createFetchClient, { type Client } from "openapi-fetch";
+import { KvError } from "./errors.js";
 import { createHttpKvClient } from "./http.js";
 import type {
   BatchOp,
   BatchResults,
+  BatchSetOpts,
   CasOptions,
   DeleteOptions,
   Entry,
@@ -234,6 +236,92 @@ export interface KvRespClientOptions extends KvBaseClientOptions {
 /** Union of HTTP and RESP options. Backend is selected from the URL scheme. */
 export type KvClientOptions = KvHttpClientOptions | KvRespClientOptions;
 
+/**
+ * Schema object with a `parse` method — works with Zod, ArkType, or any library
+ * that exposes `parse(input: unknown): T`. For Valibot wrap with
+ * `{ parse: (v) => v.parse(schema, v) }`.
+ */
+export interface KvSchema<T> {
+  parse(input: unknown): T;
+}
+
+/** A record mapping glob patterns (supporting `*`) to value schemas. */
+export type KvSchemaMap = Record<string, KvSchema<unknown>>;
+
+// ── Type-level glob matching ──────────────────────────────────────────────────
+
+/** True when string literal K matches glob pattern P (single `*` wildcard). */
+type GlobMatch<K extends string, P extends string> = P extends
+  `${infer Pre}*${infer Suf}` ? K extends `${Pre}${string}${Suf}` ? true : false
+  : K extends P ? true
+  : false;
+
+/** The first pattern key in Map that K matches, or never. */
+type MatchedPattern<K extends string, Map extends KvSchemaMap> = {
+  [P in keyof Map & string]: GlobMatch<K, P> extends true ? P : never;
+}[keyof Map & string];
+
+/** Infer the parsed value type for key K from Map. Falls back to Entry when no pattern matches. */
+export type KvSchemaType<K extends string, Map extends KvSchemaMap> =
+  [MatchedPattern<K, Map>] extends [never] ? Entry
+    : Map[MatchedPattern<K, Map> & keyof Map] extends KvSchema<infer T> ? T
+    : Entry;
+
+type SetValue<K extends string, Map extends KvSchemaMap> =
+  [MatchedPattern<K, Map>] extends [never] ? string | Uint8Array
+    : KvSchemaType<K, Map>;
+
+/** Batch op result typed by schema — get ops return schema type, others unchanged. */
+type SchemaAwareBatchOpResult<T extends BatchOp, Map extends KvSchemaMap> =
+  T extends { op: "get"; key: infer K extends string }
+    ? KvSchemaType<K, Map> | null
+    : T extends { op: "incr" } ? number
+    : T extends { op: "exists" } ? boolean
+    : T extends { op: "delete"; opts: { returnOld: true } } ? Entry | null
+    : void;
+
+export type SchemaAwareBatchResults<
+  T extends readonly BatchOp[],
+  Map extends KvSchemaMap,
+> = {
+  [K in keyof T]: T[K] extends BatchOp ? SchemaAwareBatchOpResult<T[K], Map>
+    : never;
+};
+
+/**
+ * Typed KV client — same as {@link KvClient} but `get`, `set`, `batchGet`,
+ * `batchSet`, and `batch` are typed per the schema map. Keys matching a glob
+ * pattern return/accept the schema's type; unmatched keys fall back to
+ * `Entry` / `string | Uint8Array`.
+ */
+export interface KvSchemaClient<Map extends KvSchemaMap>
+  extends Omit<KvClient, "get" | "set" | "batchGet" | "batchSet" | "batch">
+{
+  get<K extends string>(key: K): Promise<KvResult<KvSchemaType<K, Map> | null>>;
+  set<K extends string>(
+    key: K,
+    value: SetValue<K, Map>,
+    opts?: SetOptions,
+  ): Promise<KvResult<void>>;
+  batchGet<const Keys extends readonly string[]>(
+    keys: Keys,
+  ): Promise<
+    KvResult<{ [K in keyof Keys]: KvSchemaType<Keys[K] & string, Map> | null }>
+  >;
+  batchSet<const Entries extends readonly { key: string }[]>(
+    entries: {
+      [I in keyof Entries]: {
+        key: Entries[I]["key"] & string;
+        value: SetValue<Entries[I]["key"] & string, Map>;
+        opts?: BatchSetOpts;
+      };
+    },
+  ): Promise<KvResult<void>>;
+  batch<T extends readonly BatchOp[]>(
+    ops: T,
+  ): Promise<KvResult<SchemaAwareBatchResults<T, Map>>>;
+}
+
 /** Options for {@link createClient}. */
 export interface KvRawClientOptions {
   /** Base URL of the KV HTTP server, e.g. `http://kv:4869`. Trailing slash is stripped. */
@@ -253,10 +341,182 @@ export function createClient(opts: KvRawClientOptions): Client<paths> {
 }
 
 /** Creates a KV client. Backend is selected automatically from the URL scheme. */
-export function createKvClient(opts: KvClientOptions): KvClient {
+export function createKvClient(
+  opts: KvClientOptions & { ttl?: number },
+): KvClient;
+/**
+ * Creates a typed KV client. Keys matching a pattern in `schema` have their
+ * values parsed (on `get`) and serialized (on `set`) automatically. `ttl` sets
+ * a default TTL in seconds applied to every `set` unless overridden per-call.
+ *
+ * @example
+ * ```ts
+ * const kv = createKvClient({
+ *   url: "redis://localhost:6379",
+ *   schema: {
+ *     "users:*": z.object({ username: z.string() }),
+ *   },
+ * });
+ * await kv.set("users:foo", { username: "alice" });
+ * const { data } = await kv.get("users:foo"); // { username: string } | null
+ * ```
+ */
+export function createKvClient<Map extends KvSchemaMap>(
+  opts: KvClientOptions & { schema: Map; ttl?: number },
+): KvSchemaClient<Map>;
+export function createKvClient<Map extends KvSchemaMap>(
+  opts: KvClientOptions & { schema?: Map; ttl?: number },
+): KvClient | KvSchemaClient<Map> {
   const { protocol } = new URL(opts.url);
-  if (protocol === "redis:" || protocol === "rediss:") {
-    return createRespKvClient(opts as KvRespClientOptions);
+  const base: KvClient = protocol === "redis:" || protocol === "rediss:"
+    ? createRespKvClient(opts as KvRespClientOptions)
+    : (createHttpKvClient(opts as KvHttpClientOptions) as KvClient);
+
+  const { schema: schemaMap, ttl: defaultTtl } = opts;
+
+  if (!schemaMap && defaultTtl == null) return base;
+
+  // Pre-compile glob patterns to regexes once, most specific first.
+  const compiled = schemaMap
+    ? Object.entries(schemaMap)
+      .sort((a, b) => specificity(b[0]) - specificity(a[0]))
+      .map(([pattern, schema]) => ({ re: globToRegex(pattern), schema }))
+    : [];
+
+  function findSchema(key: string): KvSchema<unknown> | undefined {
+    for (const { re, schema } of compiled) {
+      if (re.test(key)) return schema;
+    }
+    return undefined;
   }
-  return createHttpKvClient(opts as KvHttpClientOptions) as KvClient;
+
+  return {
+    ...base,
+    async get(key: string) {
+      const result = await base.get(key);
+      if (result.error || result.data === null) return result;
+      const schema = findSchema(key);
+      if (!schema) return result;
+      try {
+        return { data: schema.parse(result.data.json()), error: undefined };
+      } catch (err) {
+        return {
+          data: undefined,
+          error: new KvError(
+            "schema_error",
+            err instanceof Error ? err.message : String(err),
+            422,
+          ),
+        };
+      }
+    },
+    async set(key: string, value: unknown, setOpts?: SetOptions) {
+      const ttl = setOpts?.ttl ?? defaultTtl;
+      const mergedOpts = ttl != null ? { ...setOpts, ttl } : setOpts;
+      const schema = findSchema(key);
+      return base.set(
+        key,
+        schema ? JSON.stringify(value) : (value as string | Uint8Array),
+        mergedOpts,
+      );
+    },
+    async batchGet(keys: readonly string[]) {
+      const result = await base.batchGet(keys as string[]);
+      if (result.error) return result;
+      const parsed: unknown[] = [];
+      for (let i = 0; i < result.data.length; i++) {
+        const entry = result.data[i]!;
+        if (entry === null) {
+          parsed.push(null);
+          continue;
+        }
+        const schema = findSchema(keys[i]!);
+        if (!schema) {
+          parsed.push(entry);
+          continue;
+        }
+        try {
+          parsed.push(schema.parse(entry.json()));
+        } catch (err) {
+          return {
+            data: undefined,
+            error: new KvError(
+              "schema_error",
+              err instanceof Error ? err.message : String(err),
+              422,
+            ),
+          };
+        }
+      }
+      return { data: parsed, error: undefined };
+    },
+    async batchSet(entries: readonly MSetEntry[]) {
+      const wire: MSetEntry[] = entries.map(({ key, value, opts }) => {
+        const ttl = opts?.ttl ?? defaultTtl;
+        const schema = findSchema(key);
+        const entry: MSetEntry = {
+          key,
+          value: schema
+            ? JSON.stringify(value)
+            : (value as string | Uint8Array),
+        };
+        const mergedOpts = ttl != null ? { ...opts, ttl } : opts;
+        if (mergedOpts) entry.opts = mergedOpts;
+        return entry;
+      });
+      return base.batchSet(wire);
+    },
+    async batch(ops: readonly BatchOp[]) {
+      const wireOps = ops.map((op) => {
+        if (op.op === "set") {
+          const ttl = op.opts?.ttl ?? defaultTtl;
+          if (ttl == null) return op;
+          return { ...op, opts: { ...op.opts, ttl } } as BatchOp;
+        }
+        return op;
+      });
+      const result = await base.batch(wireOps as unknown as BatchOp[]);
+      if (result.error) return result;
+      const parsed: unknown[] = [];
+      for (let i = 0; i < result.data.length; i++) {
+        const op = ops[i]!;
+        const item = (result.data as unknown[])[i];
+        if (op.op === "get" && item !== null) {
+          const schema = findSchema(op.key);
+          if (schema) {
+            try {
+              parsed.push(schema.parse((item as Entry).json()));
+            } catch (err) {
+              return {
+                data: undefined,
+                error: new KvError(
+                  "schema_error",
+                  err instanceof Error ? err.message : String(err),
+                  422,
+                ),
+              };
+            }
+            continue;
+          }
+        }
+        parsed.push(item);
+      }
+      return { data: parsed, error: undefined };
+    },
+  } as unknown as KvSchemaClient<Map>;
+}
+
+function globToRegex(pattern: string): RegExp {
+  return new RegExp(
+    "^"
+      + pattern
+        .split("*")
+        .map((s) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&"))
+        .join(".*")
+      + "$",
+  );
+}
+
+function specificity(pattern: string): number {
+  return pattern.replace(/\*/g, "").length;
 }
