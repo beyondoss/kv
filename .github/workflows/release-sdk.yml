@@ -1,0 +1,28 @@
+name: Release SDK
+permissions:
+  id-token: write # Required for OIDC
+  contents: read
+on:
+  push:
+    tags: ["sdk/v*"]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - name: install:ts
+        run: mise run install:ts
+      - name: set version
+        run: |
+          VERSION=${GITHUB_REF_NAME#sdk/v}
+          npm version "$VERSION" --no-git-tag-version
+        working-directory: sdk/ts
+      - name: build:ts
+        run: mise run build:ts
+      - name: publish
+        run: npm publish --access public
+        working-directory: sdk/ts

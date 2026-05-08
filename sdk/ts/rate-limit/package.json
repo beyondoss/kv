@@ -2,6 +2,10 @@
   "name": "@beyond.dev/rate-limit",
   "version": "0.1.0-dev",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beyondoss/kv.git"
+  },
   "engines": {
     "node": ">=18"
   },
