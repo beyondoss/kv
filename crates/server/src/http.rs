@@ -138,7 +138,7 @@ async fn handle_conn(
                 let key_str = String::from_utf8_lossy(&wp.key);
                 let watch_span = tracing::debug_span!(
                     "http.watch",
-                    ns = %wp.ns,
+                    db.name = %wp.ns,
                     key = %key_str,
                     prefix = wp.is_prefix,
                     shard = shard_idx,
@@ -188,10 +188,13 @@ async fn handle_conn(
         let start = Instant::now();
         let req_span = tracing::info_span!(
             "http.request",
-            method = %parts.method,
-            path = parts.uri.path(),
+            otel.kind = "server",
+            http.method = %parts.method,
+            http.target = parts.uri.path(),
+            http.flavor = ?parts.version,
+            http.route = op,
+            http.status_code = tracing::field::Empty,
             shard = shard_idx,
-            status = tracing::field::Empty,
         );
         let response = route(
             &parts,
@@ -207,17 +210,28 @@ async fn handle_conn(
         )
         .instrument(req_span.clone())
         .await;
-        req_span.record("status", response.status().as_u16());
-        let label = match response.status().as_u16() {
+        let status = response.status();
+        req_span.record("http.status_code", status.as_u16());
+        let label = match status.as_u16() {
             200..=299 => "ok",
             404 => "nil",
             _ => "error",
         };
+        let elapsed = start.elapsed().as_secs_f64();
+        let method = parts.method.as_str();
         metrics.ops_total.with_label_values(&[op, label]).inc();
         metrics
             .op_duration_seconds
             .with_label_values(&[op])
-            .observe(start.elapsed().as_secs_f64());
+            .observe(elapsed);
+        metrics
+            .http_requests_total
+            .with_label_values(&[method, op, status.as_str()])
+            .inc();
+        metrics
+            .http_request_duration_seconds
+            .with_label_values(&[method, op])
+            .observe(elapsed);
 
         let mut enc = GenericEncoder::new(&mut w);
         if Sink::send(&mut enc, response).await.is_err() {

@@ -33,8 +33,13 @@ pub async fn dispatch(
 ) -> Value {
     let op = cmd_name(&cmd);
     let start = Instant::now();
-    let span =
-        tracing::info_span!("resp.cmd", cmd = op, ns = %state.ns, status = tracing::field::Empty);
+    let span = tracing::info_span!(
+        "resp.cmd",
+        db.system = "beyond_kv",
+        db.operation = op,
+        db.name = %state.ns,
+        kv.result = tracing::field::Empty,
+    );
     let result = dispatch_inner(cmd, store, state, metrics)
         .instrument(span.clone())
         .await;
@@ -45,7 +50,7 @@ pub async fn dispatch(
     } else {
         "ok"
     };
-    span.record("status", label);
+    span.record("kv.result", label);
     metrics.ops_total.with_label_values(&[op, label]).inc();
     metrics
         .op_duration_seconds

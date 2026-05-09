@@ -152,7 +152,7 @@ async fn handle_conn(
                 {
                     let watch_span = tracing::debug_span!(
                         "resp.watch",
-                        ns = %state.ns,
+                        db.name = %state.ns,
                         mode = "key",
                         shard = state.shard_idx,
                     );
@@ -175,7 +175,7 @@ async fn handle_conn(
                 {
                     let watch_span = tracing::debug_span!(
                         "resp.watch",
-                        ns = %state.ns,
+                        db.name = %state.ns,
                         mode = "prefix",
                         prefix = %String::from_utf8_lossy(prefix),
                         shard = state.shard_idx,

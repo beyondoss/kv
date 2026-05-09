@@ -116,6 +116,9 @@ macro_rules! define_metrics {
 
 // Bucket sets grouped by operation latency profile.
 
+/// HTTP request latency — matches the convention used by auth, queue, and objects.
+const HTTP_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
 /// KV operations — from 25µs L1 cache hits through 10s SCAN/FLUSHDB.
 const KV_OP_BUCKETS: &[f64] = &[
     0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
@@ -130,6 +133,14 @@ const DB_OP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
 
 define_metrics! {
     pub struct MetricsInner {
+        // ── HTTP ─────────────────────────────────────────────────────────────
+        counter_vec http_requests_total("http_requests_total")["method", "path", "status"]
+            => "Total HTTP requests",
+
+        histogram http_request_duration_seconds("http_request_duration_seconds")["method", "path"]
+            buckets = HTTP_BUCKETS
+            => "HTTP request duration in seconds",
+
         // ── Operations ────────────────────────────────────────────────────────
         counter_vec ops_total("kv_ops_total")["op", "result"]
             => "Total KV operations",

@@ -146,9 +146,7 @@ fn main() -> anyhow::Result<()> {
     };
     cfg.validate()?;
 
-    let log_filter = tracing_subscriber::EnvFilter::new(
-        std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
-    );
+    let log_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
     let pretty = std::env::var("ENVIRONMENT").is_ok_and(|e| e == "development")
         || std::env::var("RUST_LOG_FORMAT").is_ok_and(|f| f == "pretty");
     if pretty {

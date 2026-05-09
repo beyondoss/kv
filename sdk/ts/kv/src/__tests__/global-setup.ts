@@ -53,7 +53,7 @@ export async function setup(): Promise<void> {
     env: {
       ...process.env,
       KV_DATA_DIR: tempDataDir,
-      KV_HTTP_PORT: String(httpPort),
+      KV_ADDRESS: `127.0.0.1:${httpPort}`,
       KV_RESP_PORT: String(respPort),
       KV_MEMORY_BYTES: String(32 * 1024 * 1024),
       KV_THREADS: "1",
