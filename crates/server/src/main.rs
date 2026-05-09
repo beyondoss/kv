@@ -147,10 +147,9 @@ fn main() -> anyhow::Result<()> {
     cfg.validate()?;
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "beyond_kv=info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            std::env::var("LOG_LEVEL").unwrap_or_else(|_| "beyond_kv=info".into()),
+        ))
         .init();
 
     // Log panics (including those in worker threads) before the process

@@ -257,21 +257,17 @@ async fn route(
     let query = parts.uri.query().unwrap_or("");
 
     if path == "/livez" {
-        return ok_text("ok");
+        return healthz_json(200, "ok");
     }
 
     if path == "/readyz" {
         let degraded = sync_failures
             .iter()
             .any(|f| f.load(Ordering::Relaxed) >= sync_failure_threshold);
-        if degraded {
-            return http::Response::builder()
-                .status(503)
-                .header("Content-Type", "text/plain")
-                .body(HttpBody::fixed_body(Some(Bytes::from_static(b"degraded"))))
-                .unwrap_or_else(|_| fallback_500());
-        }
-        return ok_text("ok");
+        return healthz_json(
+            if degraded { 503 } else { 200 },
+            if degraded { "degraded" } else { "ok" },
+        );
     }
 
     if path == "/metrics" {
@@ -2191,12 +2187,15 @@ fn json_response(status: u16, body: &serde_json::Value) -> http::Response<HttpBo
         .unwrap_or_else(|_| fallback_500())
 }
 
-fn ok_text(msg: &'static str) -> http::Response<HttpBody> {
+fn healthz_json(status: u16, health_status: &'static str) -> http::Response<HttpBody> {
+    let body = serde_json::json!({
+        "status": health_status,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
     http::Response::builder()
-        .status(200)
-        .body(HttpBody::fixed_body(Some(Bytes::from_static(
-            msg.as_bytes(),
-        ))))
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(HttpBody::fixed_body(Some(Bytes::from(body.to_string()))))
         .unwrap_or_else(|_| fallback_500())
 }
 
