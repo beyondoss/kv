@@ -14,7 +14,7 @@ macro_rules! define_metrics {
             $(
                 $metric_type:ident $field:ident($metric_name:literal)
                 $([$($label:literal),+ $(,)?])?
-                $(buckets = [$($bucket:expr),+ $(,)?])?
+                $(buckets = $buckets:expr)?
                 => $help:literal
             ),* $(,)?
         }
@@ -32,7 +32,7 @@ macro_rules! define_metrics {
                     let $field = define_metrics!(
                         @create $metric_type $metric_name $help
                         $([$($label),+])?
-                        $(buckets = [$($bucket),+])?
+                        $(buckets = $buckets)?
                     );
                     registry.register(Box::new($field.clone())).expect("metric not yet registered");
                 )*
@@ -89,30 +89,44 @@ macro_rules! define_metrics {
     (@create histogram $name:literal $help:literal) => {
         Histogram::with_opts(HistogramOpts::new($name, $help)).expect("valid metric")
     };
-    (@create histogram $name:literal $help:literal buckets = [$($bucket:expr),+]) => {
+    (@create histogram $name:literal $help:literal buckets = $buckets:expr) => {
         Histogram::with_opts(
-            HistogramOpts::new($name, $help).buckets(vec![$($bucket),+])
+            HistogramOpts::new($name, $help).buckets($buckets.to_vec())
         ).expect("valid metric")
     };
     (@create histogram $name:literal $help:literal [$($label:literal),+]) => {
         HistogramVec::new(HistogramOpts::new($name, $help), &[$($label),+]).expect("valid metric")
     };
-    (@create histogram $name:literal $help:literal [$($label:literal),+] buckets = [$($bucket:expr),+]) => {
+    (@create histogram $name:literal $help:literal [$($label:literal),+] buckets = $buckets:expr) => {
         HistogramVec::new(
-            HistogramOpts::new($name, $help).buckets(vec![$($bucket),+]),
+            HistogramOpts::new($name, $help).buckets($buckets.to_vec()),
             &[$($label),+],
         ).expect("valid metric")
     };
     (@create histogram_vec $name:literal $help:literal [$($label:literal),+]) => {
         HistogramVec::new(HistogramOpts::new($name, $help), &[$($label),+]).expect("valid metric")
     };
-    (@create histogram_vec $name:literal $help:literal [$($label:literal),+] buckets = [$($bucket:expr),+]) => {
+    (@create histogram_vec $name:literal $help:literal [$($label:literal),+] buckets = $buckets:expr) => {
         HistogramVec::new(
-            HistogramOpts::new($name, $help).buckets(vec![$($bucket),+]),
+            HistogramOpts::new($name, $help).buckets($buckets.to_vec()),
             &[$($label),+],
         ).expect("valid metric")
     };
 }
+
+// Bucket sets grouped by operation latency profile.
+
+/// KV operations — from 25µs L1 cache hits through 10s SCAN/FLUSHDB.
+const KV_OP_BUCKETS: &[f64] = &[
+    0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5, 1.0, 5.0, 10.0,
+];
+/// Storage I/O and cross-shard fan-out — 100µs to 5s.
+const STORAGE_BUCKETS: &[f64] = &[
+    0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+];
+/// Database-backed operations (log sync) — 1ms fast-path through 1s.
+const DB_OP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
 define_metrics! {
     pub struct MetricsInner {
@@ -120,13 +134,8 @@ define_metrics! {
         counter_vec ops_total("kv_ops_total")["op", "result"]
             => "Total KV operations",
 
-        // Buckets cover sub-100µs L1 hits through multi-second SCAN/FLUSHDB.
         histogram op_duration_seconds("kv_op_duration_seconds")["op"]
-            buckets = [
-                0.000025, 0.00005, 0.0001, 0.00025, 0.0005,
-                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
-                0.1, 0.25, 0.5, 1.0, 5.0, 10.0
-            ]
+            buckets = KV_OP_BUCKETS
             => "KV operation duration in seconds",
 
         // ── Connections ───────────────────────────────────────────────────────
@@ -138,7 +147,7 @@ define_metrics! {
             => "Operations that required cross-shard fan-out",
 
         histogram cross_shard_op_duration_seconds("kv_cross_shard_op_duration_seconds")["op"]
-            buckets = [0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0]
+            buckets = STORAGE_BUCKETS
             => "Cross-shard fan-out operation duration in seconds",
 
         // ── Cache ─────────────────────────────────────────────────────────────
@@ -159,7 +168,7 @@ define_metrics! {
             => "Total log sync failures per shard",
 
         histogram log_sync_duration_seconds("kv_log_sync_duration_seconds")["shard"]
-            buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+            buckets = DB_OP_BUCKETS
             => "Log sync (fsync) duration per shard in seconds",
 
         // ── Storage ───────────────────────────────────────────────────────────

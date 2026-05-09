@@ -8,8 +8,8 @@ pub struct Config {
     #[arg(long, env = "KV_RESP_PORT", default_value_t = 6379)]
     pub resp_port: u16,
 
-    #[arg(long, env = "KV_HTTP_PORT", default_value_t = 4869)]
-    pub http_port: u16,
+    #[arg(long, env = "KV_ADDRESS", default_value = "0.0.0.0:4869")]
+    pub http_address: String,
 
     #[arg(long, env = "KV_THREADS")]
     pub threads: Option<usize>,
@@ -83,7 +83,7 @@ mod tests {
     fn defaults_are_sensible() {
         let cfg = parse(&[]).unwrap();
         assert_eq!(cfg.resp_port, 6379);
-        assert_eq!(cfg.http_port, 4869);
+        assert_eq!(cfg.http_address, "0.0.0.0:4869");
         assert_eq!(cfg.memory_bytes, 256 * 1024 * 1024);
         assert!(cfg.threads.is_none());
     }
@@ -93,8 +93,8 @@ mod tests {
         let cfg = parse(&[
             "--resp-port",
             "7000",
-            "--http-port",
-            "8000",
+            "--http-address",
+            "0.0.0.0:8000",
             "--threads",
             "4",
             "--memory-bytes",
@@ -104,7 +104,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg.resp_port, 7000);
-        assert_eq!(cfg.http_port, 8000);
+        assert_eq!(cfg.http_address, "0.0.0.0:8000");
         assert_eq!(cfg.threads, Some(4));
         assert_eq!(cfg.memory_bytes, 134217728);
         assert_eq!(cfg.data_dir.to_str().unwrap(), "/tmp/kv-test");

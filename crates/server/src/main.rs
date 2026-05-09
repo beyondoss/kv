@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
 
     let data_dir = cfg.data_dir.clone();
     let resp_port = cfg.resp_port;
-    let http_port = cfg.http_port;
+    let http_address = cfg.http_address.clone();
     let memory_per_shard = cfg.memory_bytes / n_threads;
     let reclaim_sealed_threshold = cfg.reclaim_sealed_threshold;
     let reclaim_interval_secs = cfg.reclaim_interval_secs;
@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let max_value_bytes = cfg.max_value_bytes;
     let readyz_sync_failure_threshold = cfg.readyz_sync_failure_threshold;
-    tracing::info!(http_port, "HTTP server enabled");
+    tracing::info!(http_address, "HTTP server enabled");
 
     // Per-worker, per-protocol channel + wakeup pipe.
     let mut resp_senders: Vec<SyncSender<(TcpStream, SocketAddr)>> = Vec::with_capacity(n_threads);
@@ -425,7 +425,7 @@ fn main() -> anyhow::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
 
     // HTTP accept thread (non-blocking listener + shutdown-aware loop).
-    let http_addr = format!("0.0.0.0:{http_port}");
+    let http_addr = http_address;
     let http_listener = TcpListener::bind(&http_addr)?;
     http_listener.set_nonblocking(true)?;
     tracing::info!("HTTP listening on {http_addr}");
