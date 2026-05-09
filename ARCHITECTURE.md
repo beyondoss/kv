@@ -142,18 +142,18 @@ SCAN iterates shards sequentially: when a shard's inner cursor returns `"0"` (ex
 
 ## Concepts & Terminology
 
-| Term                   | What It Controls                                                                                                                                                       | NOT                                                                                               |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP) | Not an auth or tenant boundary                                                                    |
-| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                     | A partition of the keyspace: a key lives on exactly one shard, picked by `FxHash(key) % n_shards` |
-| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                | Not write-through durable storage                                                                 |
-| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                | Not the hot path for reads after first access                                                     |
-| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                        | Not modified in place; only appended                                                              |
-| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                 | Not deleted until reclaim runs again                                                              |
-| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                            | Not a tombstone or deletion marker                                                                |
-| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                   | Not a literal zero integer                                                                        |
-| `\x01`-prefixed cursor | Single-shard continuation cursor: `b"\x01"` + last_key from the previous page                                                                                          | Not a user-visible value; internal to scan                                                        |
-| `\x02`-prefixed cursor | Multi-shard continuation cursor: `b"\x02"` + `[shard_idx: u8]` + per-shard inner cursor; only emitted when `n_shards > 1`                                              | Never produced by single-shard deployments; not a user-visible value                              |
+| Term                   | What It Controls                                                                                                                                                                                | NOT                                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP); max 1024 open per shard | Not an auth or tenant boundary                                                                    |
+| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                                              | A partition of the keyspace: a key lives on exactly one shard, picked by `FxHash(key) % n_shards` |
+| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                                         | Not write-through durable storage                                                                 |
+| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                                         | Not the hot path for reads after first access                                                     |
+| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                                                 | Not modified in place; only appended                                                              |
+| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                                          | Not deleted until reclaim runs again                                                              |
+| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                                                     | Not a tombstone or deletion marker                                                                |
+| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                                            | Not a literal zero integer                                                                        |
+| `\x01`-prefixed cursor | Single-shard continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                                   | Not a user-visible value; internal to scan                                                        |
+| `\x02`-prefixed cursor | Multi-shard continuation cursor: `b"\x02"` + `[shard_idx: u8]` + per-shard inner cursor; only emitted when `n_shards > 1`                                                                       | Never produced by single-shard deployments; not a user-visible value                              |
 
 ## Core Mechanism
 
@@ -178,7 +178,7 @@ SCAN iterates shards sequentially: when a shard's inner cursor returns `"0"` (ex
 
 `ShardStore` is `!Sync` (via `Rc<>` wrapping). There is no shared mutable state between threads — each shard owns its slice of the keyspace and has no read or write path into another shard's storage.
 
-The accept loop in `main.rs` peeks the first command's key on each new connection and routes it to the owning shard; the connection is then **pinned** to that shard for its lifetime (Redis-cluster-style). Single-key commands (GET/SET/DEL/EXISTS/...) execute locally on the pinned shard. Multi-key commands (MGET/MSET/DEL/EXISTS) **fan out across shards** transparently — see "Cross-Shard Fan-Out" below.
+The accept loop in `main.rs` peeks the first command's key on each new connection (via `routing.rs:peek_resp_key` / `peek_http_key`) and routes it to the owning shard; the connection is then **pinned** to that shard for its lifetime (Redis-cluster-style). If the key cannot be extracted within a 2 ms window (slow client, or single-element commands like `PING`), the connection falls back to round-robin shard assignment. Single-key commands (GET/SET/DEL/EXISTS/...) execute locally on the pinned shard. Multi-key commands (MGET/MSET/DEL/EXISTS) **fan out across shards** transparently — see "Cross-Shard Fan-Out" below.
 
 ### Two-Level Storage
 
@@ -414,15 +414,63 @@ Across shards (when MSET keys span shard boundaries), atomicity is **not** prese
 
 ## Configuration
 
-| CLI Flag / Env Var                                           | Default              | What It Controls at Runtime                                                                       |
-| ------------------------------------------------------------ | -------------------- | ------------------------------------------------------------------------------------------------- |
-| `--data-dir` / `KV_DATA_DIR`                                 | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`)                                      |
-| `--resp-port` / `KV_RESP_PORT`                               | `6379`               | TCP port each thread's RESP listener binds to                                                     |
-| `--http-port` / `KV_HTTP_PORT`                               | `4869`               | TCP port each thread's HTTP listener binds to                                                     |
-| `--threads` / `KV_THREADS`                                   | `num_cpus::get()`    | Number of OS threads (= number of shards)                                                         |
-| `--memory-bytes` / `KV_MEMORY_BYTES`                         | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads                                              |
-| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD` | `4`                  | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim |
-| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS`       | `300`                | Seconds between auto-reclaim scans (ignored when threshold is 0)                                  |
+| CLI Flag / Env Var                                                     | Default              | What It Controls at Runtime                                                                       |
+| ---------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `--data-dir` / `KV_DATA_DIR`                                           | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`)                                      |
+| `--resp-port` / `KV_RESP_PORT`                                         | `6379`               | TCP port each thread's RESP listener binds to                                                     |
+| `--http-address` / `KV_ADDRESS`                                        | `0.0.0.0:4869`       | Socket address each thread's HTTP listener binds to (full `ip:port`)                              |
+| `--threads` / `KV_THREADS`                                             | `num_cpus::get()`    | Number of OS threads (= number of shards)                                                         |
+| `--memory-bytes` / `KV_MEMORY_BYTES`                                   | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads                                              |
+| `--max-conns-per-shard` / `KV_MAX_CONNS_PER_SHARD`                     | `10000`              | Per-shard connection cap; connections beyond this are dropped immediately with a busy response    |
+| `--idle-timeout-secs` / `KV_IDLE_TIMEOUT_SECS`                         | `60`                 | Seconds of inactivity before a connection is closed                                               |
+| `--max-value-bytes` / `KV_MAX_VALUE_BYTES`                             | `67108864` (64 MB)   | Maximum accepted value size; larger bodies are rejected with HTTP 413 or RESP `ERR`               |
+| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD`           | `4`                  | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim |
+| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS`                 | `300`                | Seconds between auto-reclaim scans (ignored when threshold is 0)                                  |
+| `--readyz-sync-failure-threshold` / `KV_READYZ_SYNC_FAILURE_THRESHOLD` | `3`                  | Consecutive log-sync failures on any shard before `/readyz` returns 503                           |
+| `--log-level` / `LOG_LEVEL`                                            | `info`               | `tracing` filter level; set `ENVIRONMENT=development` for pretty-printed logs                     |
+
+## Observability
+
+Metrics are exposed in Prometheus text format at `GET /metrics` on the HTTP port. Each shard registers its own sub-counters; the `Metrics::encode()` call flushes atomic cache counters into the registered `CounterVec` before gathering, so scrape output is always consistent.
+
+| Metric                               | Labels                     | What It Measures                                              |
+| ------------------------------------ | -------------------------- | ------------------------------------------------------------- |
+| `http_requests_total`                | `method`, `path`, `status` | Total HTTP requests by method, route pattern, and status code |
+| `http_request_duration_seconds`      | `method`, `path`           | HTTP request latency histogram (5 ms – 2.5 s buckets)         |
+| `kv_ops_total`                       | `op`, `result`             | KV operation count by command name and outcome (ok/err/miss)  |
+| `kv_op_duration_seconds`             | `op`                       | KV operation latency histogram (25 µs – 10 s buckets)         |
+| `kv_active_connections`              | `shard`, `proto`           | Live client connections per shard and protocol (resp/http)    |
+| `kv_cross_shard_ops_total`           | `op`                       | Operations that required cross-shard fan-out                  |
+| `kv_cross_shard_op_duration_seconds` | `op`                       | Cross-shard fan-out latency histogram (100 µs – 5 s buckets)  |
+| `kv_cache_ops_total`                 | `result` (hit/miss)        | L1 cache lookup outcomes aggregated across all shards         |
+| `kv_cache_size_bytes`                | `shard`                    | L1 cache memory in use per shard                              |
+| `kv_cache_entries`                   | `shard`                    | L1 cache entry count per shard                                |
+| `kv_keys_expired_total`              | `shard`                    | Keys removed by TTL sweep per shard                           |
+| `kv_log_sync_failures_total`         | `shard`                    | fsync failures per shard (drives `/readyz` degradation)       |
+| `kv_log_sync_duration_seconds`       | `shard`                    | fsync latency histogram (1 ms – 1 s buckets)                  |
+| `kv_sealed_segments`                 | `shard`                    | Sealed log files awaiting compaction per shard                |
+| `kv_reclaim_runs_total`              | `shard`                    | Completed compaction runs per shard                           |
+| `kv_reclaim_files_freed_total`       | `shard`                    | Log files deleted by compaction per shard                     |
+| `kv_namespaces_open`                 | `shard`                    | Open namespace count per shard (hard limit: 1024)             |
+
+## Trust Boundaries
+
+**What the server verifies (rejects if invalid):**
+
+- Value size: bodies exceeding `KV_MAX_VALUE_BYTES` are rejected with HTTP 413 or RESP `ERR`.
+- Connection count: connections beyond `KV_MAX_CONNS_PER_SHARD` are dropped immediately.
+- RESP protocol framing: malformed arrays or bulk strings close the connection.
+- CAS preconditions: `If-Match` / `REV` mismatches return 409 / nil without writing.
+
+**What passes through unchecked:**
+
+- Client identity — there is **no authentication**. Any TCP client can read or write any key in any namespace.
+- Namespace validity beyond format — `SELECT` accepts any non-negative integer; the namespace directory is created on first write.
+- Value content — bytes are stored and returned verbatim; no schema validation.
+
+**Why these boundaries are where they are:**
+
+The server is designed to run inside a trusted network perimeter (the same GlideFS-backed VM host). Authentication, authz, and tenant isolation are delegated to the edge proxy layer that sits in front of the server.
 
 ## Failure Modes
 
@@ -464,3 +512,5 @@ Across shards (when MSET keys span shard boundaries), atomicity is **not** prese
 | `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                                                      |
 | `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                                                            |
 | `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint; batch endpoint                                                |
+| `crates/server/src/routing.rs`     | `peek_resp_key` / `peek_http_key` — peek first bytes of a new connection to extract routing key; `shard_for_key` (FxHash); percent-decode for HTTP paths    |
+| `crates/server/src/metrics.rs`     | Prometheus metric definitions (`MetricsInner` / `Metrics`); `encode()` flushes atomic cache counters into registered `CounterVec` before gathering          |
