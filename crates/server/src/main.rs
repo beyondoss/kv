@@ -146,11 +146,19 @@ fn main() -> anyhow::Result<()> {
     };
     cfg.validate()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            std::env::var("LOG_LEVEL").unwrap_or_else(|_| "beyond_kv=info".into()),
-        ))
-        .init();
+    let log_filter = tracing_subscriber::EnvFilter::new(
+        std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+    );
+    let pretty = std::env::var("ENVIRONMENT").is_ok_and(|e| e == "development")
+        || std::env::var("RUST_LOG_FORMAT").is_ok_and(|f| f == "pretty");
+    if pretty {
+        tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    } else {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(log_filter)
+            .init();
+    }
 
     // Log panics (including those in worker threads) before the process
     // aborts (release) or the thread unwinds (debug).

@@ -39,7 +39,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 num_cpus = "1"
 signal-hook = "0.3"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 base64.workspace = true
