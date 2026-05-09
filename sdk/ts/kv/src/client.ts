@@ -15,6 +15,8 @@ import type {
   KvResult,
   ListOptions,
   ListResult,
+  Lock,
+  LockOptions,
   MSetEntry,
   SetOptions,
   WatchEvent,
@@ -30,6 +32,8 @@ export type {
   GetAndSetOptions,
   KvHttpResult,
   KvResult,
+  Lock,
+  LockOptions,
 } from "./kv-types.js";
 export type { operations } from "./types.js";
 
@@ -144,6 +148,35 @@ export interface KvClient {
    * Supported on both RESP and HTTP backends.
    */
   watch(key: string, opts?: WatchOptions): AsyncGenerator<WatchEvent>;
+  /**
+   * Attempt to acquire a distributed lock on `key` in a single non-blocking
+   * attempt. Returns a `Lock` handle if acquired, or `null` if already held.
+   *
+   * The lock is automatically released after `opts.ttl` seconds (default 30)
+   * even if the holder crashes. Call `lock.release()` to release early.
+   *
+   * @see {@link lock} for the RAII callback form that waits to acquire.
+   */
+  tryLock(key: string, opts?: LockOptions): Promise<KvResult<Lock | null>>;
+  /**
+   * Acquire a distributed lock on `key`, execute `fn` while holding it, then
+   * release automatically — even if `fn` throws.
+   *
+   * Waits efficiently via `watch()` (no busy-polling) until the lock becomes
+   * available. Use `opts.timeout` (ms) to set a deadline.
+   *
+   * @example
+   * ```ts
+   * const { data, error } = await kv.lock("job:123", async () => {
+   *   return doExclusiveWork();
+   * });
+   * ```
+   */
+  lock<T>(
+    key: string,
+    fn: () => Promise<T>,
+    opts?: LockOptions,
+  ): Promise<KvResult<T>>;
   /** Release underlying connections. Call when the client is no longer needed. */
   close(): Promise<void>;
 }
@@ -383,6 +416,147 @@ export interface KvSchemaClient<Map extends KvSchemaMap> extends
 export interface KvRawClientOptions {
   /** Base URL of the KV HTTP server, e.g. `http://kv:4869`. Trailing slash is stripped. */
   url: string;
+}
+
+const DEFAULT_LOCK_TTL = 30;
+
+/**
+ * Builds `lock` and `tryLock` on top of standard KvClient primitives.
+ * Shared by both backends — spread the result into the returned client object.
+ */
+export function createLockMethods(
+  base: KvClient,
+): Pick<KvClient, "lock" | "tryLock"> {
+  async function tryLock(
+    key: string,
+    opts?: LockOptions,
+  ): Promise<KvResult<Lock | null>> {
+    const ttl = opts?.ttl ?? DEFAULT_LOCK_TTL;
+    const token = crypto.randomUUID();
+    const result = await base.set(key, token, { ifAbsent: true, ttl });
+    if (result.error) {
+      if (result.error.status === 409) return { data: null, error: undefined };
+      return { data: undefined, error: result.error };
+    }
+    const lock: Lock = {
+      async release(): Promise<KvResult<void>> {
+        const getResult = await base.get(key);
+        if (getResult.error) return { data: undefined, error: undefined };
+        const entry = getResult.data;
+        if (entry === null || entry.text() !== token) {
+          return { data: undefined, error: undefined };
+        }
+        // ifMatch is atomic on HTTP; silently ignored on RESP —
+        // the token check above is the primary ownership guard on both backends.
+        const delResult = await base.delete(key, { ifMatch: entry.revision });
+        if (delResult.error && delResult.error.status !== 409) {
+          return { data: undefined, error: delResult.error };
+        }
+        return { data: undefined, error: undefined };
+      },
+    };
+    return { data: lock, error: undefined };
+  }
+
+  async function lock<T>(
+    key: string,
+    fn: () => Promise<T>,
+    opts?: LockOptions,
+  ): Promise<KvResult<T>> {
+    const ttl = opts?.ttl ?? DEFAULT_LOCK_TTL;
+    const deadline = opts?.timeout != null
+      ? Date.now() + opts.timeout
+      : undefined;
+    const signal = opts?.signal;
+    const watchAc = new AbortController();
+
+    function onExternalAbort() {
+      watchAc.abort();
+    }
+    signal?.addEventListener("abort", onExternalAbort, { once: true });
+
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          return {
+            data: undefined,
+            error: new KvError("aborted", "lock acquisition aborted", 499),
+          };
+        }
+        if (deadline != null && Date.now() >= deadline) {
+          return {
+            data: undefined,
+            error: new KvError(
+              "timeout",
+              `timed out waiting to acquire lock: ${key}`,
+              408,
+            ),
+          };
+        }
+
+        const acquired = await tryLock(key, { ttl });
+        if (acquired.error) return { data: undefined, error: acquired.error };
+
+        if (acquired.data !== null) {
+          const handle = acquired.data;
+          let fnResult: T;
+          try {
+            fnResult = await fn();
+          } catch (err) {
+            await handle.release();
+            return {
+              data: undefined,
+              error: new KvError(
+                "fn_error",
+                err instanceof Error ? err.message : String(err),
+                500,
+              ),
+            };
+          }
+          await handle.release();
+          return { data: fnResult, error: undefined };
+        }
+
+        // Lock is held — wait for deletion via watch (no busy-polling).
+        // Node >= 18 lacks AbortSignal.any(), so compose signals manually.
+        const iterAc = new AbortController();
+        watchAc.signal.addEventListener("abort", () => iterAc.abort(), {
+          once: true,
+        });
+        let iterTimeout: ReturnType<typeof setTimeout> | undefined;
+        if (deadline != null) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) continue;
+          iterTimeout = setTimeout(() => iterAc.abort(), remaining);
+        }
+
+        try {
+          for await (
+            const event of base.watch(key, {
+              signal: iterAc.signal,
+            })
+          ) {
+            if (event.type === "del") break;
+          }
+        } catch {
+          if (signal?.aborted) {
+            return {
+              data: undefined,
+              error: new KvError("aborted", "lock acquisition aborted", 499),
+            };
+          }
+          // Timeout or transient error — loop back to check deadline.
+        } finally {
+          if (iterTimeout != null) clearTimeout(iterTimeout);
+        }
+      }
+    } finally {
+      signal?.removeEventListener("abort", onExternalAbort);
+      watchAc.abort();
+    }
+  }
+
+  return { tryLock, lock };
 }
 
 /**

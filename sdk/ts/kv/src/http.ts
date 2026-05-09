@@ -1,3 +1,4 @@
+import { createLockMethods } from "./client.js";
 import type { KvHttpClient, KvHttpClientOptions } from "./client.js";
 import { KvError } from "./errors.js";
 import type {
@@ -527,7 +528,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
     return { data: undefined, error, response: error.response };
   }
 
-  return {
+  const client = {
     async get(key) {
       try {
         const [data, response] = await _get(key);
@@ -702,6 +703,7 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
       return watchSse(base, nsIdx, key, watchOpts, fetchFn);
     },
   } as KvHttpClient;
+  return Object.assign(client, createLockMethods(client)) as KvHttpClient;
 }
 
 async function* watchSse(

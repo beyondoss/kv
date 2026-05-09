@@ -1,6 +1,7 @@
 import Redis from "ioredis";
 import * as net from "node:net";
 
+import { createLockMethods } from "./client.js";
 import type { KvClient, KvRespClientOptions } from "./client.js";
 import { KvError } from "./errors.js";
 import type {
@@ -409,7 +410,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
     }
   }
 
-  return {
+  const client = {
     async get(key) {
       try {
         return { data: await _get(key), error: undefined };
@@ -721,6 +722,7 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
       return redis.quit().then(() => undefined);
     },
   } as KvClient;
+  return Object.assign(client, createLockMethods(client)) as KvClient;
 }
 
 function isConflictError(e: unknown): boolean {

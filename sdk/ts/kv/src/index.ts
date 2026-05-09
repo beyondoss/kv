@@ -51,6 +51,8 @@ export type {
   ListKey,
   ListOptions,
   ListResult,
+  Lock,
+  LockOptions,
   MSetEntry,
   SetOptions,
   WatchEvent,

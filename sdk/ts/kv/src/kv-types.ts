@@ -163,6 +163,19 @@ export interface WatchOptions {
   signal?: AbortSignal;
 }
 
+export interface Lock {
+  release(): Promise<KvResult<void>>;
+}
+
+export interface LockOptions {
+  /** Lock TTL in seconds. Auto-releases on holder crash. Default: 30. */
+  ttl?: number;
+  /** Max ms to wait for acquisition (`lock()` only). Returns 408 on timeout. */
+  timeout?: number;
+  /** Cancellation signal (`lock()` only). */
+  signal?: AbortSignal;
+}
+
 export interface DeleteOptions {
   /**
    * Compare-and-delete: only delete if the stored revision matches this value.
