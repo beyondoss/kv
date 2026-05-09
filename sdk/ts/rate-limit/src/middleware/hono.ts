@@ -28,7 +28,7 @@ function rateLimitHeaders(info: RateLimitInfo): Record<string, string> {
   };
 }
 
-export function rateLimitMiddleware(
+export function rateLimit(
   limiter: RateLimiter,
   opts: RateLimitMiddlewareOptions = {},
 ): MiddlewareHandler {

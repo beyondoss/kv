@@ -13,9 +13,9 @@ import {
   tokenBucket,
 } from "../src/client.js";
 import { RateLimitError } from "../src/errors.js";
-import { rateLimitMiddleware as expressMiddleware } from "../src/middleware/express.js";
-import { rateLimitPlugin } from "../src/middleware/fastify.js";
-import { rateLimitMiddleware as honoMiddleware } from "../src/middleware/hono.js";
+import { rateLimit as expressMiddleware } from "../src/middleware/express.js";
+import { rateLimit as rateLimitPlugin } from "../src/middleware/fastify.js";
+import { rateLimit as honoMiddleware } from "../src/middleware/hono.js";
 import { extractIp } from "../src/middleware/ip.js";
 import { withRateLimit } from "../src/middleware/next.js";
 import {

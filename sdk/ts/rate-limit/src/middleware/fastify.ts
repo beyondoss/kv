@@ -72,7 +72,7 @@ const plugin: FastifyPluginCallback<RateLimitPluginOptions> = (
   done();
 };
 
-export const rateLimitPlugin = fp(plugin, {
+export const rateLimit = fp(plugin, {
   name: "@beyond.dev/rate-limit",
   fastify: ">=4",
 });

@@ -29,7 +29,7 @@ function setRateLimitHeaders(res: Response, info: RateLimitInfo): void {
   res.setHeader("X-RateLimit-Reset", String(Math.ceil(info.reset / 1000)));
 }
 
-export function rateLimitMiddleware(
+export function rateLimit(
   limiter: RateLimiter,
   opts: RateLimitMiddlewareOptions = {},
 ): RequestHandler {
