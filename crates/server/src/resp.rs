@@ -4,6 +4,8 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use tracing::Instrument as _;
+
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
 use beyond_kv_engine::watch::{KeyFilter, WatchEvent};
 use beyond_kv_proto::command::Command;
@@ -59,26 +61,37 @@ pub async fn serve(
     cross_shard_wakeups: Arc<[StdUnixStream]>,
     metrics: Arc<Metrics>,
 ) {
-    crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
-        let store = store.clone();
-        let cross_shard_txs = cross_shard_txs.clone();
-        let cross_shard_wakeups = cross_shard_wakeups.clone();
-        let metrics = metrics.clone();
-        monoio::spawn(async move {
-            let _guard = guard;
-            handle_conn(
-                s,
-                store,
-                idle_timeout,
-                shard_idx,
-                n_shards,
-                cross_shard_txs,
-                cross_shard_wakeups,
-                metrics,
-            )
-            .await;
-        });
-    })
+    crate::serve_loop(
+        rx,
+        wakeup_read,
+        max_conns,
+        "RESP",
+        shard_idx,
+        metrics.clone(),
+        |s, _peer, guard| {
+            let store = store.clone();
+            let cross_shard_txs = cross_shard_txs.clone();
+            let cross_shard_wakeups = cross_shard_wakeups.clone();
+            let metrics = metrics.clone();
+            monoio::spawn(async move {
+                let _guard = guard;
+                handle_conn(
+                    s,
+                    store,
+                    idle_timeout,
+                    ConnState {
+                        shard_idx,
+                        n_shards,
+                        cross_shard_txs: Some(cross_shard_txs),
+                        cross_shard_wakeups: Some(cross_shard_wakeups),
+                        ..ConnState::default()
+                    },
+                    metrics,
+                )
+                .await;
+            });
+        },
+    )
     .await;
 }
 
@@ -86,20 +99,11 @@ async fn handle_conn(
     stream: TcpStream,
     store: Rc<ShardStore>,
     idle_timeout: Duration,
-    shard_idx: usize,
-    n_shards: usize,
-    cross_shard_txs: ShardSenders,
-    cross_shard_wakeups: Arc<[StdUnixStream]>,
+    state: ConnState,
     metrics: Arc<Metrics>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
-    let mut state = ConnState {
-        shard_idx,
-        n_shards,
-        cross_shard_txs: Some(cross_shard_txs),
-        cross_shard_wakeups: Some(cross_shard_wakeups),
-        ..ConnState::default()
-    };
+    let mut state = state;
 
     loop {
         use monoio::io::sink::Sink;
@@ -145,7 +149,17 @@ async fn handle_conn(
                     let _ = <_ as Sink<Value>>::flush(&mut framed).await;
                     break;
                 }
-                run_key_watch_loop(&mut framed, &store, &state, keys.clone(), *since).await;
+                {
+                    let watch_span = tracing::debug_span!(
+                        "resp.watch",
+                        ns = %state.ns,
+                        mode = "key",
+                        shard = state.shard_idx,
+                    );
+                    run_key_watch_loop(&mut framed, &store, &state, keys.clone(), *since)
+                        .instrument(watch_span)
+                        .await;
+                }
                 break;
             }
             Command::PWatch { prefix, since } => {
@@ -158,7 +172,18 @@ async fn handle_conn(
                     let _ = <_ as Sink<Value>>::flush(&mut framed).await;
                     break;
                 }
-                run_prefix_watch_loop(&mut framed, &store, &state, prefix.clone(), *since).await;
+                {
+                    let watch_span = tracing::debug_span!(
+                        "resp.watch",
+                        ns = %state.ns,
+                        mode = "prefix",
+                        prefix = %String::from_utf8_lossy(prefix),
+                        shard = state.shard_idx,
+                    );
+                    run_prefix_watch_loop(&mut framed, &store, &state, prefix.clone(), *since)
+                        .instrument(watch_span)
+                        .await;
+                }
                 break;
             }
             _ => {}

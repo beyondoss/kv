@@ -15,6 +15,7 @@ fn poke_wakeup(wakeups: &[StdUnixStream], shard: usize) {
     }
 }
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,7 @@ use monoio_http::h1::codec::decoder::FillPayload;
 use monoio_http::h1::codec::decoder::RequestDecoder;
 use monoio_http::h1::codec::encoder::GenericEncoder;
 use monoio_http::h1::payload::Payload;
+use tracing::Instrument as _;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_routed(
@@ -55,28 +57,41 @@ pub async fn serve_routed(
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
     metrics: Arc<Metrics>,
+    sync_failures: Arc<[AtomicU32]>,
+    sync_failure_threshold: u32,
 ) {
-    crate::serve_loop(rx, wakeup_read, max_conns, "HTTP", |s, _peer, guard| {
-        let store = store.clone();
-        let txs = cross_shard_txs.clone();
-        let wakeups = cross_shard_wakeups.clone();
-        let metrics = metrics.clone();
-        monoio::spawn(async move {
-            let _guard = guard;
-            handle_conn(
-                s,
-                store,
-                idle_timeout,
-                max_value_bytes,
-                shard_idx,
-                n_shards,
-                txs,
-                wakeups,
-                metrics,
-            )
-            .await;
-        });
-    })
+    crate::serve_loop(
+        rx,
+        wakeup_read,
+        max_conns,
+        "HTTP",
+        shard_idx,
+        metrics.clone(),
+        |s, _peer, guard| {
+            let store = store.clone();
+            let txs = cross_shard_txs.clone();
+            let wakeups = cross_shard_wakeups.clone();
+            let metrics = metrics.clone();
+            let sync_failures = sync_failures.clone();
+            monoio::spawn(async move {
+                let _guard = guard;
+                handle_conn(
+                    s,
+                    store,
+                    idle_timeout,
+                    max_value_bytes,
+                    shard_idx,
+                    n_shards,
+                    txs,
+                    wakeups,
+                    metrics,
+                    sync_failures,
+                    sync_failure_threshold,
+                )
+                .await;
+            });
+        },
+    )
     .await;
 }
 
@@ -91,6 +106,8 @@ async fn handle_conn(
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
     metrics: Arc<Metrics>,
+    sync_failures: Arc<[AtomicU32]>,
+    sync_failure_threshold: u32,
 ) {
     // Split so we can keep the write half for SSE streaming later.
     let (r, mut w) = stream.into_split();
@@ -117,16 +134,27 @@ async fn handle_conn(
                 let _ = Sink::send(&mut enc, method_not_allowed()).await;
                 break;
             }
-            handle_watch_sse(
-                &mut w,
-                &store,
-                wp,
-                shard_idx,
-                n_shards,
-                &cross_shard_txs,
-                &cross_shard_wakeups,
-            )
-            .await;
+            {
+                let key_str = String::from_utf8_lossy(&wp.key);
+                let watch_span = tracing::debug_span!(
+                    "http.watch",
+                    ns = %wp.ns,
+                    key = %key_str,
+                    prefix = wp.is_prefix,
+                    shard = shard_idx,
+                );
+                handle_watch_sse(
+                    &mut w,
+                    &store,
+                    wp,
+                    shard_idx,
+                    n_shards,
+                    &cross_shard_txs,
+                    &cross_shard_wakeups,
+                )
+                .instrument(watch_span)
+                .await;
+            }
             return;
         }
 
@@ -158,6 +186,13 @@ async fn handle_conn(
 
         let op = http_op(&parts.method, parts.uri.path());
         let start = Instant::now();
+        let req_span = tracing::info_span!(
+            "http.request",
+            method = %parts.method,
+            path = parts.uri.path(),
+            shard = shard_idx,
+            status = tracing::field::Empty,
+        );
         let response = route(
             &parts,
             body_bytes,
@@ -167,15 +202,22 @@ async fn handle_conn(
             &cross_shard_txs,
             &cross_shard_wakeups,
             metrics.as_ref(),
+            &sync_failures,
+            sync_failure_threshold,
         )
+        .instrument(req_span.clone())
         .await;
+        req_span.record("status", response.status().as_u16());
         let label = match response.status().as_u16() {
             200..=299 => "ok",
             404 => "nil",
             _ => "error",
         };
         metrics.ops_total.with_label_values(&[op, label]).inc();
-        metrics.op_duration_seconds.with_label_values(&[op]).observe(start.elapsed().as_secs_f64());
+        metrics
+            .op_duration_seconds
+            .with_label_values(&[op])
+            .observe(start.elapsed().as_secs_f64());
 
         let mut enc = GenericEncoder::new(&mut w);
         if Sink::send(&mut enc, response).await.is_err() {
@@ -197,6 +239,7 @@ async fn read_body(body: Payload) -> Bytes {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route(
     parts: &http::request::Parts,
     body: Bytes,
@@ -206,12 +249,28 @@ async fn route(
     cross_shard_txs: &ShardSenders,
     cross_shard_wakeups: &[StdUnixStream],
     metrics: &Metrics,
+    sync_failures: &[AtomicU32],
+    sync_failure_threshold: u32,
 ) -> http::Response<HttpBody> {
     let path = parts.uri.path();
     let method = &parts.method;
     let query = parts.uri.query().unwrap_or("");
 
-    if path == "/healthz" {
+    if path == "/livez" {
+        return ok_text("ok");
+    }
+
+    if path == "/readyz" {
+        let degraded = sync_failures
+            .iter()
+            .any(|f| f.load(Ordering::Relaxed) >= sync_failure_threshold);
+        if degraded {
+            return http::Response::builder()
+                .status(503)
+                .header("Content-Type", "text/plain")
+                .body(HttpBody::fixed_body(Some(Bytes::from_static(b"degraded"))))
+                .unwrap_or_else(|_| fallback_500());
+        }
         return ok_text("ok");
     }
 
@@ -2086,7 +2145,8 @@ pub struct ApiDoc;
 
 fn http_op(method: &http::Method, path: &str) -> &'static str {
     match path {
-        "/healthz" => "healthz",
+        "/livez" => "livez",
+        "/readyz" => "readyz",
         "/metrics" => "metrics",
         "/v1/openapi.json" => "openapi",
         "/v1/kv/batch" => "batch",

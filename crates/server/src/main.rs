@@ -176,6 +176,7 @@ fn main() -> anyhow::Result<()> {
     let max_conns = cfg.max_conns_per_shard;
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let max_value_bytes = cfg.max_value_bytes;
+    let readyz_sync_failure_threshold = cfg.readyz_sync_failure_threshold;
     tracing::info!(http_port, "HTTP server enabled");
 
     // Per-worker, per-protocol channel + wakeup pipe.
@@ -216,6 +217,14 @@ fn main() -> anyhow::Result<()> {
     let shutdown_error = Arc::new(AtomicBool::new(false));
     let metrics = beyond_kv::metrics::Metrics::new();
 
+    // Per-shard counter of consecutive log-sync failures. /readyz reports 503
+    // when any shard reaches the failure threshold so load balancers can take
+    // it out of rotation while durability is degraded.
+    let sync_failures: Arc<[std::sync::atomic::AtomicU32]> = (0..n_threads)
+        .map(|_| std::sync::atomic::AtomicU32::new(0))
+        .collect::<Vec<_>>()
+        .into();
+
     let handles: Vec<_> = (0..n_threads)
         .zip(worker_inboxes)
         .zip(cross_shard_rx_vec)
@@ -230,6 +239,7 @@ fn main() -> anyhow::Result<()> {
                 let cross_shard_wakeups = cross_shard_wakeups.clone();
                 let shutdown_error = shutdown_error.clone();
                 let metrics = metrics.clone();
+                let sync_failures = Arc::clone(&sync_failures);
                 std::thread::Builder::new()
                     .name(format!("kv-worker-{i}"))
                     .spawn(move || {
@@ -245,29 +255,49 @@ fn main() -> anyhow::Result<()> {
                             )
                             .await
                             .expect("failed to open store");
+                            let counters = store.cache_counters();
+                            metrics.register_cache_counters(counters.hits, counters.misses);
                             let store = Rc::new(store);
 
                             let sweep_store = store.clone();
+                            let sweep_metrics = metrics.clone();
+                            let shard_label = format!("{i}");
                             monoio::spawn(async move {
                                 loop {
                                     monoio::time::sleep(Duration::from_secs(30)).await;
-                                    sweep_store.sweep_cache();
+                                    let expired = sweep_store.sweep_cache();
+                                    if expired > 0 {
+                                        sweep_metrics.keys_expired_total.with_label_values(&[&shard_label]).inc_by(expired as f64);
+                                    }
+                                    sweep_metrics.cache_size_bytes.with_label_values(&[&shard_label]).set(sweep_store.cache_bytes_used() as f64);
+                                    sweep_metrics.cache_entries.with_label_values(&[&shard_label]).set(sweep_store.cache_len() as f64);
+                                    sweep_metrics.namespaces_open.with_label_values(&[&shard_label]).set(sweep_store.namespace_count() as f64);
+                                    sweep_metrics.sealed_segments.with_label_values(&[&shard_label]).set(sweep_store.sealed_segment_count() as f64);
                                 }
                             });
 
                             let sync_store = store.clone();
+                            let sync_fail_counter = Arc::clone(&sync_failures);
+                            let sync_metrics = metrics.clone();
+                            let sync_shard_label = format!("{i}");
                             monoio::spawn(async move {
-                                let mut consecutive_failures = 0u32;
                                 loop {
                                     monoio::time::sleep(Duration::from_secs(1)).await;
+                                    let sync_start = std::time::Instant::now();
                                     match sync_store.sync_logs().await {
-                                        Ok(()) => consecutive_failures = 0,
+                                        Ok(()) => {
+                                            sync_metrics.log_sync_duration_seconds.with_label_values(&[&sync_shard_label]).observe(sync_start.elapsed().as_secs_f64());
+                                            sync_fail_counter[i].store(0, Ordering::Relaxed);
+                                        }
                                         Err(e) => {
-                                            consecutive_failures += 1;
-                                            if consecutive_failures >= 3 {
+                                            sync_metrics.log_sync_failures_total.with_label_values(&[&sync_shard_label]).inc();
+                                            let n = sync_fail_counter[i]
+                                                .fetch_add(1, Ordering::Relaxed)
+                                                + 1;
+                                            if n >= readyz_sync_failure_threshold {
                                                 tracing::error!(
                                                     error = %e,
-                                                    consecutive = consecutive_failures,
+                                                    consecutive = n,
                                                     "periodic log sync failing repeatedly; \
                                                      durability degraded"
                                                 );
@@ -284,17 +314,26 @@ fn main() -> anyhow::Result<()> {
 
                             if reclaim_sealed_threshold > 0 {
                                 let reclaim_store = store.clone();
+                                let reclaim_metrics = metrics.clone();
+                                let reclaim_shard_label = format!("{i}");
                                 monoio::spawn(async move {
                                     loop {
                                         monoio::time::sleep(Duration::from_secs(
                                             reclaim_interval_secs,
                                         ))
                                         .await;
-                                        if let Err(e) = reclaim_store
+                                        match reclaim_store
                                             .reclaim_if_needed(reclaim_sealed_threshold)
                                             .await
                                         {
-                                            tracing::warn!(error = %e, "auto-reclaim failed");
+                                            Ok(summary) if summary.namespaces_reclaimed > 0 => {
+                                                reclaim_metrics.reclaim_runs_total.with_label_values(&[&reclaim_shard_label]).inc_by(summary.namespaces_reclaimed as f64);
+                                                reclaim_metrics.reclaim_files_freed_total.with_label_values(&[&reclaim_shard_label]).inc_by(summary.files_freed as f64);
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "auto-reclaim failed");
+                                            }
                                         }
                                     }
                                 });
@@ -304,6 +343,7 @@ fn main() -> anyhow::Result<()> {
                             let http_txs = cross_shard_txs.clone();
                             let http_wakeups = cross_shard_wakeups.clone();
                             let http_metrics = metrics.clone();
+                            let http_sync_failures = Arc::clone(&sync_failures);
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -317,6 +357,8 @@ fn main() -> anyhow::Result<()> {
                                     http_txs,
                                     http_wakeups,
                                     http_metrics,
+                                    http_sync_failures,
+                                    readyz_sync_failure_threshold,
                                 )
                                 .await;
                             });
@@ -430,12 +472,25 @@ fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("waiting for workers to flush and exit");
-    for h in handles {
-        if let Err(e) = h.join() {
-            tracing::error!("worker thread panicked: {e:?}");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("kv-shutdown-watchdog".into())
+        .spawn(move || {
+            for h in handles {
+                if let Err(e) = h.join() {
+                    tracing::error!("worker thread panicked: {e:?}");
+                }
+            }
+            let _ = done_tx.send(());
+        })?;
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+    match done_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+        Ok(()) => tracing::info!("shutdown complete"),
+        Err(_) => {
+            tracing::error!("workers did not exit within {SHUTDOWN_TIMEOUT:?}; forcing abort");
+            std::process::abort();
         }
     }
-    tracing::info!("shutdown complete");
 
     if shutdown_error.load(Ordering::Relaxed) {
         anyhow::bail!("one or more workers failed to seal log files on shutdown");

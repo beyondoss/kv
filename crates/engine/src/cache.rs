@@ -239,9 +239,9 @@ impl MemCache {
     }
 
     /// Remove all keys expiring at or before `now_ms`. Called by background sweeper.
-    pub fn sweep_expired(&self, now_ms: u64) {
+    pub fn sweep_expired(&self, now_ms: u64) -> u64 {
         let mut freed = 0usize;
-        let mut freed_count = 0usize;
+        let mut freed_count = 0u64;
         self.entries.borrow_mut().retain(|_, v| {
             if v.expires_at_ms.is_some_and(|ms| ms <= now_ms) {
                 freed += v.size;
@@ -256,13 +256,14 @@ impl MemCache {
                 .set(self.current_bytes.get().saturating_sub(freed));
         }
         if freed_count > 0 {
-            let stale = self.stale_slots.get() + freed_count;
+            let stale = self.stale_slots.get() + freed_count as usize;
             self.stale_slots.set(stale);
             let queue_len = self.small.borrow().len() + self.main.borrow().len();
             if stale > queue_len / 2 {
                 self.compact_queues();
             }
         }
+        freed_count
     }
 
     pub fn len(&self) -> usize {

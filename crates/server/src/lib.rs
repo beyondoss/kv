@@ -10,17 +10,32 @@ use std::cell::Cell;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use monoio::io::AsyncReadRent;
 use monoio::net::{TcpStream, UnixStream};
 
-/// RAII guard that decrements a shared connection counter on drop.
-pub(crate) struct ConnGuard(pub(crate) Rc<Cell<usize>>);
+use crate::metrics::Metrics;
+
+/// RAII guard that decrements a shared connection counter and the per-shard
+/// `kv_active_connections` gauge on drop.
+pub(crate) struct ConnGuard {
+    count: Rc<Cell<usize>>,
+    gauge: prometheus::Gauge,
+}
+
+impl ConnGuard {
+    fn new(count: Rc<Cell<usize>>, gauge: prometheus::Gauge) -> Self {
+        gauge.inc();
+        Self { count, gauge }
+    }
+}
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
+        self.count.set(self.count.get().saturating_sub(1));
+        self.gauge.dec();
     }
 }
 
@@ -35,6 +50,8 @@ pub(crate) async fn serve_loop(
     wakeup_read: StdUnixStream,
     max_conns: usize,
     label: &'static str,
+    shard_idx: usize,
+    metrics: Arc<Metrics>,
     mut on_conn: impl FnMut(TcpStream, SocketAddr, ConnGuard),
 ) {
     if let Err(e) = wakeup_read.set_nonblocking(true) {
@@ -75,7 +92,11 @@ pub(crate) async fn serve_loop(
                 Ok(s) => {
                     tracing::debug!(%peer, "accepted {label} connection");
                     conn_count.set(conn_count.get() + 1);
-                    let guard = ConnGuard(conn_count.clone());
+                    let shard_label = shard_idx.to_string();
+                    let gauge = metrics
+                        .active_connections
+                        .with_label_values(&[shard_label.as_str(), label]);
+                    let guard = ConnGuard::new(conn_count.clone(), gauge);
                     on_conn(s, peer, guard);
                 }
                 Err(e) => tracing::error!(%peer, "{label} TcpStream::from_std: {e}"),

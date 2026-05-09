@@ -127,6 +127,11 @@ impl TestServer {
                         let http_store = stores[0].clone();
                         let http_txs = cross_shard_txs.clone();
                         let http_wakeups = cross_shard_wakeups.clone();
+                        let http_sync_failures: std::sync::Arc<[std::sync::atomic::AtomicU32]> = (0
+                            ..n_shards)
+                            .map(|_| std::sync::atomic::AtomicU32::new(0))
+                            .collect::<Vec<_>>()
+                            .into();
                         monoio::spawn(async move {
                             beyond_kv::http::serve_routed(
                                 http_store,
@@ -140,6 +145,8 @@ impl TestServer {
                                 http_txs,
                                 http_wakeups,
                                 beyond_kv::metrics::Metrics::new(),
+                                http_sync_failures,
+                                3,
                             )
                             .await;
                         });
@@ -185,8 +192,12 @@ impl TestServer {
         format!("{}/v1/kv?ns={ns}", self.base())
     }
 
-    pub fn healthz_url(&self) -> String {
-        format!("{}/healthz", self.base())
+    pub fn livez_url(&self) -> String {
+        format!("{}/livez", self.base())
+    }
+
+    pub fn readyz_url(&self) -> String {
+        format!("{}/readyz", self.base())
     }
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────

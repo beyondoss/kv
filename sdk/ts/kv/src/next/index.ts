@@ -41,7 +41,10 @@ export function createServerKvClient<Map extends KvSchemaMap>(opts?: {
 }): KvClient | KvSchemaClient<Map> {
   return createKvClient(
     opts?.schema != null
-      ? { schema: opts.schema, ...(opts.ttl != null && { ttl: opts.ttl }) } as Parameters<typeof createKvClient<Map>>[0]
+      ? {
+        schema: opts.schema,
+        ...(opts.ttl != null && { ttl: opts.ttl }),
+      } as Parameters<typeof createKvClient<Map>>[0]
       : undefined,
   );
 }

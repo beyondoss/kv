@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn peek_http_key_returns_none_for_non_values_path() {
-        let s = pair_with_payload(b"GET /healthz HTTP/1.1\r\n\r\n");
+        let s = pair_with_payload(b"GET /livez HTTP/1.1\r\n\r\n");
         assert_eq!(peek_http_key(&s), None);
     }
 

@@ -39,6 +39,10 @@ pub struct Config {
     /// Requests with a Content-Length or body exceeding this are rejected with 413 / ERR.
     #[arg(long, env = "KV_MAX_VALUE_BYTES", default_value_t = 64 * 1024 * 1024)]
     pub max_value_bytes: usize,
+
+    /// Number of consecutive log-sync failures on any shard before /readyz returns 503.
+    #[arg(long, env = "KV_READYZ_SYNC_FAILURE_THRESHOLD", default_value_t = 3)]
+    pub readyz_sync_failure_threshold: u32,
 }
 
 impl Config {

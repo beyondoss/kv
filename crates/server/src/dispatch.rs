@@ -2,6 +2,8 @@ use std::io::Write as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::{Duration, Instant};
 
+use tracing::Instrument as _;
+
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
 use beyond_kv_engine::types::{Entry, SetOptions};
 use beyond_kv_proto::command::{Command, GetExTtl, SetArgs, SetCondition, SetTtl};
@@ -23,18 +25,41 @@ const SCAN_CURSOR_PREFIX: u8 = 0x02;
 
 const KEYS_SCAN_LIMIT: usize = 1_000_000;
 
-pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState, metrics: &Metrics) -> Value {
+pub async fn dispatch(
+    cmd: Command,
+    store: &ShardStore,
+    state: &mut ConnState,
+    metrics: &Metrics,
+) -> Value {
     let op = cmd_name(&cmd);
     let start = Instant::now();
-    tracing::debug!(cmd = op, ns = %state.ns);
-    let result = dispatch_inner(cmd, store, state).await;
-    let label = if result.is_error() { "error" } else if result.is_null() { "nil" } else { "ok" };
+    let span =
+        tracing::info_span!("resp.cmd", cmd = op, ns = %state.ns, status = tracing::field::Empty);
+    let result = dispatch_inner(cmd, store, state, metrics)
+        .instrument(span.clone())
+        .await;
+    let label = if result.is_error() {
+        "error"
+    } else if result.is_null() {
+        "nil"
+    } else {
+        "ok"
+    };
+    span.record("status", label);
     metrics.ops_total.with_label_values(&[op, label]).inc();
-    metrics.op_duration_seconds.with_label_values(&[op]).observe(start.elapsed().as_secs_f64());
+    metrics
+        .op_duration_seconds
+        .with_label_values(&[op])
+        .observe(start.elapsed().as_secs_f64());
     result
 }
 
-async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
+async fn dispatch_inner(
+    cmd: Command,
+    store: &ShardStore,
+    state: &mut ConnState,
+    metrics: &Metrics,
+) -> Value {
     match cmd {
         Command::Ping { message } => message
             .map(r::bulk)
@@ -119,12 +144,12 @@ async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState)
             }
         }
 
-        Command::Del { keys } => match dispatch_del(keys, store, state).await {
+        Command::Del { keys } => match dispatch_del(keys, store, state, metrics).await {
             Ok(n) => r::integer(n as i64),
             Err(e) => r::error("ERR", &e),
         },
 
-        Command::Exists { keys } => match dispatch_exists(keys, store, state).await {
+        Command::Exists { keys } => match dispatch_exists(keys, store, state, metrics).await {
             Ok(n) => r::integer(n as i64),
             Err(e) => r::error("ERR", &e),
         },
@@ -205,7 +230,7 @@ async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState)
             Err(e) => r::error("ERR", &e.to_string()),
         },
 
-        Command::MGet { keys } => match dispatch_mget(keys, store, state).await {
+        Command::MGet { keys } => match dispatch_mget(keys, store, state, metrics).await {
             Ok(entries) => {
                 let values: Vec<Value> = entries
                     .into_iter()
@@ -219,7 +244,7 @@ async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState)
             Err(e) => r::error("ERR", &e),
         },
 
-        Command::MSet { pairs } => match dispatch_mset(pairs, store, state).await {
+        Command::MSet { pairs } => match dispatch_mset(pairs, store, state, metrics).await {
             Ok(()) => r::ok(),
             Err(e) => r::error("ERR", &e),
         },
@@ -265,7 +290,7 @@ async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState)
             }
         }
 
-        Command::Keys { pattern } => match dispatch_keys(pattern, store, state).await {
+        Command::Keys { pattern } => match dispatch_keys(pattern, store, state, metrics).await {
             Ok(keys) => {
                 if keys.len() >= KEYS_SCAN_LIMIT {
                     return r::error(
@@ -279,18 +304,18 @@ async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState)
         },
 
         Command::Scan { cursor, args } => {
-            match dispatch_scan(cursor, args.pattern, args.count, store, state).await {
+            match dispatch_scan(cursor, args.pattern, args.count, store, state, metrics).await {
                 Ok(page) => r::scan_reply(page.next_cursor, page.keys),
                 Err(e) => r::error("ERR", &e),
             }
         }
 
-        Command::DbSize => match dispatch_dbsize(store, state).await {
+        Command::DbSize => match dispatch_dbsize(store, state, metrics).await {
             Ok(n) => r::integer(n as i64),
             Err(e) => r::error("ERR", &e),
         },
 
-        Command::FlushDb => match dispatch_flushdb(store, state).await {
+        Command::FlushDb => match dispatch_flushdb(store, state, metrics).await {
             Ok(()) => r::ok(),
             Err(e) => r::error("ERR", &e),
         },
@@ -383,11 +408,20 @@ fn bucket_by_shard(keys: &[Bytes], n_shards: usize) -> Vec<Option<Vec<(usize, By
     buckets
 }
 
-async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, String> {
+async fn dispatch_dbsize(
+    store: &ShardStore,
+    state: &ConnState,
+    metrics: &Metrics,
+) -> Result<u64, String> {
     let txs = match fan_out_txs(state) {
         None => return store.db_size(&state.ns).await.map_err(|e| e.to_string()),
         Some(txs) => txs,
     };
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["DBSIZE"])
+        .inc();
+    let start = Instant::now();
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
     let mut futs: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::with_capacity(txs.len());
@@ -406,6 +440,10 @@ async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, S
         futs.push(reply_rx);
     }
     let results = join_all(futs).await;
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["DBSIZE"])
+        .observe(start.elapsed().as_secs_f64());
     let mut total = 0u64;
     for r in results {
         total += r.map_err(|e| e.to_string())??;
@@ -413,11 +451,20 @@ async fn dispatch_dbsize(store: &ShardStore, state: &ConnState) -> Result<u64, S
     Ok(total)
 }
 
-async fn dispatch_flushdb(store: &ShardStore, state: &ConnState) -> Result<(), String> {
+async fn dispatch_flushdb(
+    store: &ShardStore,
+    state: &ConnState,
+    metrics: &Metrics,
+) -> Result<(), String> {
     let txs = match fan_out_txs(state) {
         None => return store.flush_db(&state.ns).await.map_err(|e| e.to_string()),
         Some(txs) => txs,
     };
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["FLUSHDB"])
+        .inc();
+    let start = Instant::now();
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
     let mut futs: Vec<oneshot::Receiver<Result<(), String>>> = Vec::with_capacity(txs.len());
@@ -436,6 +483,10 @@ async fn dispatch_flushdb(store: &ShardStore, state: &ConnState) -> Result<(), S
         futs.push(reply_rx);
     }
     let results = join_all(futs).await;
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["FLUSHDB"])
+        .observe(start.elapsed().as_secs_f64());
     for r in results {
         r.map_err(|e| e.to_string())??;
     }
@@ -446,6 +497,7 @@ async fn dispatch_keys(
     pattern: Option<Bytes>,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<Vec<Bytes>, String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -468,6 +520,11 @@ async fn dispatch_keys(
         }
         Some(txs) => txs,
     };
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["KEYS"])
+        .inc();
+    let start = Instant::now();
     let ns = state.ns.clone();
     let wakeups = state.cross_shard_wakeups.as_deref();
     let mut futs: Vec<oneshot::Receiver<Result<Vec<Bytes>, String>>> =
@@ -488,6 +545,10 @@ async fn dispatch_keys(
         futs.push(reply_rx);
     }
     let results = join_all(futs).await;
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["KEYS"])
+        .observe(start.elapsed().as_secs_f64());
     let mut all = Vec::new();
     for r in results {
         all.extend(r.map_err(|e| e.to_string())??);
@@ -506,6 +567,7 @@ async fn dispatch_scan(
     count: u64,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<beyond_kv_engine::types::ScanPage, String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -516,6 +578,11 @@ async fn dispatch_scan(
         }
         Some(txs) => txs,
     };
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["SCAN"])
+        .inc();
+    let start = Instant::now();
 
     // Decode cursor → (target_shard, per_shard_cursor).
     let (target_shard, per_shard_cursor) = if cursor.first() == Some(&SCAN_CURSOR_PREFIX) {
@@ -550,6 +617,10 @@ async fn dispatch_scan(
         }
         reply_rx.await.map_err(|e| e.to_string())??
     };
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["SCAN"])
+        .observe(start.elapsed().as_secs_f64());
 
     // Build the outgoing cursor.
     let next = if page.next_cursor == b"0".as_ref() {
@@ -578,6 +649,7 @@ async fn dispatch_mget(
     keys: Vec<Bytes>,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<Vec<Option<Entry>>, String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -609,6 +681,8 @@ async fn dispatch_mget(
     let mut results: Vec<Option<Entry>> = vec![None; keys.len()];
     let mut local_bucket: Option<Vec<(usize, Bytes)>> = None;
     let mut pending: Vec<oneshot::Receiver<MGetReply>> = Vec::new();
+    let mut went_cross_shard = false;
+    let start = Instant::now();
 
     // Send to all remote shards first so they start working while we do the
     // local lookup. Stash local keys for after the sends.
@@ -618,6 +692,7 @@ async fn dispatch_mget(
             local_bucket = Some(bucket);
             continue;
         }
+        went_cross_shard = true;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = CrossShardRequest::MGet {
             ns: state.ns.clone(),
@@ -632,6 +707,12 @@ async fn dispatch_mget(
             poke_wakeup(w, shard);
         }
         pending.push(reply_rx);
+    }
+    if went_cross_shard {
+        metrics
+            .cross_shard_ops_total
+            .with_label_values(&["MGET"])
+            .inc();
     }
 
     // Local lookup runs while remote shards are processing.
@@ -654,6 +735,12 @@ async fn dispatch_mget(
             results[orig_idx] = entry;
         }
     }
+    if went_cross_shard {
+        metrics
+            .cross_shard_op_duration_seconds
+            .with_label_values(&["MGET"])
+            .observe(start.elapsed().as_secs_f64());
+    }
     Ok(results)
 }
 
@@ -661,6 +748,7 @@ async fn dispatch_mset(
     pairs: Vec<(Bytes, Bytes)>,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<(), String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -693,6 +781,11 @@ async fn dispatch_mset(
             .await
             .map_err(|e| e.to_string());
     }
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["MSET"])
+        .inc();
+    let start = Instant::now();
 
     // NOTE: cross-shard MSET is NOT atomic — each shard applies its subset
     // independently. Matches Redis Cluster semantics.
@@ -730,6 +823,10 @@ async fn dispatch_mset(
         rx.await
             .map_err(|_| "cross-shard reply dropped".to_string())??;
     }
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["MSET"])
+        .observe(start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -737,6 +834,7 @@ async fn dispatch_del(
     keys: Vec<Bytes>,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<u64, String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -765,6 +863,11 @@ async fn dispatch_del(
         let refs: Vec<&[u8]> = local.iter().map(|k| k.as_ref()).collect();
         return store.del(&state.ns, &refs).await.map_err(|e| e.to_string());
     }
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["DEL"])
+        .inc();
+    let start = Instant::now();
 
     let mut local_keys: Option<Vec<Bytes>> = None;
     let mut pending: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::new();
@@ -799,6 +902,10 @@ async fn dispatch_del(
             .map_err(|e| e.to_string())?;
     }
     let replies = join_all(pending).await;
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["DEL"])
+        .observe(start.elapsed().as_secs_f64());
     for r in replies {
         total += r.map_err(|_| "cross-shard reply dropped".to_string())??;
     }
@@ -809,6 +916,7 @@ async fn dispatch_exists(
     keys: Vec<Bytes>,
     store: &ShardStore,
     state: &ConnState,
+    metrics: &Metrics,
 ) -> Result<u64, String> {
     let txs = match fan_out_txs(state) {
         None => {
@@ -842,6 +950,11 @@ async fn dispatch_exists(
             .await
             .map_err(|e| e.to_string());
     }
+    metrics
+        .cross_shard_ops_total
+        .with_label_values(&["EXISTS"])
+        .inc();
+    let start = Instant::now();
 
     let mut local_keys: Option<Vec<Bytes>> = None;
     let mut pending: Vec<oneshot::Receiver<Result<u64, String>>> = Vec::new();
@@ -876,6 +989,10 @@ async fn dispatch_exists(
             .map_err(|e| e.to_string())?;
     }
     let replies = join_all(pending).await;
+    metrics
+        .cross_shard_op_duration_seconds
+        .with_label_values(&["EXISTS"])
+        .observe(start.elapsed().as_secs_f64());
     for r in replies {
         total += r.map_err(|_| "cross-shard reply dropped".to_string())??;
     }

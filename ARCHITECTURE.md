@@ -84,7 +84,8 @@ http.rs router
   ├─ GET    /v1/watch/{key}                     → SSE stream (exact key)
   ├─ GET    /v1/watch?prefix=…                  → SSE stream (prefix, all shards)
   ├─ POST   /v1/admin/compact                   → ShardStore::reclaim()
-  └─ GET    /healthz                            → 200 OK
+  ├─ GET    /livez                             → 200 OK (liveness)
+  └─ GET    /readyz                            → 200 OK | 503 degraded (readiness)
   │
   ▼
 HTTP Client

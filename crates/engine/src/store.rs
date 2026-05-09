@@ -2,7 +2,24 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Per-shard L1 cache hit/miss counters. Both fields are `Arc<AtomicU64>` so the
+/// server-side metrics layer can read them without holding a reference to the store.
+pub struct CacheCounters {
+    pub hits: Arc<AtomicU64>,
+    pub misses: Arc<AtomicU64>,
+}
+
+/// Aggregate result from a background reclaim pass across all namespaces.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReclaimSummary {
+    pub namespaces_reclaimed: u64,
+    pub files_freed: u64,
+    /// Bytes remaining in the live data after compaction.
+    pub live_bytes: u64,
+}
 
 use bytes::Bytes;
 use futures_channel::mpsc::Receiver;
@@ -53,6 +70,8 @@ pub struct ShardStore {
     namespaces: RefCell<FxHashMap<String, Rc<NamespaceLog>>>,
     cache: MemCache,
     watchers: RefCell<WatchRegistry>,
+    cache_hit_count: Arc<AtomicU64>,
+    cache_miss_count: Arc<AtomicU64>,
 }
 
 impl ShardStore {
@@ -107,7 +126,18 @@ impl ShardStore {
             namespaces: RefCell::new(namespaces),
             cache: MemCache::new(memory_bytes),
             watchers: RefCell::new(WatchRegistry::new()),
+            cache_hit_count: Arc::new(AtomicU64::new(0)),
+            cache_miss_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Snapshot of this shard's cache hit/miss counters. Cheap clone — both
+    /// counters live behind `Arc` so observers see live updates.
+    pub fn cache_counters(&self) -> CacheCounters {
+        CacheCounters {
+            hits: self.cache_hit_count.clone(),
+            misses: self.cache_miss_count.clone(),
+        }
     }
 
     /// Open the namespace if not already open, then return a cloned handle.
@@ -376,6 +406,7 @@ impl ShardStore {
         if let Some((value, expires_at_ms, metadata, revision)) =
             Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
         {
+            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(Entry {
                 value,
                 expires_at: Self::instant_from_ms(expires_at_ms, now, now_instant),
@@ -383,6 +414,7 @@ impl ShardStore {
                 revision,
             }));
         }
+        self.cache_miss_count.fetch_add(1, Ordering::Relaxed);
 
         let (entry, expires_at_ms) = {
             let idx = nslog.index.borrow();
@@ -435,6 +467,7 @@ impl ShardStore {
             if let Some((value, expires_at_ms, metadata, revision)) =
                 Self::with_cache_key(ns, key, |ck| self.cache.get(ck, now))
             {
+                self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                 results[i] = Some(Entry {
                     value,
                     expires_at: Self::instant_from_ms(expires_at_ms, now, now_instant),
@@ -443,6 +476,7 @@ impl ShardStore {
                 });
                 continue;
             }
+            self.cache_miss_count.fetch_add(1, Ordering::Relaxed);
             // Index lookup (in-RAM)
             let (entry, ttl) = {
                 let idx = nslog.index.borrow();
@@ -1034,8 +1068,29 @@ impl ShardStore {
         Ok((initial, rx))
     }
 
-    pub fn sweep_cache(&self) {
-        self.cache.sweep_expired(now_ms());
+    pub fn sweep_cache(&self) -> u64 {
+        self.cache.sweep_expired(now_ms())
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn cache_bytes_used(&self) -> usize {
+        self.cache.bytes_used()
+    }
+
+    pub fn namespace_count(&self) -> usize {
+        self.namespaces.borrow().len()
+    }
+
+    /// Total sealed (compactable) log segments across all open namespaces.
+    pub fn sealed_segment_count(&self) -> usize {
+        self.namespaces
+            .borrow()
+            .values()
+            .map(|ns| ns.sealed_file_count())
+            .sum()
     }
 
     /// Fsync any unsynced writes across all namespaces. Called by the per-shard
@@ -1073,9 +1128,9 @@ impl ShardStore {
 
     /// Run reclaim on any namespace that has more than `threshold` sealed files.
     /// Called by the background reclaim timer. `threshold == 0` disables auto-reclaim.
-    pub async fn reclaim_if_needed(&self, threshold: usize) -> Result<()> {
+    pub async fn reclaim_if_needed(&self, threshold: usize) -> Result<ReclaimSummary> {
         if threshold == 0 {
-            return Ok(());
+            return Ok(ReclaimSummary::default());
         }
         let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
         let to_reclaim: Vec<Rc<NamespaceLog>> = ns_list
@@ -1083,11 +1138,15 @@ impl ShardStore {
             .filter(|ns| ns.sealed_file_count() > threshold)
             .collect();
         let results = join_all(to_reclaim.iter().map(|ns| ns.reclaim())).await;
+        let mut summary = ReclaimSummary::default();
         for (ns, result) in to_reclaim.iter().zip(results) {
             let report = result?;
             info!(?report, dir = %ns.dir.display(), "auto-reclaim complete");
+            summary.namespaces_reclaimed += 1;
+            summary.files_freed += report.dead_files_dropped as u64;
+            summary.live_bytes = report.live_bytes;
         }
-        Ok(())
+        Ok(summary)
     }
 
     /// SCAN with key-cursor semantics:

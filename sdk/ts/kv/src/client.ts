@@ -433,11 +433,15 @@ export function createKvClient<Map extends KvSchemaMap>(
     );
   }
   // Spread opts with url resolved to string so internal factories (http.ts, resp.ts) see it as required.
-  const resolved = { ...opts, url } as KvClientOptions & { schema?: Map; ttl?: number };
+  const resolved = { ...opts, url } as KvClientOptions & {
+    schema?: Map;
+    ttl?: number;
+  };
   const { protocol } = new URL(url);
   const respDb = (resolved as KvRespClientOptions).db
     ?? (env["BEYOND_KV_DB"] != null ? Number(env["BEYOND_KV_DB"]) : undefined);
-  const httpNamespace = (resolved as KvHttpClientOptions).namespace ?? env["BEYOND_KV_NAMESPACE"];
+  const httpNamespace = (resolved as KvHttpClientOptions).namespace
+    ?? env["BEYOND_KV_NAMESPACE"];
   const base: KvClient = protocol === "redis:" || protocol === "rediss:"
     ? createRespKvClient({
       ...(resolved as KvRespClientOptions),

@@ -115,6 +115,12 @@ impl ShardedServer {
                                     http_txs,
                                     http_wakeups,
                                     beyond_kv::metrics::Metrics::new(),
+                                    std::sync::Arc::<[std::sync::atomic::AtomicU32]>::from(
+                                        (0..N_SHARDS)
+                                            .map(|_| std::sync::atomic::AtomicU32::new(0))
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                    3,
                                 )
                                 .await;
                             });

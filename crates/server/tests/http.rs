@@ -1,12 +1,20 @@
 mod common;
 use common::{ListOptions, PutOptions, TestServer};
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health checks ─────────────────────────────────────────────────────────────
 
 #[test]
-fn healthz_returns_ok() {
+fn livez_returns_ok() {
     let srv = TestServer::start();
-    let res = common::raw_call_url(ureq::get(&srv.healthz_url()));
+    let res = common::raw_call_url(ureq::get(&srv.livez_url()));
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body_str(), "ok");
+}
+
+#[test]
+fn readyz_returns_ok() {
+    let srv = TestServer::start();
+    let res = common::raw_call_url(ureq::get(&srv.readyz_url()));
     assert_eq!(res.status, 200);
     assert_eq!(res.body_str(), "ok");
 }
