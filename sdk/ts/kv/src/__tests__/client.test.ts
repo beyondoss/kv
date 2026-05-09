@@ -25,7 +25,7 @@ describe("createServerKvClient — environment configuration", () => {
   const savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
-    for (const k of ["KV_URL", "KV_DB", "KV_NAMESPACE"]) {
+    for (const k of ["BEYOND_KV_URL", "BEYOND_KV_DB", "BEYOND_KV_NAMESPACE"]) {
       savedEnv[k] = process.env[k];
       delete process.env[k];
     }
@@ -41,13 +41,13 @@ describe("createServerKvClient — environment configuration", () => {
     }
   });
 
-  it("throws when KV_URL is not set", () => {
-    expect(() => createServerKvClient()).toThrow(/KV_URL/);
+  it("throws when BEYOND_KV_URL is not set", () => {
+    expect(() => createServerKvClient()).toThrow(/BEYOND_KV_URL/);
   });
 
-  it("creates an HTTP client from an http:// KV_URL", async () => {
-    process.env["KV_URL"] = getHttpUrl();
-    process.env["KV_NAMESPACE"] = uniqueNs();
+  it("creates an HTTP client from an http:// BEYOND_KV_URL", async () => {
+    process.env["BEYOND_KV_URL"] = getHttpUrl();
+    process.env["BEYOND_KV_NAMESPACE"] = uniqueNs();
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "server-kv");
@@ -55,9 +55,9 @@ describe("createServerKvClient — environment configuration", () => {
     expect(entry).not.toBeNull();
   });
 
-  it("creates a RESP client from a redis:// KV_URL", async () => {
-    process.env["KV_URL"] = getRespUrl();
-    process.env["KV_DB"] = "0";
+  it("creates a RESP client from a redis:// BEYOND_KV_URL", async () => {
+    process.env["BEYOND_KV_URL"] = getRespUrl();
+    process.env["BEYOND_KV_DB"] = "0";
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "server-resp");
@@ -65,17 +65,17 @@ describe("createServerKvClient — environment configuration", () => {
     expect(entry).not.toBeNull();
   });
 
-  it("passes KV_DB to the RESP backend", () => {
-    process.env["KV_URL"] = getRespUrl();
-    process.env["KV_DB"] = "2";
+  it("passes BEYOND_KV_DB to the RESP backend", () => {
+    process.env["BEYOND_KV_URL"] = getRespUrl();
+    process.env["BEYOND_KV_DB"] = "2";
     // Just verify it constructs without error; db routing is tested in resp.test.ts
     expect(() => createServerKvClient()).not.toThrow();
   });
 
-  it("passes KV_NAMESPACE to the HTTP backend", async () => {
+  it("passes BEYOND_KV_NAMESPACE to the HTTP backend", async () => {
     const ns = uniqueNs();
-    process.env["KV_URL"] = getHttpUrl();
-    process.env["KV_NAMESPACE"] = ns;
+    process.env["BEYOND_KV_URL"] = getHttpUrl();
+    process.env["BEYOND_KV_NAMESPACE"] = ns;
     const kv = createServerKvClient();
     const key = uniqueKey();
     await kv.set(key, "namespaced");

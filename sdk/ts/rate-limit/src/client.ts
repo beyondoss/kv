@@ -1,4 +1,5 @@
 import { createKvClient, type KvClient } from "@beyond.dev/kv";
+import { env } from "std-env";
 import { limitFixedWindow } from "./algorithms/fixed-window.js";
 import { limitSlidingWindow } from "./algorithms/sliding-window.js";
 import { limitTokenBucket } from "./algorithms/token-bucket.js";
@@ -142,9 +143,17 @@ export interface RateLimiter {
 }
 
 export interface RateLimiterOptions {
-  /** KV backend URL — same format as `createKvClient` (`redis://` or `http://`). */
-  url: string;
-  algorithm: Algorithm;
+  /**
+   * KV backend URL — same format as `createKvClient` (`redis://` or `http://`).
+   * Defaults to the `BEYOND_KV_URL` environment variable when omitted.
+   */
+  url?: string;
+  /**
+   * Rate limiting algorithm. Defaults to `slidingWindow({ limit: 100, window: 60000 })`
+   * when omitted, configurable via `BEYOND_RATE_LIMIT_ALGORITHM`, `BEYOND_RATE_LIMIT_LIMIT`,
+   * and `BEYOND_RATE_LIMIT_WINDOW` environment variables.
+   */
+  algorithm?: Algorithm;
   /** KV key namespace prefix. Default: `"rl"`. */
   keyPrefix?: string;
   /** Per-operation KV timeout in milliseconds. */
@@ -158,6 +167,22 @@ export interface RateLimiterOptions {
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
+
+function buildAlgorithmFromEnv(): Algorithm {
+  const algo = env["BEYOND_RATE_LIMIT_ALGORITHM"] ?? "sliding";
+  const limit = Number(env["BEYOND_RATE_LIMIT_LIMIT"] ?? "100");
+  const window = Number(env["BEYOND_RATE_LIMIT_WINDOW"] ?? "60000");
+  if (algo === "fixed") return fixedWindow({ limit, window });
+  if (algo === "token") {
+    return tokenBucket({
+      capacity: Number(env["BEYOND_RATE_LIMIT_CAPACITY"] ?? String(limit)),
+      refillRate: Number(
+        env["BEYOND_RATE_LIMIT_REFILL_RATE"] ?? String(limit / (window / 1000)),
+      ),
+    });
+  }
+  return slidingWindow({ limit, window });
+}
 
 function toRateLimitError(err: unknown, key: string): RateLimitError {
   const message = err instanceof Error ? err.message : String(err);
@@ -175,13 +200,19 @@ function sleep(ms: number): Promise<void> {
 
 /** Creates a distributed rate limiter backed by a beyond-kv instance. */
 export function createRateLimiter(opts: RateLimiterOptions): RateLimiter {
+  const url = opts.url ?? env["BEYOND_KV_URL"];
+  if (!url) {
+    throw new Error(
+      "BEYOND_KV_URL is required (pass `url` or set the BEYOND_KV_URL env var)",
+    );
+  }
   const kv: KvClient = createKvClient({
-    url: opts.url,
+    url,
     retries: opts.retries ?? 2,
     ...(opts.timeout !== undefined ? { timeout: opts.timeout } : {}),
   });
   const prefix = opts.keyPrefix ?? "rl";
-  const algo = opts.algorithm;
+  const algo = opts.algorithm ?? buildAlgorithmFromEnv();
   const { onRequest, onResponse } = opts;
 
   async function run(

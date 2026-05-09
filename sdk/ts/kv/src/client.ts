@@ -1,4 +1,5 @@
 import createFetchClient, { type Client } from "openapi-fetch";
+import { env } from "std-env";
 import { KvError } from "./errors.js";
 import { createHttpKvClient } from "./http.js";
 import type {
@@ -398,7 +399,7 @@ export function createClient(opts: KvRawClientOptions): Client<paths> {
 
 /** Creates a KV client. Backend is selected automatically from the URL scheme. */
 export function createKvClient(
-  opts: KvClientOptions & { ttl?: number },
+  opts?: KvClientOptions & { ttl?: number },
 ): KvClient;
 /**
  * Creates a typed KV client. Keys matching a pattern in `schema` have their
@@ -421,14 +422,33 @@ export function createKvClient<Map extends KvSchemaMap>(
   opts: KvClientOptions & { schema: Map; ttl?: number },
 ): KvSchemaClient<Map>;
 export function createKvClient<Map extends KvSchemaMap>(
-  opts: KvClientOptions & { schema?: Map; ttl?: number },
+  opts?: Partial<KvClientOptions> & { schema?: Map; ttl?: number },
 ): KvClient | KvSchemaClient<Map> {
-  const { protocol } = new URL(opts.url);
+  const url = opts?.url ?? env["BEYOND_KV_URL"];
+  if (!url) {
+    throw new KvError(
+      "invalid_request",
+      "BEYOND_KV_URL is required (pass `url` or set the BEYOND_KV_URL env var)",
+      0,
+    );
+  }
+  // Spread opts with url resolved to string so internal factories (http.ts, resp.ts) see it as required.
+  const resolved = { ...opts, url } as KvClientOptions & { schema?: Map; ttl?: number };
+  const { protocol } = new URL(url);
+  const respDb = (resolved as KvRespClientOptions).db
+    ?? (env["BEYOND_KV_DB"] != null ? Number(env["BEYOND_KV_DB"]) : undefined);
+  const httpNamespace = (resolved as KvHttpClientOptions).namespace ?? env["BEYOND_KV_NAMESPACE"];
   const base: KvClient = protocol === "redis:" || protocol === "rediss:"
-    ? createRespKvClient(opts as KvRespClientOptions)
-    : createHttpKvClient(opts as KvHttpClientOptions);
+    ? createRespKvClient({
+      ...(resolved as KvRespClientOptions),
+      ...(respDb !== undefined && { db: respDb }),
+    })
+    : createHttpKvClient({
+      ...(resolved as KvHttpClientOptions),
+      ...(httpNamespace !== undefined && { namespace: httpNamespace }),
+    });
 
-  const { schema: schemaMap, ttl: defaultTtl } = opts;
+  const { schema: schemaMap, ttl: defaultTtl } = opts ?? {};
 
   if (!schemaMap && defaultTtl == null) return base;
 

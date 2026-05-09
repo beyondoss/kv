@@ -1,3 +1,19 @@
+import { createKvClient, type KvClient } from "./client.js";
+
+let _kv: KvClient | undefined;
+
+/**
+ * Default KV client configured from environment variables.
+ * Reads `BEYOND_KV_URL` (required), `BEYOND_KV_DB` (RESP), and `BEYOND_KV_NAMESPACE` (HTTP).
+ * Initialized lazily on first method call.
+ */
+export const kv: KvClient = new Proxy({} as KvClient, {
+  get(_, prop) {
+    _kv ??= createKvClient();
+    return (_kv as unknown as Record<string | symbol, unknown>)[prop];
+  },
+});
+
 export {
   type components,
   createClient,
