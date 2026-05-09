@@ -2,6 +2,7 @@ pub mod config;
 pub mod cross_shard;
 pub mod dispatch;
 pub mod http;
+pub mod metrics;
 pub mod resp;
 pub mod routing;
 

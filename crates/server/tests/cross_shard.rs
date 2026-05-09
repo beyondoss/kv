@@ -114,6 +114,7 @@ impl ShardedServer {
                                     N_SHARDS,
                                     http_txs,
                                     http_wakeups,
+                                    beyond_kv::metrics::Metrics::new(),
                                 )
                                 .await;
                             });
@@ -127,6 +128,7 @@ impl ShardedServer {
                                 N_SHARDS,
                                 cross_shard_txs,
                                 cross_shard_wakeups,
+                                beyond_kv::metrics::Metrics::new(),
                             )
                             .await;
                         });

@@ -25,6 +25,7 @@ futures-util.workspace = true
 http.workspace = true
 mimalloc.workspace = true
 monoio.workspace = true
+prometheus.workspace = true
 monoio-codec.workspace = true
 monoio-http.workspace = true
 rustc-hash.workspace = true

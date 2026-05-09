@@ -17,6 +17,7 @@ use monoio_codec::Framed;
 
 use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
 use crate::dispatch::dispatch;
+use crate::metrics::Metrics;
 use crate::routing::shard_for_key;
 
 pub struct ConnState {
@@ -56,11 +57,13 @@ pub async fn serve(
     n_shards: usize,
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
+    metrics: Arc<Metrics>,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "RESP", |s, _peer, guard| {
         let store = store.clone();
         let cross_shard_txs = cross_shard_txs.clone();
         let cross_shard_wakeups = cross_shard_wakeups.clone();
+        let metrics = metrics.clone();
         monoio::spawn(async move {
             let _guard = guard;
             handle_conn(
@@ -71,6 +74,7 @@ pub async fn serve(
                 n_shards,
                 cross_shard_txs,
                 cross_shard_wakeups,
+                metrics,
             )
             .await;
         });
@@ -86,6 +90,7 @@ async fn handle_conn(
     n_shards: usize,
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
+    metrics: Arc<Metrics>,
 ) {
     let mut framed = Framed::new(stream, RespCodec::resp2());
     let mut state = ConnState {
@@ -160,7 +165,7 @@ async fn handle_conn(
         }
 
         let response = {
-            let resp = dispatch(cmd, &store, &mut state).await;
+            let resp = dispatch(cmd, &store, &mut state, &metrics).await;
             if is_hello {
                 framed.codec_mut().set_version(match state.resp_version {
                     3 => beyond_resp::Version::Resp3,

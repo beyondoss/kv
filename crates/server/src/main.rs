@@ -214,6 +214,7 @@ fn main() -> anyhow::Result<()> {
     let cross_shard_txs: Arc<[_]> = Arc::from(cross_shard_tx_vec);
     let cross_shard_wakeups: Arc<[_]> = Arc::from(cross_shard_wake_writes);
     let shutdown_error = Arc::new(AtomicBool::new(false));
+    let metrics = beyond_kv::metrics::Metrics::new();
 
     let handles: Vec<_> = (0..n_threads)
         .zip(worker_inboxes)
@@ -228,6 +229,7 @@ fn main() -> anyhow::Result<()> {
                 let cross_shard_txs = cross_shard_txs.clone();
                 let cross_shard_wakeups = cross_shard_wakeups.clone();
                 let shutdown_error = shutdown_error.clone();
+                let metrics = metrics.clone();
                 std::thread::Builder::new()
                     .name(format!("kv-worker-{i}"))
                     .spawn(move || {
@@ -301,6 +303,7 @@ fn main() -> anyhow::Result<()> {
                             let http_store = store.clone();
                             let http_txs = cross_shard_txs.clone();
                             let http_wakeups = cross_shard_wakeups.clone();
+                            let http_metrics = metrics.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -313,6 +316,7 @@ fn main() -> anyhow::Result<()> {
                                     n_threads,
                                     http_txs,
                                     http_wakeups,
+                                    http_metrics,
                                 )
                                 .await;
                             });
@@ -340,6 +344,7 @@ fn main() -> anyhow::Result<()> {
                                 n_threads,
                                 cross_shard_txs,
                                 cross_shard_wakeups,
+                                metrics.clone(),
                             )
                             .await;
 

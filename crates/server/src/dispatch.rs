@@ -1,6 +1,6 @@
 use std::io::Write as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beyond_kv_engine::store::{DEFAULT_NS, ShardStore};
 use beyond_kv_engine::types::{Entry, SetOptions};
@@ -13,6 +13,7 @@ use futures_util::future::join_all;
 use futures_util::sink::SinkExt;
 
 use crate::cross_shard::{CrossShardRequest, MGetReply};
+use crate::metrics::Metrics;
 use crate::resp::ConnState;
 use crate::routing::shard_for_key;
 
@@ -22,8 +23,18 @@ const SCAN_CURSOR_PREFIX: u8 = 0x02;
 
 const KEYS_SCAN_LIMIT: usize = 1_000_000;
 
-pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
-    tracing::debug!(cmd = cmd_name(&cmd), ns = %state.ns);
+pub async fn dispatch(cmd: Command, store: &ShardStore, state: &mut ConnState, metrics: &Metrics) -> Value {
+    let op = cmd_name(&cmd);
+    let start = Instant::now();
+    tracing::debug!(cmd = op, ns = %state.ns);
+    let result = dispatch_inner(cmd, store, state).await;
+    let label = if result.is_error() { "error" } else if result.is_null() { "nil" } else { "ok" };
+    metrics.ops_total.with_label_values(&[op, label]).inc();
+    metrics.op_duration_seconds.with_label_values(&[op]).observe(start.elapsed().as_secs_f64());
+    result
+}
+
+async fn dispatch_inner(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
     match cmd {
         Command::Ping { message } => message
             .map(r::bulk)
@@ -990,7 +1001,7 @@ mod tests {
 
     /// Drive `dispatch` to completion on a fresh monoio runtime.
     fn run(cmd: Command, store: &ShardStore, state: &mut ConnState) -> Value {
-        rt_block_on(dispatch(cmd, store, state))
+        rt_block_on(dispatch(cmd, store, state, &crate::metrics::Metrics::new()))
     }
 
     fn set_key(s: &ShardStore, key: &[u8], value: &[u8]) {

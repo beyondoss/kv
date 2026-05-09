@@ -139,6 +139,7 @@ impl TestServer {
                                 n_shards,
                                 http_txs,
                                 http_wakeups,
+                                beyond_kv::metrics::Metrics::new(),
                             )
                             .await;
                         });
@@ -152,6 +153,7 @@ impl TestServer {
                             n_shards,
                             cross_shard_txs,
                             cross_shard_wakeups,
+                            beyond_kv::metrics::Metrics::new(),
                         )
                         .await;
                     });

@@ -16,9 +16,10 @@ fn poke_wakeup(wakeups: &[StdUnixStream], shard: usize) {
 }
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
+use crate::metrics::Metrics;
 use crate::routing::shard_for_key;
 
 use base64::Engine as _;
@@ -53,11 +54,13 @@ pub async fn serve_routed(
     n_shards: usize,
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
+    metrics: Arc<Metrics>,
 ) {
     crate::serve_loop(rx, wakeup_read, max_conns, "HTTP", |s, _peer, guard| {
         let store = store.clone();
         let txs = cross_shard_txs.clone();
         let wakeups = cross_shard_wakeups.clone();
+        let metrics = metrics.clone();
         monoio::spawn(async move {
             let _guard = guard;
             handle_conn(
@@ -69,6 +72,7 @@ pub async fn serve_routed(
                 n_shards,
                 txs,
                 wakeups,
+                metrics,
             )
             .await;
         });
@@ -86,6 +90,7 @@ async fn handle_conn(
     n_shards: usize,
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
+    metrics: Arc<Metrics>,
 ) {
     // Split so we can keep the write half for SSE streaming later.
     let (r, mut w) = stream.into_split();
@@ -151,6 +156,8 @@ async fn handle_conn(
             break;
         }
 
+        let op = http_op(&parts.method, parts.uri.path());
+        let start = Instant::now();
         let response = route(
             &parts,
             body_bytes,
@@ -159,8 +166,16 @@ async fn handle_conn(
             n_shards,
             &cross_shard_txs,
             &cross_shard_wakeups,
+            metrics.as_ref(),
         )
         .await;
+        let label = match response.status().as_u16() {
+            200..=299 => "ok",
+            404 => "nil",
+            _ => "error",
+        };
+        metrics.ops_total.with_label_values(&[op, label]).inc();
+        metrics.op_duration_seconds.with_label_values(&[op]).observe(start.elapsed().as_secs_f64());
 
         let mut enc = GenericEncoder::new(&mut w);
         if Sink::send(&mut enc, response).await.is_err() {
@@ -190,6 +205,7 @@ async fn route(
     n_shards: usize,
     cross_shard_txs: &ShardSenders,
     cross_shard_wakeups: &[StdUnixStream],
+    metrics: &Metrics,
 ) -> http::Response<HttpBody> {
     let path = parts.uri.path();
     let method = &parts.method;
@@ -197,6 +213,14 @@ async fn route(
 
     if path == "/healthz" {
         return ok_text("ok");
+    }
+
+    if path == "/metrics" {
+        return http::Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain; version=0.0.4")
+            .body(HttpBody::fixed_body(Some(Bytes::from(metrics.encode()))))
+            .unwrap_or_else(|_| fallback_500());
     }
 
     if path == "/v1/openapi.json" {
@@ -2059,6 +2083,26 @@ struct ErrorResponse {
     )
 )]
 pub struct ApiDoc;
+
+fn http_op(method: &http::Method, path: &str) -> &'static str {
+    match path {
+        "/healthz" => "healthz",
+        "/metrics" => "metrics",
+        "/v1/openapi.json" => "openapi",
+        "/v1/kv/batch" => "batch",
+        "/v1/admin/compact" => "compact",
+        p if p == "/v1/kv" || p.starts_with("/v1/kv?") => "list",
+        p if p.starts_with("/v1/kv/") => match *method {
+            http::Method::GET => "get",
+            http::Method::HEAD => "head",
+            http::Method::PUT => "put",
+            http::Method::DELETE => "delete",
+            http::Method::PATCH => "patch",
+            _ => "other",
+        },
+        _ => "other",
+    }
+}
 
 fn openapi_json() -> &'static Bytes {
     static SPEC: std::sync::OnceLock<Bytes> = std::sync::OnceLock::new();
