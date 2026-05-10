@@ -310,6 +310,80 @@ describe("cache — HTTP backend", () => {
     expect(fetchCount).toBe(2);
   });
 
+  it(".refresh() force-fetches and updates the cache; next call returns new value", async () => {
+    const kv = httpClient();
+    const myCache = createCache(kv);
+    let fetchCount = 0;
+    const key = uniqueKey("ref");
+    async function fetchItem() {
+      fetchCount++;
+      return { v: fetchCount };
+    }
+    const getItem = myCache(fetchItem, { key, ttl: 60 });
+
+    const first = await getItem();
+    expect(first).toEqual({ v: 1 });
+
+    const refreshed = await getItem.refresh();
+    expect(refreshed).toEqual({ v: 2 });
+    expect(fetchCount).toBe(2);
+
+    // Cache now holds the refreshed value — no additional fetch
+    const hit = await getItem();
+    expect(hit).toEqual({ v: 2 });
+    expect(fetchCount).toBe(2);
+  });
+
+  it(".refresh() stampede protection — concurrent calls share one fetch", async () => {
+    const kv = httpClient();
+    const myCache = createCache(kv);
+    let fetchCount = 0;
+    const key = uniqueKey("refstamp");
+    async function fetchItem() {
+      fetchCount++;
+      await sleep(20);
+      return fetchCount;
+    }
+    const getItem = myCache(fetchItem, { key, ttl: 60 });
+    await getItem(); // populate
+
+    const [a, b] = await Promise.all([getItem.refresh(), getItem.refresh()]);
+    expect(fetchCount).toBe(2); // one for initial, one for both refreshes
+    expect(a).toBe(b);
+  });
+
+  it("onRefreshError — called when background SWR refresh fails", async () => {
+    const kv = httpClient();
+    const myCache = createCache(kv);
+    const key = uniqueKey("rferr");
+    let fetchCount = 0;
+    let refreshError: unknown;
+
+    async function fetchItem() {
+      fetchCount++;
+      if (fetchCount > 1) throw new Error("upstream down");
+      return { v: 1 };
+    }
+    // ttl: 1, swr: 30 — after 1.5s the entry is stale
+    const getItem = myCache(fetchItem, {
+      key,
+      ttl: 1,
+      swr: 30,
+      onRefreshError: (err) => { refreshError = err; },
+    });
+
+    await getItem(); // populate
+    await sleep(1500); // push into stale window
+
+    // Stale value returned; background refresh fires and fails
+    const stale = await getItem();
+    expect(stale).toEqual({ v: 1 });
+
+    await sleep(200); // let background refresh complete
+    expect(refreshError).toBeDefined();
+    expect((refreshError as Error).message).toBe("upstream down");
+  });
+
   it("error propagation — fetcher throws, caller rejects", async () => {
     const kv = httpClient();
     const myCache = createCache(kv);

@@ -24,7 +24,9 @@ export type CacheOptions<TArgs extends unknown[]> = {
    * Stale-while-revalidate window in **seconds**, appended after `ttl`.
    *
    * While in this window the cached (stale) value is returned immediately and
-   * the fetcher is called in the background to refresh the entry.
+   * the fetcher is called in the background to refresh the entry. If the
+   * background refresh fails, `onRefreshError` is called (if provided) and
+   * stale data continues to be served until the entry expires.
    *
    * @example
    * ```ts
@@ -34,12 +36,39 @@ export type CacheOptions<TArgs extends unknown[]> = {
    */
   swr?: number;
   /**
+   * Called when a background SWR refresh fails. Stale data continues to be
+   * served regardless — this is purely for observability (logging, metrics).
+   *
+   * @example
+   * ```ts
+   * const getUser = cache(fetchUser, {
+   *   ttl: 60,
+   *   swr: 3600,
+   *   onRefreshError: (err) => logger.warn('cache refresh failed', err),
+   * })
+   * ```
+   */
+  onRefreshError?: (err: unknown) => void;
+  /**
    * KV key or key derivation function.
    *
    * **Omit** to derive the key automatically from the fetcher's function name
    * and JSON-serialised arguments: `"fnName:${JSON.stringify(args)}"`.
    * Anonymous functions cannot be used without an explicit `key` — they will
    * throw at definition time.
+   *
+   * > **Warning — bundler minification**: When bundling with esbuild, webpack,
+   * > swc, or similar tools with minification enabled, `fetcher.name` is
+   * > mangled to a short identifier (e.g. `t`). Two unrelated functions can
+   * > receive the same mangled name, causing silent cache key collisions.
+   * > **Always provide an explicit `key` in production builds.**
+   *
+   * > **Note — `JSON.stringify` constraints**: Args are serialised with
+   * > `JSON.stringify`. This means object key order must be consistent,
+   * > `undefined` values are dropped, `Date` instances become strings,
+   * > `BigInt` and circular references throw, and class instances serialise as
+   * > plain objects. Provide a custom `key` function if your args don't
+   * > satisfy these constraints.
    *
    * @example Static key (no-arg fetcher):
    * ```ts
@@ -58,7 +87,8 @@ export type CacheOptions<TArgs extends unknown[]> = {
  * A cached async function returned by {@link cache} or {@link createCache}.
  *
  * Call it like the original function — it returns a `Promise<TReturn>`.
- * Use `.delete(...args)` to invalidate a specific cached entry.
+ * Use `.delete(...args)` to invalidate a specific cached entry, or
+ * `.refresh(...args)` to force an immediate re-fetch and update the cache.
  *
  * @typeParam TArgs - Argument tuple of the wrapped fetcher function.
  * @typeParam TReturn - Return type of the wrapped fetcher function.
@@ -67,6 +97,12 @@ export type CacheHandle<TArgs extends unknown[], TReturn> = {
   (...args: TArgs): Promise<TReturn>;
   /** Invalidate the cached entry for these arguments. */
   delete(...args: TArgs): Promise<void>;
+  /**
+   * Force a fresh fetch, bypassing the cache, and update the stored value.
+   * Returns the new value. Stampede protection applies — concurrent `.refresh()`
+   * calls for the same key share one fetch.
+   */
+  refresh(...args: TArgs): Promise<TReturn>;
 };
 
 type CacheFn = <TArgs extends unknown[], TReturn>(
@@ -205,7 +241,7 @@ export function createCache(client: KvClient): CacheFn {
     fetcher: (...args: TArgs) => Promise<TReturn>,
     options: CacheOptions<TArgs> = {},
   ): CacheHandle<TArgs, TReturn> {
-    const { ttl, swr = 0, key: keyOpt } = options;
+    const { ttl, swr = 0, key: keyOpt, onRefreshError } = options;
     const storageTtl = ttl != null ? ttl + swr : undefined;
 
     if (!keyOpt && !fetcher.name) {
@@ -248,7 +284,8 @@ export function createCache(client: KvClient): CacheFn {
       return p;
     }
 
-    const handle = async function(...args: TArgs): Promise<TReturn> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handle = async function (...args: TArgs): Promise<TReturn> {
       const kvKey = resolveKey(args);
       const entry = await enqueueGet(client, kvKey);
 
@@ -259,16 +296,20 @@ export function createCache(client: KvClient): CacheFn {
       if (swr > 0 && entry.ttlMs != null && entry.ttlMs <= swr * 1000) {
         // Within the SWR window — return stale value immediately and refresh
         // in the background so the next caller gets fresh data.
-        fetchAndStore(kvKey, args).catch(() => {});
+        fetchAndStore(kvKey, args).catch(onRefreshError ?? (() => {}));
         return entry.json<TReturn>();
       }
 
       return entry.json<TReturn>();
     } as CacheHandle<TArgs, TReturn>;
 
-    handle.delete = async function(...args: TArgs): Promise<void> {
+    handle.delete = async function (...args: TArgs): Promise<void> {
       const { error } = await client.delete(resolveKey(args));
       if (error) throw error;
+    };
+
+    handle.refresh = function (...args: TArgs): Promise<TReturn> {
+      return fetchAndStore(resolveKey(args), args);
     };
 
     return handle;
@@ -285,6 +326,12 @@ export function createCache(client: KvClient): CacheFn {
  * the function's name and JSON-serialised arguments:
  * `"fnName:${JSON.stringify(args)}"`. The function must be named; anonymous
  * functions throw at definition time.
+ *
+ * > **Warning — bundler minification**: When bundling with esbuild, webpack,
+ * > swc, or similar tools with minification enabled, `fetcher.name` is
+ * > mangled to a short identifier (e.g. `t`). Two unrelated functions can
+ * > receive the same mangled name, causing silent cache key collisions.
+ * > **Always provide an explicit `key` in production builds.**
  *
  * **Coalescing** — concurrent calls within the same microtask tick are
  * collapsed into a single `batch()` round-trip regardless of which handle they
@@ -304,6 +351,7 @@ export function createCache(client: KvClient): CacheFn {
  * const getUser = cache(fetchUser, { ttl: 60 })
  * const user = await getUser('user_123') // type: User
  * await getUser.delete('user_123')       // invalidate
+ * await getUser.refresh('user_123')      // force re-fetch
  * ```
  *
  * @example Explicit key (required for anonymous functions or custom shapes):
@@ -320,6 +368,7 @@ export function createCache(client: KvClient): CacheFn {
  *   key: (id: string) => `posts:${id}`,
  *   ttl: 60,    // fresh for 60s
  *   swr: 3600,  // serve stale for up to 1hr while refreshing
+ *   onRefreshError: (err) => logger.warn('cache refresh failed', err),
  * })
  * ```
  *
@@ -338,4 +387,9 @@ export function createCache(client: KvClient): CacheFn {
  * ])
  * ```
  */
-export const cache: CacheFn = createCache(kv);
+export function cache<TArgs extends unknown[], TReturn>(
+  fetcher: (...args: TArgs) => Promise<TReturn>,
+  options?: CacheOptions<TArgs>,
+): CacheHandle<TArgs, TReturn> {
+  return createCache(kv)(fetcher, options);
+}
