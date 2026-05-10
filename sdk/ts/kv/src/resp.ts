@@ -31,6 +31,28 @@ function toKvError(err: unknown): KvError {
   );
 }
 
+/**
+ * Create a KV client backed by the RESP (Redis-compatible) protocol.
+ *
+ * Prefer {@link createKvClient} for automatic backend selection. Use this
+ * directly when you need explicit RESP-only behaviour or want to pass ioredis-
+ * specific options.
+ *
+ * The RESP backend maintains a persistent connection and pipelines batch
+ * operations for maximum throughput. It does not support HTTP-only features
+ * like per-entry metadata or atomic compare-and-delete.
+ *
+ * @example
+ * ```ts
+ * import { createRespKvClient } from '@beyond.dev/kv'
+ *
+ * const kv = createRespKvClient({ url: 'redis://localhost:6379', db: 1 })
+ * await kv.set('hello', 'world')
+ * const { data } = await kv.get('hello')
+ * console.log(data?.text()) // "world"
+ * await kv.close()
+ * ```
+ */
 export function createRespKvClient(opts: KvRespClientOptions): KvClient {
   const redis = new Redis(opts.url, {
     db: opts.db ?? 0,

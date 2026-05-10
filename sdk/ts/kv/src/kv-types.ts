@@ -2,6 +2,20 @@ import type { KvError } from "./errors.js";
 
 const decoder = new TextDecoder();
 
+/**
+ * A KV entry returned by `get`, `getAndSet`, `getAndDelete`, and similar read
+ * operations. Wraps raw bytes with convenience decode methods.
+ *
+ * @example
+ * ```ts
+ * const { data: entry } = await kv.get('config')
+ * if (entry) {
+ *   const text = entry.text()           // UTF-8 string
+ *   const obj  = entry.json<Config>()   // parsed JSON
+ *   console.log(entry.ttl, entry.revision)
+ * }
+ * ```
+ */
 export interface Entry {
   value: Uint8Array;
   /** Decode the value as a UTF-8 string. */
@@ -110,6 +124,7 @@ export interface CasOptions {
   ttl?: number;
 }
 
+/** A single entry in a {@link KvClient.batchSet} call. */
 export interface MSetEntry {
   key: string;
   value: string | Uint8Array;
@@ -118,12 +133,14 @@ export interface MSetEntry {
 }
 
 export interface ListOptions {
+  /** Return only keys whose name starts with this string. */
   prefix?: string;
   /**
    * Opaque pagination cursor from a previous `list()` response. Pass the
    * value verbatim — do not construct or modify it.
    */
   cursor?: string;
+  /** Maximum number of keys to return per page. Server may return fewer. */
   limit?: number;
 }
 
@@ -138,6 +155,7 @@ export interface ListResult {
 }
 
 export interface ListKey {
+  /** The full key name. */
   name: string;
 }
 
@@ -163,7 +181,14 @@ export interface WatchOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * A distributed lock handle returned by {@link KvClient.tryLock}.
+ * Call `release()` to relinquish the lock before its TTL expires.
+ * The lock is always auto-released after `opts.ttl` seconds even if `release()`
+ * is never called — crash-safe by design.
+ */
 export interface Lock {
+  /** Release the lock early. Idempotent — safe to call if the TTL already expired. */
   release(): Promise<KvResult<void>>;
 }
 
@@ -190,6 +215,22 @@ export interface DeleteOptions {
   returnOld?: boolean;
 }
 
+/**
+ * A single operation in a {@link KvClient.batch} call.
+ * Operations are executed in order and results are returned in the same order.
+ *
+ * @example
+ * ```ts
+ * const { data, error } = await kv.batch([
+ *   { op: 'get',    key: 'a' },
+ *   { op: 'set',    key: 'b', value: '1', opts: { ttl: 60 } },
+ *   { op: 'incr',   key: 'counter', delta: 5 },
+ *   { op: 'exists', key: 'flag' },
+ *   { op: 'delete', key: 'tmp' },
+ * ] as const)
+ * // data is [Entry | null, void, number, boolean, void]
+ * ```
+ */
 export type BatchOp =
   | { op: "get"; key: string }
   | { op: "set"; key: string; value: string | Uint8Array; opts?: BatchSetOpts }
@@ -203,6 +244,11 @@ type BatchOpResult<T extends BatchOp> = T extends { op: "get" } ? Entry | null
   : T extends { op: "delete"; opts: { returnOld: true } } ? Entry | null
   : void;
 
+/**
+ * Tuple of result types for a {@link KvClient.batch} call — each element
+ * corresponds to the matching {@link BatchOp} at the same index.
+ * TypeScript infers this automatically when ops are typed `as const`.
+ */
 export type BatchResults<T extends readonly BatchOp[]> = {
   [K in keyof T]: T[K] extends BatchOp ? BatchOpResult<T[K]> : never;
 };

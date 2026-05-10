@@ -74,6 +74,27 @@ function toKvError(err: unknown): KvError {
   );
 }
 
+/**
+ * Create a KV client backed by the HTTP REST API.
+ *
+ * Prefer {@link createKvClient} for automatic backend selection. Use this
+ * directly when you need HTTP-only features (per-entry metadata,
+ * atomic compare-and-delete) or want to supply a custom `fetch` implementation.
+ *
+ * The HTTP backend includes the raw `Response` object on every result, which is
+ * useful for inspecting headers or caching directives from edge runtimes.
+ *
+ * @example
+ * ```ts
+ * import { createHttpKvClient } from '@beyond.dev/kv'
+ *
+ * const kv = createHttpKvClient({ url: 'http://localhost:4869', namespace: 'db1' })
+ * await kv.set('hello', 'world', { metadata: { source: 'api' } })
+ * const { data, response } = await kv.get('hello')
+ * console.log(data?.text(), response.status) // "world" 200
+ * await kv.close()
+ * ```
+ */
 export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
   const base = opts.url.replace(/\/+$/, "");
   const nsIdx = nsToIndex(opts.namespace ?? "default");

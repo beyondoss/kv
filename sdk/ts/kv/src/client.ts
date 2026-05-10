@@ -37,21 +37,76 @@ export type {
 } from "./kv-types.js";
 export type { operations } from "./types.js";
 
+/** Emitted before each KV command. Pass `onRequest` to {@link KvClientOptions} to subscribe. */
 export interface KvRequestEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`, `"BATCH"`. */
   command: string;
+  /** Number of keys involved in the command. */
   keyCount: number;
 }
 
+/** Emitted after each KV command completes. Pass `onResponse` to {@link KvClientOptions} to subscribe. */
 export interface KvResponseEvent {
+  /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`, `"BATCH"`. */
   command: string;
+  /** Number of keys involved in the command. */
   keyCount: number;
+  /** Wall-clock duration of the command in milliseconds. */
   durationMs: number;
 }
 
-/** The KvClient interface — satisfied by both the RESP and HTTP backends. */
+/**
+ * The KV client interface — satisfied by both the RESP and HTTP backends.
+ *
+ * Obtain a client via {@link createKvClient} (auto-selects backend from the URL scheme),
+ * or use the default {@link kv} singleton configured from `BEYOND_KV_URL`.
+ *
+ * All methods return a `{ data, error }` result — they **never throw**. Check
+ * `error` before using `data`.
+ *
+ * @example
+ * ```ts
+ * import { kv } from '@beyond.dev/kv'
+ *
+ * // set
+ * const { error } = await kv.set('greeting', 'hello', { ttl: 60 })
+ * if (error) throw error
+ *
+ * // get
+ * const { data: entry } = await kv.get('greeting')
+ * console.log(entry?.text()) // "hello"
+ * ```
+ */
 export interface KvClient {
+  /**
+   * Fetch the entry stored at `key`, or `null` if the key does not exist.
+   *
+   * @example
+   * ```ts
+   * const { data: entry, error } = await kv.get('users:alice')
+   * if (error) throw error
+   * if (entry === null) return null
+   * return entry.json<User>()
+   * ```
+   */
   get(key: string): Promise<KvResult<Entry | null>>;
+  /**
+   * Store `value` at `key`. Use `opts` to set expiry, conditional-write
+   * semantics, or metadata.
+   *
+   * @example
+   * ```ts
+   * // Simple write
+   * await kv.set('greeting', 'hello')
+   *
+   * // Write with TTL
+   * await kv.set('session:abc', token, { ttl: 3600 })
+   *
+   * // Write only if key doesn't exist (creates atomically)
+   * const { error } = await kv.set('lock:job', '1', { ifAbsent: true })
+   * if (error?.status === 409) { /* already exists *\/ }
+   * ```
+   */
   set(
     key: string,
     value: string | Uint8Array,
@@ -81,6 +136,22 @@ export interface KvClient {
   ): Promise<KvResult<Entry | null>>;
   /** Delete `key`. Idempotent — returns void whether or not the key existed. */
   delete(key: string, opts?: DeleteOptions): Promise<KvResult<void>>;
+  /**
+   * List keys in the namespace, optionally filtered by `prefix`.
+   * Results are paginated — pass the returned `nextCursor` back as `cursor` to
+   * fetch the next page. Iterate until `nextCursor` is absent.
+   *
+   * @example
+   * ```ts
+   * let cursor: string | undefined
+   * do {
+   *   const { data, error } = await kv.list({ prefix: 'users:', cursor })
+   *   if (error) throw error
+   *   for (const key of data.keys) console.log(key.name)
+   *   cursor = data.nextCursor
+   * } while (cursor)
+   * ```
+   */
   list(opts?: ListOptions): Promise<KvResult<ListResult>>;
   /** Return the total number of keys in the namespace. */
   count(): Promise<KvResult<number>>;
