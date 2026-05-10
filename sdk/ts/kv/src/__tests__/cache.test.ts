@@ -33,12 +33,11 @@ function spyClient(client: KvClient) {
 // ── Unit ──────────────────────────────────────────────────────────────────────
 
 describe("cache — unit", () => {
-  it("throws at definition time for anonymous functions", () => {
+  it("TypeScript enforces key at compile time (runtime: key option present)", () => {
     const kv = httpClient();
     const myCache = createCache(kv);
-    expect(() => myCache(async () => "value", { ttl: 60 })).toThrow(
-      "cache: cannot derive key from anonymous function — provide a `key` option",
-    );
+    // key is required by the type system — this verifies the JS shape at runtime
+    expect(() => myCache(async function fetchVal() { return 1; }, { key: "k", ttl: 60 })).not.toThrow();
   });
 });
 
@@ -65,22 +64,7 @@ describe("cache — HTTP backend", () => {
     expect(fetchCount).toBe(1); // fetcher not called again
   });
 
-  it("derives key from function name and JSON-serialized args", async () => {
-    const kv = httpClient();
-    const myCache = createCache(kv);
-    async function fetchThing(id: string) {
-      return { id };
-    }
-    const getThing = myCache(fetchThing, { ttl: 60 });
-    await getThing("hello");
-
-    // Verify the value landed at the derived key, not somewhere else
-    const { data: entry } = await kv.get(`fetchThing:["hello"]`);
-    expect(entry).not.toBeNull();
-    expect(entry!.json()).toEqual({ id: "hello" });
-  });
-
-  it("explicit static key overrides default derivation", async () => {
+  it("explicit static key", async () => {
     const kv = httpClient();
     const myCache = createCache(kv);
     const key = uniqueKey("static");

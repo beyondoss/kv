@@ -50,25 +50,17 @@ export type CacheOptions<TArgs extends unknown[]> = {
    */
   onRefreshError?: (err: unknown) => void;
   /**
-   * KV key or key derivation function.
+   * KV key or key derivation function. Required.
    *
-   * **Omit** to derive the key automatically from the fetcher's function name
-   * and JSON-serialised arguments: `"fnName:${JSON.stringify(args)}"`.
-   * Anonymous functions cannot be used without an explicit `key` — they will
-   * throw at definition time.
+   * Use a static string for no-arg fetchers or shared state. Use a function
+   * to derive the key from the fetcher's arguments.
    *
-   * > **Warning — bundler minification**: When bundling with esbuild, webpack,
-   * > swc, or similar tools with minification enabled, `fetcher.name` is
-   * > mangled to a short identifier (e.g. `t`). Two unrelated functions can
-   * > receive the same mangled name, causing silent cache key collisions.
-   * > **Always provide an explicit `key` in production builds.**
-   *
-   * > **Note — `JSON.stringify` constraints**: Args are serialised with
-   * > `JSON.stringify`. This means object key order must be consistent,
-   * > `undefined` values are dropped, `Date` instances become strings,
-   * > `BigInt` and circular references throw, and class instances serialise as
-   * > plain objects. Provide a custom `key` function if your args don't
-   * > satisfy these constraints.
+   * > **Note — `JSON.stringify` constraints**: If you derive the key from args
+   * > with `JSON.stringify`, object key order must be consistent, `undefined`
+   * > values are dropped, `Date` instances become strings, `BigInt` and
+   * > circular references throw, and class instances serialise as plain
+   * > objects. Use a custom derivation if your args don't satisfy these
+   * > constraints.
    *
    * @example Static key (no-arg fetcher):
    * ```ts
@@ -80,7 +72,7 @@ export type CacheOptions<TArgs extends unknown[]> = {
    * const getUser = cache(fetchUser, { key: (id: string) => `users:${id}`, ttl: 60 })
    * ```
    */
-  key?: string | ((...args: TArgs) => string);
+  key: string | ((...args: TArgs) => string);
 };
 
 /**
@@ -107,7 +99,7 @@ export type CacheHandle<TArgs extends unknown[], TReturn> = {
 
 type CacheFn = <TArgs extends unknown[], TReturn>(
   fetcher: (...args: TArgs) => Promise<TReturn>,
-  options?: CacheOptions<TArgs>,
+  options: CacheOptions<TArgs>,
 ) => CacheHandle<TArgs, TReturn>;
 
 // ── Per-client batch state ────────────────────────────────────────────────────
@@ -239,16 +231,10 @@ function enqueueSet(
 export function createCache(client: KvClient): CacheFn {
   return function cache<TArgs extends unknown[], TReturn>(
     fetcher: (...args: TArgs) => Promise<TReturn>,
-    options: CacheOptions<TArgs> = {},
+    options: CacheOptions<TArgs>,
   ): CacheHandle<TArgs, TReturn> {
     const { ttl, swr = 0, key: keyOpt, onRefreshError } = options;
     const storageTtl = ttl != null ? ttl + swr : undefined;
-
-    if (!keyOpt && !fetcher.name) {
-      throw new Error(
-        "cache: cannot derive key from anonymous function — provide a `key` option",
-      );
-    }
 
     // Per-handle in-flight map: stampede protection across microtask ticks.
     // A second caller for the same key while a fetch is in-flight joins the
@@ -256,7 +242,6 @@ export function createCache(client: KvClient): CacheFn {
     const inFlight = new Map<string, Promise<TReturn>>();
 
     function resolveKey(args: TArgs): string {
-      if (!keyOpt) return `${fetcher.name}:${JSON.stringify(args)}`;
       if (typeof keyOpt === "string") return keyOpt;
       return keyOpt(...args);
     }
@@ -322,16 +307,9 @@ export function createCache(client: KvClient): CacheFn {
  * Uses the default KV client configured via `BEYOND_KV_URL`. Pass a custom
  * client with {@link createCache} instead.
  *
- * **Automatic key derivation** — omit `key` and the cache key is derived from
- * the function's name and JSON-serialised arguments:
- * `"fnName:${JSON.stringify(args)}"`. The function must be named; anonymous
- * functions throw at definition time.
- *
- * > **Warning — bundler minification**: When bundling with esbuild, webpack,
- * > swc, or similar tools with minification enabled, `fetcher.name` is
- * > mangled to a short identifier (e.g. `t`). Two unrelated functions can
- * > receive the same mangled name, causing silent cache key collisions.
- * > **Always provide an explicit `key` in production builds.**
+ * **Explicit key required** — provide a static string for no-arg fetchers or
+ * a derivation function for parameterised ones. This keeps keys stable across
+ * bundler minification and refactors.
  *
  * **Coalescing** — concurrent calls within the same microtask tick are
  * collapsed into a single `batch()` round-trip regardless of which handle they
@@ -389,7 +367,7 @@ export function createCache(client: KvClient): CacheFn {
  */
 export function cache<TArgs extends unknown[], TReturn>(
   fetcher: (...args: TArgs) => Promise<TReturn>,
-  options?: CacheOptions<TArgs>,
+  options: CacheOptions<TArgs>,
 ): CacheHandle<TArgs, TReturn> {
   return createCache(kv)(fetcher, options);
 }
