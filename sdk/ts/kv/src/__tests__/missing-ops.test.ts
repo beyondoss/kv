@@ -340,11 +340,14 @@ describe("RESP backend — count()", () => {
   });
 
   it("increases after a set", async () => {
-    const kv = respClient();
-    const { data: before } = await kv.count();
-    await kv.set(uniqueKey(), "v");
+    // Isolated db to avoid races with concurrent tests on db0.
+    const kv = respClient(4);
+    await kv.flush();
+    await kv.set(uniqueKey(), "a");
+    await kv.set(uniqueKey(), "b");
+    await kv.set(uniqueKey(), "c");
     const { data: after } = await kv.count();
-    expect(after).toBeGreaterThan(before!);
+    expect(after).toBe(3);
     await kv.close();
   });
 });

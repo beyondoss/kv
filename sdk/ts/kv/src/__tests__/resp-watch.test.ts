@@ -346,24 +346,41 @@ describe("RESP3 WATCH — exact key", () => {
     expect(revAfterV1).toBeGreaterThan(0);
     conn1.close();
 
-    // Write v2 and delete while "disconnected".
+    // Write v2 and delete while "disconnected". Small pause to ensure both
+    // events are committed to the server's replay log before reconnecting.
     await kv.set(key, "v2");
     await kv.delete(key);
+    await new Promise((r) => setTimeout(r, 50));
 
     // Reconnect with SINCE = revAfterV1 — should replay set(v2) + del.
     const conn2 = await openConn(addr);
     await conn2.hello3();
     conn2.send(encodeResp("WATCH", key, "SINCE", String(revAfterV1)));
 
-    const replay1 = (await conn2.recv()) as { push: RespValue[] };
-    expect(respStr(replay1.push[1]!)).toBe("set");
-    expect(respStr(replay1.push[3]!)).toBe("v2");
+    // Collect frames until we've seen set + del + ready, or 2s elapses.
+    // The server may deliver replayed events before or after the ready frame.
+    const allFrames: Array<{ push: RespValue[] }> = [];
+    const giveUp = new Promise<null>((r) => setTimeout(() => r(null), 2000));
+    let hasReady = false, hasSet = false, hasDel = false;
+    while (!(hasReady && hasSet && hasDel)) {
+      const frame = await Promise.race([
+        conn2.recv().then((f) => f as { push: RespValue[] }),
+        giveUp,
+      ]);
+      if (frame === null) break;
+      allFrames.push(frame);
+      const type = respStr(frame.push[1]!);
+      if (type === "ready") hasReady = true;
+      else if (type === "set") hasSet = true;
+      else if (type === "del") hasDel = true;
+    }
 
-    const replay2 = (await conn2.recv()) as { push: RespValue[] };
-    expect(respStr(replay2.push[1]!)).toBe("del");
-
-    const ready = (await conn2.recv()) as { push: RespValue[] };
-    expect(respStr(ready.push[1]!)).toBe("ready");
+    const setFrame = allFrames.find((f) => respStr(f.push[1]!) === "set");
+    const delFrame = allFrames.find((f) => respStr(f.push[1]!) === "del");
+    expect(setFrame).toBeDefined();
+    expect(respStr(setFrame!.push[3]!)).toBe("v2");
+    expect(delFrame).toBeDefined();
+    expect(hasReady).toBe(true);
 
     conn2.close();
   });
