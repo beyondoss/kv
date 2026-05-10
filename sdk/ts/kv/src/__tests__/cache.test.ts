@@ -37,7 +37,11 @@ describe("cache — unit", () => {
     const kv = httpClient();
     const myCache = createCache(kv);
     // key is required by the type system — this verifies the JS shape at runtime
-    expect(() => myCache(async function fetchVal() { return 1; }, { key: "k", ttl: 60 })).not.toThrow();
+    expect(() =>
+      myCache(async function fetchVal() {
+        return 1;
+      }, { key: "k", ttl: 60 })
+    ).not.toThrow();
   });
 });
 
@@ -353,7 +357,9 @@ describe("cache — HTTP backend", () => {
       key,
       ttl: 1,
       swr: 30,
-      onRefreshError: (err) => { refreshError = err; },
+      onRefreshError: (err) => {
+        refreshError = err;
+      },
     });
 
     await getItem(); // populate

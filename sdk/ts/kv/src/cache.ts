@@ -270,7 +270,7 @@ export function createCache(client: KvClient): CacheFn {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const handle = async function (...args: TArgs): Promise<TReturn> {
+    const handle = async function(...args: TArgs): Promise<TReturn> {
       const kvKey = resolveKey(args);
       const entry = await enqueueGet(client, kvKey);
 
@@ -288,12 +288,12 @@ export function createCache(client: KvClient): CacheFn {
       return entry.json<TReturn>();
     } as CacheHandle<TArgs, TReturn>;
 
-    handle.delete = async function (...args: TArgs): Promise<void> {
+    handle.delete = async function(...args: TArgs): Promise<void> {
       const { error } = await client.delete(resolveKey(args));
       if (error) throw error;
     };
 
-    handle.refresh = function (...args: TArgs): Promise<TReturn> {
+    handle.refresh = function(...args: TArgs): Promise<TReturn> {
       return fetchAndStore(resolveKey(args), args);
     };
 
