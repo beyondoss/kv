@@ -20,6 +20,10 @@
     "./next": {
       "import": "./dist/next/index.mjs",
       "types": "./dist/next/index.d.mts"
+    },
+    "./cache": {
+      "import": "./dist/cache.mjs",
+      "types": "./dist/cache.d.mts"
     }
   },
   "scripts": {
