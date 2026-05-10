@@ -1,31 +1,32 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createCache } from "../cache.js";
-import type { KvClient } from "../client.js";
-import { httpClient, respClient, uniqueKey } from "./harness.js";
+import { createKvClient, type KvClient } from "../client.js";
+import {
+  getHttpUrl,
+  getRespUrl,
+  httpClient,
+  respClient,
+  uniqueKey,
+  uniqueNs,
+} from "./harness.js";
 
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
 }
 
-function spyClient(client: KvClient) {
+function batchTracker() {
   let count = 0;
-  const proxy = new Proxy(client, {
-    get(target, prop, receiver) {
-      const val = Reflect.get(target, prop, receiver);
-      if (prop === "batch") {
-        return (...args: unknown[]) => {
-          count++;
-          return (val as (...a: unknown[]) => unknown).apply(target, args);
-        };
-      }
-      return val;
-    },
-  });
+  let total = 0;
   return {
-    client: proxy as KvClient,
+    onRequest: (e: { command: string }) => {
+      total++;
+      if (e.command === "BATCH") count++;
+    },
     calls: () => count,
+    total: () => total,
     reset: () => {
       count = 0;
+      total = 0;
     },
   };
 }
@@ -133,9 +134,13 @@ describe("cache — HTTP backend", () => {
   });
 
   it("coalesces concurrent reads from the same handle into one batch() call", async () => {
-    const base = httpClient();
-    const spy = spyClient(base);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getHttpUrl(),
+      namespace: uniqueNs(),
+      onRequest: t.onRequest,
+    });
+    const myCache = createCache(kv);
 
     const k1 = uniqueKey("c");
     const k2 = uniqueKey("c");
@@ -146,17 +151,21 @@ describe("cache — HTTP backend", () => {
     const getVal = myCache(fetchVal, { key: (k: string) => k, ttl: 60 });
 
     await Promise.all([getVal(k1), getVal(k2), getVal(k3)]);
-    spy.reset();
+    t.reset();
 
     // All hits — 3 concurrent calls → exactly 1 batch() round-trip
     await Promise.all([getVal(k1), getVal(k2), getVal(k3)]);
-    expect(spy.calls()).toBe(1);
+    expect(t.calls()).toBe(1);
   });
 
   it("coalesces reads across different cache handles on the same client", async () => {
-    const base = httpClient();
-    const spy = spyClient(base);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getHttpUrl(),
+      namespace: uniqueNs(),
+      onRequest: t.onRequest,
+    });
+    const myCache = createCache(kv);
 
     const userKey = uniqueKey("user");
     const postKey = uniqueKey("post");
@@ -171,17 +180,21 @@ describe("cache — HTTP backend", () => {
 
     // Populate both handles
     await Promise.all([getUser(), getPost()]);
-    spy.reset();
+    t.reset();
 
     // Two different handles, same client — reads must share one batch() call
     await Promise.all([getUser(), getPost()]);
-    expect(spy.calls()).toBe(1);
+    expect(t.calls()).toBe(1);
   });
 
   it("coalesces concurrent writes (misses) into one batch() call", async () => {
-    const base = httpClient();
-    const spy = spyClient(base);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getHttpUrl(),
+      namespace: uniqueNs(),
+      onRequest: t.onRequest,
+    });
+    const myCache = createCache(kv);
 
     const k1 = uniqueKey("w");
     const k2 = uniqueKey("w");
@@ -191,10 +204,9 @@ describe("cache — HTTP backend", () => {
     }
     const getVal = myCache(fetchVal, { key: (k: string) => k, ttl: 60 });
 
-    spy.reset();
     // 3 concurrent misses → 1 batch() for reads + 1 batch() for writes = 2 total
     await Promise.all([getVal(k1), getVal(k2), getVal(k3)]);
-    expect(spy.calls()).toBe(2);
+    expect(t.calls()).toBe(2);
   });
 
   it("stampede protection — fetcher called once for concurrent same-key misses", async () => {
@@ -387,23 +399,27 @@ describe("cache — HTTP backend", () => {
   });
 
   it("createCache routes through the provided client, not the default", async () => {
-    const custom = httpClient();
-    const spy = spyClient(custom);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getHttpUrl(),
+      namespace: uniqueNs(),
+      onRequest: t.onRequest,
+    });
+    const myCache = createCache(kv);
     const key = uniqueKey("cc");
     async function fetchVal() {
       return "val";
     }
     const getVal = myCache(fetchVal, { key, ttl: 60 });
 
-    // Miss + write = 2 batch() calls through the custom client
+    // Miss + write = 2 round-trips through the custom client (GET for miss, SET for write)
     await getVal();
-    expect(spy.calls()).toBe(2);
+    expect(t.total()).toBe(2);
 
-    // Hit = 1 more batch() call
-    spy.reset();
+    // Hit = 1 more round-trip (GET)
+    t.reset();
     await getVal();
-    expect(spy.calls()).toBe(1);
+    expect(t.total()).toBe(1);
   });
 });
 
@@ -443,9 +459,14 @@ describe("cache — RESP backend", () => {
   });
 
   it("coalesces concurrent reads into one batch() call", async () => {
-    const base = client();
-    const spy = spyClient(base);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getRespUrl(),
+      db: 3,
+      onRequest: t.onRequest,
+    });
+    clients.push(kv);
+    const myCache = createCache(kv);
 
     const k1 = uniqueKey("rc");
     const k2 = uniqueKey("rc");
@@ -455,16 +476,21 @@ describe("cache — RESP backend", () => {
     const getVal = myCache(fetchVal, { key: (k: string) => k, ttl: 60 });
 
     await Promise.all([getVal(k1), getVal(k2)]);
-    spy.reset();
+    t.reset();
 
     await Promise.all([getVal(k1), getVal(k2)]);
-    expect(spy.calls()).toBe(1);
+    expect(t.calls()).toBe(1);
   });
 
   it("coalesces reads across different cache handles on the same client", async () => {
-    const base = client();
-    const spy = spyClient(base);
-    const myCache = createCache(spy.client);
+    const t = batchTracker();
+    const kv = createKvClient({
+      url: getRespUrl(),
+      db: 3,
+      onRequest: t.onRequest,
+    });
+    clients.push(kv);
+    const myCache = createCache(kv);
 
     const k1 = uniqueKey("rch1");
     const k2 = uniqueKey("rch2");
@@ -478,10 +504,10 @@ describe("cache — RESP backend", () => {
     const getB = myCache(fetchB, { key: k2, ttl: 60 });
 
     await Promise.all([getA(), getB()]);
-    spy.reset();
+    t.reset();
 
     await Promise.all([getA(), getB()]);
-    expect(spy.calls()).toBe(1);
+    expect(t.calls()).toBe(1);
   });
 
   it("stampede protection — fetcher called once for concurrent same-key misses", async () => {

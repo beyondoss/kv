@@ -491,6 +491,119 @@ export interface KvRawClientOptions {
 
 const DEFAULT_LOCK_TTL = 30;
 
+// ── Per-client coalescing ─────────────────────────────────────────────────────
+//
+// get() and set() calls within the same microtask tick are collapsed into a
+// single batch() round-trip. Identical gets for the same key share one result.
+
+type PendingGet = {
+  key: string;
+  waiters: Array<(r: KvResult<Entry | null>) => void>;
+};
+type PendingSet = {
+  key: string;
+  value: string | Uint8Array;
+  opts?: SetOptions;
+  resolve(r: KvResult<void>): void;
+};
+type CoalesceState = {
+  gets: Map<string, PendingGet>;
+  sets: PendingSet[];
+  scheduled: boolean;
+};
+
+function withCoalescing(inner: KvClient): KvClient {
+  const state: CoalesceState = { gets: new Map(), sets: [], scheduled: false };
+
+  function schedule(): void {
+    if (state.scheduled) return;
+    state.scheduled = true;
+    Promise.resolve().then(flush);
+  }
+
+  async function flush(): Promise<void> {
+    state.scheduled = false;
+    const gets = [...state.gets.values()];
+    const sets = [...state.sets];
+    state.gets.clear();
+    state.sets.length = 0;
+    if (!gets.length && !sets.length) return;
+
+    // Single-op shortcut: preserves command names and metadata-error hooks for solo calls.
+    if (gets.length === 1 && sets.length === 0) {
+      const [g] = gets;
+      const result = await inner.get(g!.key);
+      g!.waiters.forEach((r) => r(result));
+      return;
+    }
+    if (gets.length === 0 && sets.length === 1) {
+      const [s] = sets;
+      const result = await inner.set(s!.key, s!.value, s!.opts);
+      s!.resolve(result as KvResult<void>);
+      return;
+    }
+
+    const ops: BatchOp[] = [
+      ...gets.map((g) => ({ op: "get" as const, key: g.key })),
+      ...sets.map((s) =>
+        s.opts !== undefined
+          ? { op: "set" as const, key: s.key, value: s.value, opts: s.opts }
+          : { op: "set" as const, key: s.key, value: s.value }
+      ),
+    ];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await inner.batch(ops as any);
+
+    if (result.error) {
+      const err = result.error;
+      for (const g of gets) {
+        g.waiters.forEach((r) => r({ data: undefined, error: err }));
+      }
+      for (const s of sets) s.resolve({ data: undefined, error: err });
+      return;
+    }
+
+    const data = result.data as Array<Entry | null | undefined>;
+    for (let i = 0; i < gets.length; i++) {
+      const entry = (data[i] ?? null) as Entry | null;
+      gets[i]!.waiters.forEach((r) => r({ data: entry, error: undefined }));
+    }
+    for (const s of sets) s.resolve({ data: undefined, error: undefined });
+  }
+
+  return {
+    ...inner,
+    get(key: string): Promise<KvResult<Entry | null>> {
+      return new Promise((resolve) => {
+        let pending = state.gets.get(key);
+        if (!pending) {
+          pending = { key, waiters: [] };
+          state.gets.set(key, pending);
+        }
+        pending.waiters.push(resolve);
+        schedule();
+      });
+    },
+    set(
+      key: string,
+      value: string | Uint8Array,
+      opts?: SetOptions,
+    ): Promise<KvResult<void>> {
+      // Conditional writes need independent semantics — don't coalesce them.
+      if (opts?.ifAbsent || opts?.ifPresent || opts?.ifMatch !== undefined) {
+        return inner.set(key, value, opts);
+      }
+      return new Promise((resolve) => {
+        const entry: PendingSet = { key, value, resolve };
+        if (opts !== undefined) entry.opts = opts;
+        state.sets.push(entry);
+        schedule();
+      });
+    },
+  };
+}
+
 /**
  * Builds `lock` and `tryLock` on top of standard KvClient primitives.
  * Shared by both backends — spread the result into the returned client object.
@@ -687,15 +800,17 @@ export function createKvClient<Map extends KvSchemaMap>(
     ?? (env["BEYOND_KV_DB"] != null ? Number(env["BEYOND_KV_DB"]) : undefined);
   const httpNamespace = (resolved as KvHttpClientOptions).namespace
     ?? env["BEYOND_KV_NAMESPACE"];
-  const base: KvClient = protocol === "redis:" || protocol === "rediss:"
-    ? createRespKvClient({
-      ...(resolved as KvRespClientOptions),
-      ...(respDb !== undefined && { db: respDb }),
-    })
-    : createHttpKvClient({
-      ...(resolved as KvHttpClientOptions),
-      ...(httpNamespace !== undefined && { namespace: httpNamespace }),
-    });
+  const base: KvClient = withCoalescing(
+    protocol === "redis:" || protocol === "rediss:"
+      ? createRespKvClient({
+        ...(resolved as KvRespClientOptions),
+        ...(respDb !== undefined && { db: respDb }),
+      })
+      : createHttpKvClient({
+        ...(resolved as KvHttpClientOptions),
+        ...(httpNamespace !== undefined && { namespace: httpNamespace }),
+      }),
+  );
 
   const { schema: schemaMap, ttl: defaultTtl } = opts ?? {};
 

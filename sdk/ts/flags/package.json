@@ -1,0 +1,88 @@
+{
+  "name": "@beyond.dev/flags",
+  "version": "0.1.0-dev",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beyondoss/kv.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "types": "./dist/index.d.mts"
+    },
+    "./hono": {
+      "import": "./dist/middleware/hono.mjs",
+      "types": "./dist/middleware/hono.d.mts"
+    },
+    "./express": {
+      "import": "./dist/middleware/express.mjs",
+      "types": "./dist/middleware/express.d.mts"
+    },
+    "./fastify": {
+      "import": "./dist/middleware/fastify.mjs",
+      "types": "./dist/middleware/fastify.d.mts"
+    },
+    "./next": {
+      "import": "./dist/middleware/next.mjs",
+      "types": "./dist/middleware/next.d.mts"
+    },
+    "./next/middleware": {
+      "import": "./dist/middleware/next-middleware.mjs",
+      "types": "./dist/middleware/next-middleware.d.mts"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@beyond.dev/kv": "*",
+    "std-env": "^3.9.0",
+    "tslib": "^2.8.1"
+  },
+  "peerDependencies": {
+    "express": ">=4",
+    "fastify": ">=4",
+    "fastify-plugin": ">=4",
+    "hono": ">=4",
+    "next": ">=14"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "fastify-plugin": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "express": "^5.0.0",
+    "fastify": "^5.0.0",
+    "fastify-plugin": "^5.0.0",
+    "hono": "^4.0.0",
+    "next": "^15.0.0",
+    "tsdown": "^0.21.10",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
+  }
+}

@@ -1,0 +1,274 @@
+import type { KvClient } from "@beyond.dev/kv";
+import { FlagError } from "./errors.js";
+import type {
+  FlagDef,
+  FlagsErrorEvent,
+  JsonValue,
+  UserPrefs,
+} from "./types.js";
+
+const DEF_PREFIX = "flags:def:";
+const USER_PREFIX = "flags:user:";
+
+const decoder = new TextDecoder();
+
+/**
+ * In-memory snapshot of all `flags:def:*` entries. Loaded once at boot, then
+ * kept in sync via `kv.watch()` (preferred) or polling (fallback).
+ *
+ * Reads are O(1) Map lookups — zero KV round-trips per flag eval.
+ */
+export class Snapshot {
+  private state = new Map<string, FlagDef>();
+  private readyPromise: Promise<void>;
+  private resolveReady!: () => void;
+  private watchAbort: AbortController | undefined;
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
+  private closed = false;
+  isReady = false;
+
+  readonly kv: KvClient;
+  readonly opts: {
+    refresh: number;
+    watch: boolean;
+    onError?: (e: FlagsErrorEvent) => void;
+  };
+
+  constructor(
+    kv: KvClient,
+    opts: {
+      refresh: number;
+      watch: boolean;
+      onError?: (e: FlagsErrorEvent) => void;
+    },
+  ) {
+    this.kv = kv;
+    this.opts = opts;
+    this.readyPromise = new Promise<void>((r) => {
+      this.resolveReady = r;
+    });
+  }
+
+  /** Resolves once the initial snapshot load has finished (success or failure). */
+  ready(): Promise<void> {
+    return this.readyPromise;
+  }
+
+  /** Returns a resolved promise if already loaded, otherwise the ready promise. */
+  awaitReady(): Promise<void> {
+    return this.isReady ? Promise.resolve() : this.readyPromise;
+  }
+
+  /** Lookup the current state for a flag. Returns `undefined` if absent. */
+  get(name: string): FlagDef | undefined {
+    return this.state.get(name);
+  }
+
+  /** Start the snapshot: initial load + background sync (watch or poll). */
+  start(): void {
+    void this.runInitialLoad();
+  }
+
+  private async runInitialLoad(): Promise<void> {
+    try {
+      await this.loadAll();
+    } catch (err) {
+      this.reportError("snapshot", err);
+    } finally {
+      this.isReady = true;
+      this.resolveReady();
+    }
+
+    if (this.closed) return;
+
+    if (this.opts.watch) {
+      void this.runWatch();
+    } else {
+      this.startPolling();
+    }
+  }
+
+  private async loadAll(): Promise<void> {
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const { data, error } = await this.kv.list(
+        cursor === undefined
+          ? { prefix: DEF_PREFIX }
+          : { prefix: DEF_PREFIX, cursor },
+      );
+      if (error) throw error;
+      const names = data.keys.map((k) => k.name);
+      if (names.length > 0) {
+        const entries = await this.kv.batchGet(names);
+        if (entries.error) throw entries.error;
+        for (let i = 0; i < names.length; i++) {
+          const fullKey = names[i] as string;
+          const entry = entries.data[i];
+          if (!entry) continue;
+          const flagName = fullKey.slice(DEF_PREFIX.length);
+          seen.add(flagName);
+          this.applyValue(flagName, entry.value);
+        }
+      }
+      cursor = data.nextCursor;
+    } while (cursor);
+
+    // Drop any flag that's no longer in KV.
+    for (const name of this.state.keys()) {
+      if (!seen.has(name)) this.state.delete(name);
+    }
+  }
+
+  private async runWatch(): Promise<void> {
+    let attempt = 0;
+    while (!this.closed) {
+      this.watchAbort = new AbortController();
+      const opts = { prefix: true, signal: this.watchAbort.signal };
+      const sessionStart = Date.now();
+      try {
+        for await (const event of this.kv.watch(DEF_PREFIX, opts)) {
+          if (this.closed) return;
+          if (event.type === "ready") continue;
+          if (event.type === "set") {
+            const flagName = event.key.slice(DEF_PREFIX.length);
+            this.applyValue(flagName, event.value);
+          } else if (event.type === "del") {
+            const flagName = event.key.slice(DEF_PREFIX.length);
+            this.state.delete(flagName);
+          }
+        }
+        // Stream ended cleanly (server close, LB timeout, graceful restart).
+        // Treat as a transient disconnect and reconnect with backoff.
+      } catch (err) {
+        if (this.closed) return;
+        this.reportError("watch", err);
+      }
+
+      if (this.closed) return;
+
+      // A long-lived session indicates the server is healthy; reset backoff.
+      if (Date.now() - sessionStart > 30_000) attempt = 0;
+
+      // Poll while waiting to reconnect so evals don't freeze on a stale snapshot.
+      this.startPolling();
+
+      const delayMs = Math.min(1_000 * 2 ** attempt, 60_000);
+      attempt++;
+      await new Promise<void>((r) => setTimeout(r, delayMs));
+      if (this.closed) return;
+
+      // Stop polling before re-establishing watch so we don't run both at once.
+      if (this.pollTimer !== undefined) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = undefined;
+      }
+    }
+  }
+
+  private startPolling(): void {
+    if (this.closed || this.pollTimer) return;
+    const intervalMs = Math.max(1, this.opts.refresh) * 1000;
+    this.pollTimer = setInterval(() => {
+      this.loadAll().catch((err) => this.reportError("snapshot", err));
+    }, intervalMs);
+    // Don't keep the event loop alive for our own polling.
+    if (typeof this.pollTimer === "object" && "unref" in this.pollTimer) {
+      (this.pollTimer as { unref: () => void }).unref();
+    }
+  }
+
+  private applyValue(flagName: string, raw: Uint8Array): void {
+    let parsed: FlagDef | undefined;
+    try {
+      parsed = decodeFlagDef(raw);
+    } catch (err) {
+      this.reportError("snapshot", err, flagName);
+      return;
+    }
+    if (parsed) this.state.set(flagName, parsed);
+  }
+
+  private reportError(
+    source: FlagsErrorEvent["source"],
+    err: unknown,
+    name?: string,
+  ): void {
+    if (!this.opts.onError) return;
+    const event: FlagsErrorEvent = {
+      source,
+      error: err instanceof Error
+        ? err
+        : new FlagError("kv_error", String(err)),
+    };
+    if (name !== undefined) event.name = name;
+    this.opts.onError(event);
+  }
+
+  /** Stop background sync and release resources. Idempotent. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.watchAbort?.abort();
+    this.watchAbort = undefined;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
+  }
+}
+
+// ── User pref helpers (per-id KV keys, fetched once per request) ──────────────
+
+/** Build the KV key for a flag definition. */
+export function defKey(flagName: string): string {
+  return DEF_PREFIX + flagName;
+}
+
+/** Build the KV key for a per-id pref bundle. */
+export function userKey(id: string): string {
+  return USER_PREFIX + id;
+}
+
+/**
+ * Fetch the per-id pref bundle for `id`. Returns `null` if the user has no
+ * prefs. Errors are reported through `onError` and surfaced as `null` so
+ * eval falls through to defaults rather than crashing.
+ */
+export async function fetchUserPrefs(
+  kv: KvClient,
+  id: string,
+  onError?: (e: FlagsErrorEvent) => void,
+): Promise<UserPrefs | null> {
+  const { data, error } = await kv.get(userKey(id));
+  if (error) {
+    onError?.({ source: "user-prefs", error, id });
+    return null;
+  }
+  if (!data) return null;
+  try {
+    return data.json<UserPrefs>();
+  } catch (err) {
+    onError?.({
+      source: "user-prefs",
+      error: err instanceof Error ? err : new Error(String(err)),
+      id,
+    });
+    return null;
+  }
+}
+
+function decodeFlagDef(value: Uint8Array): FlagDef | undefined {
+  const text = decoder.decode(value);
+  if (text.length === 0) return undefined;
+  const parsed = JSON.parse(text) as JsonValue;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new FlagError("invalid_state", "Flag def must be a JSON object");
+  }
+  if (typeof (parsed as Record<string, unknown>)["on"] !== "boolean") {
+    throw new FlagError(
+      "invalid_state",
+      "FlagDef.on must be a boolean (got: "
+        + JSON.stringify((parsed as Record<string, unknown>)["on"]) + ")",
+    );
+  }
+  return parsed as unknown as FlagDef;
+}

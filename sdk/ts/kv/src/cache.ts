@@ -1,6 +1,5 @@
 import type { KvClient } from "./client.js";
 import { kv } from "./index.js";
-import type { BatchOp, BatchSetOpts, Entry } from "./kv-types.js";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -102,113 +101,6 @@ type CacheFn = <TArgs extends unknown[], TReturn>(
   options: CacheOptions<TArgs>,
 ) => CacheHandle<TArgs, TReturn>;
 
-// ── Per-client batch state ────────────────────────────────────────────────────
-//
-// All cache handles sharing the same KvClient share one BatchState, so
-// concurrent reads and writes from different handles collapse into a single
-// client.batch() call per microtask tick.
-
-type Waiter = {
-  resolve(e: Entry | null): void;
-  reject(e: unknown): void;
-};
-
-type PendingGet = { key: string; waiters: Waiter[] };
-type PendingSet = {
-  key: string;
-  value: string;
-  opts?: BatchSetOpts;
-  resolve(): void;
-  reject(e: unknown): void;
-};
-
-type BatchState = {
-  gets: Map<string, PendingGet>;
-  sets: PendingSet[];
-  scheduled: boolean;
-};
-
-const stateByClient = new WeakMap<KvClient, BatchState>();
-
-function getState(client: KvClient): BatchState {
-  let s = stateByClient.get(client);
-  if (!s) {
-    s = { gets: new Map(), sets: [], scheduled: false };
-    stateByClient.set(client, s);
-  }
-  return s;
-}
-
-function scheduleFlush(client: KvClient, state: BatchState): void {
-  if (state.scheduled) return;
-  state.scheduled = true;
-  Promise.resolve().then(() => flush(client, state));
-}
-
-async function flush(client: KvClient, state: BatchState): Promise<void> {
-  state.scheduled = false;
-
-  const gets = [...state.gets.values()];
-  const sets = [...state.sets];
-  state.gets.clear();
-  state.sets.length = 0;
-
-  if (!gets.length && !sets.length) return;
-
-  const ops: BatchOp[] = [
-    ...gets.map((g) => ({ op: "get" as const, key: g.key })),
-    ...sets.map((s) =>
-      s.opts !== undefined
-        ? { op: "set" as const, key: s.key, value: s.value, opts: s.opts }
-        : { op: "set" as const, key: s.key, value: s.value }
-    ),
-  ];
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await client.batch(ops as any);
-
-  if (result.error) {
-    for (const g of gets) g.waiters.forEach((w) => w.reject(result.error));
-    for (const s of sets) s.reject(result.error);
-    return;
-  }
-
-  const data = result.data as Array<Entry | null | undefined>;
-  for (let i = 0; i < gets.length; i++) {
-    const entry = data[i] ?? null;
-    gets[i]!.waiters.forEach((w) => w.resolve(entry as Entry | null));
-  }
-  for (const s of sets) s.resolve();
-}
-
-function enqueueGet(client: KvClient, key: string): Promise<Entry | null> {
-  const state = getState(client);
-  return new Promise<Entry | null>((resolve, reject) => {
-    let pending = state.gets.get(key);
-    if (!pending) {
-      pending = { key, waiters: [] };
-      state.gets.set(key, pending);
-    }
-    pending.waiters.push({ resolve, reject });
-    scheduleFlush(client, state);
-  });
-}
-
-function enqueueSet(
-  client: KvClient,
-  key: string,
-  value: string,
-  opts?: BatchSetOpts,
-): Promise<void> {
-  const state = getState(client);
-  return new Promise<void>((resolve, reject) => {
-    const entry: PendingSet = { key, value, resolve, reject };
-    if (opts !== undefined) entry.opts = opts;
-    state.sets.push(entry);
-    scheduleFlush(client, state);
-  });
-}
-
 // ── Cache factory ─────────────────────────────────────────────────────────────
 
 /**
@@ -253,12 +145,12 @@ export function createCache(client: KvClient): CacheFn {
       const p = (async () => {
         try {
           const value = await fetcher(...args);
-          await enqueueSet(
-            client,
+          const { error } = await client.set(
             kvKey,
             JSON.stringify(value),
             storageTtl != null ? { ttl: storageTtl } : undefined,
           );
+          if (error) throw error;
           return value;
         } finally {
           inFlight.delete(kvKey);
@@ -272,7 +164,8 @@ export function createCache(client: KvClient): CacheFn {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const handle = async function(...args: TArgs): Promise<TReturn> {
       const kvKey = resolveKey(args);
-      const entry = await enqueueGet(client, kvKey);
+      const { data: entry, error } = await client.get(kvKey);
+      if (error) throw error;
 
       if (entry === null) {
         return fetchAndStore(kvKey, args);
@@ -311,9 +204,9 @@ export function createCache(client: KvClient): CacheFn {
  * a derivation function for parameterised ones. This keeps keys stable across
  * bundler minification and refactors.
  *
- * **Coalescing** — concurrent calls within the same microtask tick are
- * collapsed into a single `batch()` round-trip regardless of which handle they
- * come from. Reads and writes share the same batch.
+ * **Coalescing** — concurrent `get` and `set` calls within the same microtask
+ * tick are collapsed into a single `batch()` round-trip at the client level,
+ * so any combination of cache handles and direct client calls coalesce together.
  *
  * **Stampede protection** — concurrent callers for the same key while a fetch
  * is in-flight all receive the same Promise. The upstream is called exactly

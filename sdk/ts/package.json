@@ -1,6 +1,6 @@
 {
   "private": true,
-  "workspaces": ["kv", "rate-limit"],
+  "workspaces": ["kv", "rate-limit", "flags"],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
