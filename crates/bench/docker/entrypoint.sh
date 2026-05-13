@@ -56,10 +56,9 @@ print_header() {
 
 # ── Start Beyond ───────────────────────────────────────────────────────────────
 start_beyond() {
-    beyond-kv \
+    beyond-kv serve \
         --data-dir "$DATA_BEYOND" \
         --resp-port "$BEYOND_PORT" \
-        --http-port 4870 \
         --memory-bytes "$MEMORY_BYTES" \
         --threads "$BEYOND_SHARDS" \
         > "$LOG_DIR/beyond.log" 2>&1 &

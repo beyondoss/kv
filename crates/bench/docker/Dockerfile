@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
 # Honest KV bench: Beyond and Redis in the same Linux container, on loopback,
-# with matched durability. Build context must be the `beyond/` parent directory
-# so we can pull both `kv/` and the sibling `resp/` crate.
+# with matched durability. Build context is the kv/ root; beyond-resp is
+# fetched from crates.io.
 
 # ── Builder ─────────────────────────────────────────────────────────────────────
 FROM rust:1.92-slim-bookworm AS builder
@@ -16,12 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-# Sibling crates the workspace points at via `path = "../resp"`.
-COPY resp /src/resp
-COPY kv   /src/kv
-
 WORKDIR /src/kv
+COPY . /src/kv
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/kv/target \
     cargo build --release -p beyond-kv -p beyond-kv-bench && \
@@ -39,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /out/beyond-kv /usr/local/bin/beyond-kv
 COPY --from=builder /out/kv-bench  /usr/local/bin/kv-bench
-COPY kv/crates/bench/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY crates/bench/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # `docker run --init` injects tini as PID 1 so signals reach our trap and zombie

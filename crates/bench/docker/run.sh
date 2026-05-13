@@ -14,7 +14,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KV_ROOT="$(cd "$HERE/../../.." && pwd)"
-BUILD_CTX="$(cd "$KV_ROOT/.." && pwd)"   # contains both `kv/` and `resp/`
+BUILD_CTX="$KV_ROOT"
 
 IMAGE="beyond-kv-bench:latest"
 CONTAINER="beyond-kv-bench-run"
@@ -43,19 +43,20 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ $REBUILD -eq 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "==> Building $IMAGE (streaming kv + resp into build context)"
+    echo "==> Building $IMAGE"
     # Tar+pipe instead of pointing docker at the parent dir directly: the
     # parent contains target/ trees and other crates that would balloon the
     # build context to multi-GB. We ship only what the Dockerfile COPYs.
+    # beyond-resp is fetched from crates.io, so no sibling path copy needed.
     tar \
         -C "$BUILD_CTX" \
-        --exclude='*/target' \
-        --exclude='*/node_modules' \
-        --exclude='*/.git' \
-        --exclude='*/sdk' \
-        -cf - kv resp \
+        --exclude='./target' \
+        --exclude='./node_modules' \
+        --exclude='./.git' \
+        --exclude='./sdk' \
+        -cf - . \
     | docker build \
-        --file "kv/crates/bench/docker/Dockerfile" \
+        --file "crates/bench/docker/Dockerfile" \
         --tag  "$IMAGE" \
         -
 fi

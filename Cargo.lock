@@ -210,6 +210,8 @@ dependencies = [
 [[package]]
 name = "beyond-resp"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3cd1d85480a6bf0ba382444c86d7ae3fef4d647240af1cae0b4461b1720828"
 dependencies = [
  "bytes",
  "itoa",
