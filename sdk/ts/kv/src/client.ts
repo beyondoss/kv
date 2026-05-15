@@ -37,6 +37,24 @@ export type {
 } from "./kv-types.js";
 export type { operations } from "./types.js";
 
+/**
+ * mTLS / custom-CA options. Supply all three fields for mutual TLS, or just
+ * `ca` to pin a private CA without presenting a client certificate.
+ *
+ * - **Node / Bun**: forwarded to an undici `Agent` with `allowH2: true`.
+ * - **Deno**: forwarded to `Deno.createHttpClient`.
+ * - **RESP backend**: forwarded to the ioredis TLS socket and to the raw
+ *   `node:tls` socket used by the `watch` method.
+ */
+export interface TlsOptions {
+  /** PEM-encoded CA certificate (or array of certificates) to trust. */
+  ca?: string | string[];
+  /** PEM-encoded client certificate to present during the TLS handshake. */
+  cert?: string;
+  /** PEM-encoded private key matching `cert`. */
+  key?: string;
+}
+
 /** Emitted before each KV command. Pass `onRequest` to {@link KvClientOptions} to subscribe. */
 export interface KvRequestEvent {
   /** Logical command name: `"GET"`, `"SET"`, `"MGET"`, `"MSET"`, `"DEL"`, `"SCAN"`, `"BATCH"`. */
@@ -321,8 +339,15 @@ export interface KvHttpClientOptions extends KvBaseClientOptions {
   namespace?: string;
   /**
    * Custom `fetch` implementation for connection pooling or test mocking.
+   * When provided, takes precedence over `tls`.
    */
   fetch?: typeof globalThis.fetch;
+  /**
+   * TLS / mTLS options. When provided (and `fetch` is not), the SDK builds a
+   * TLS-aware fetch — undici `Agent` on Node/Bun, `Deno.createHttpClient` on Deno.
+   * See {@link TlsOptions} for per-runtime behaviour.
+   */
+  tls?: TlsOptions;
   /**
    * Called when an `x-kv-metadata` response header cannot be parsed as JSON.
    */
@@ -336,6 +361,15 @@ export interface KvRespClientOptions extends KvBaseClientOptions {
    * 0 → `default`, 1 → `db1`, …, 15 → `db15`. Default: 0.
    */
   db?: number;
+  /**
+   * TLS / mTLS options. Forwarded to the ioredis TLS socket and to the raw
+   * `node:tls` connection used by the `watch` method.
+   *
+   * TLS is also enabled implicitly when the URL scheme is `rediss://`.
+   * With `rediss://` you may omit `tls` entirely (trusting the system CA) or
+   * pass `tls` to supply custom cert material.
+   */
+  tls?: TlsOptions;
 }
 
 /** Union of HTTP and RESP options. Backend is selected from the URL scheme. */

@@ -1,5 +1,6 @@
 import Redis from "ioredis";
 import * as net from "node:net";
+import * as tls from "node:tls";
 
 import { createLockMethods } from "./client.js";
 import type { KvClient, KvRespClientOptions } from "./client.js";
@@ -54,12 +55,24 @@ function toKvError(err: unknown): KvError {
  * ```
  */
 export function createRespKvClient(opts: KvRespClientOptions): KvClient {
+  const isTlsUrl = opts.url.startsWith("rediss://");
+  const tlsOpts = isTlsUrl || opts.tls
+    ? {
+      ca: Array.isArray(opts.tls?.ca)
+        ? opts.tls.ca.join("\n")
+        : opts.tls?.ca,
+      cert: opts.tls?.cert,
+      key: opts.tls?.key,
+    }
+    : undefined;
+
   const redis = new Redis(opts.url, {
     db: opts.db ?? 0,
     commandTimeout: opts.timeout,
     maxRetriesPerRequest: opts.retries ?? 2,
     enableReadyCheck: false,
     lazyConnect: false,
+    ...(tlsOpts ? { tls: tlsOpts } : {}),
   });
 
   (redis as any).addBuiltinCommand("revision");
@@ -698,12 +711,22 @@ export function createRespKvClient(opts: KvRespClientOptions): KvClient {
       const signal = watchOpts?.signal;
       let lastRevision = watchOpts?.since ?? 0;
 
+      const respTlsOpts: RespTlsOptions = isTlsUrl || opts.tls
+        ? {
+          ca: Array.isArray(opts.tls?.ca)
+            ? opts.tls.ca.join("\n")
+            : opts.tls?.ca,
+          cert: opts.tls?.cert,
+          key: opts.tls?.key,
+        }
+        : undefined;
+
       while (true) {
         if (signal?.aborted) return;
 
         let conn: Resp3Conn | undefined;
         try {
-          conn = await openResp3Conn(host, port, signal);
+          conn = await openResp3Conn(host, port, respTlsOpts, signal);
           await conn.hello3();
           if (db !== 0) {
             await conn.sendAndRecv(encodeRespArgs("SELECT", String(db)));
@@ -951,16 +974,42 @@ class Resp3Conn {
   }
 }
 
+type RespTlsOptions =
+  | {
+    ca: string | undefined;
+    cert: string | undefined;
+    key: string | undefined;
+  }
+  | undefined;
+
 function openResp3Conn(
   host: string,
   port: number,
+  tlsOpts: RespTlsOptions,
   signal?: AbortSignal,
 ): Promise<Resp3Conn> {
   return new Promise((resolve, reject) => {
-    const sock = net.createConnection(port, host, () => {
+    let sock: net.Socket;
+    const onConnect = () => {
       sock.removeListener("error", reject);
-      resolve(new Resp3Conn(sock));
-    });
+      resolve(new Resp3Conn(sock as net.Socket));
+    };
+
+    if (tlsOpts) {
+      sock = tls.connect(
+        port,
+        host,
+        {
+          ca: tlsOpts.ca,
+          cert: tlsOpts.cert,
+          key: tlsOpts.key,
+        },
+        onConnect,
+      ) as unknown as net.Socket;
+    } else {
+      sock = net.createConnection(port, host, onConnect);
+    }
+
     sock.once("error", reject);
     if (signal) {
       const onAbort = () => {

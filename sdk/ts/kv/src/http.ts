@@ -1,5 +1,9 @@
 import { createLockMethods } from "./client.js";
-import type { KvHttpClient, KvHttpClientOptions } from "./client.js";
+import type {
+  KvHttpClient,
+  KvHttpClientOptions,
+  TlsOptions,
+} from "./client.js";
 import { KvError } from "./errors.js";
 import type {
   BatchOp,
@@ -22,6 +26,43 @@ import type {
 import { makeEntry } from "./kv-types.js";
 import type { components } from "./types.js";
 import { camelize } from "./utils/camelize.js";
+
+function buildTlsFetchPromise(
+  tls: TlsOptions,
+): Promise<typeof globalThis.fetch> {
+  const cas = Array.isArray(tls.ca) ? tls.ca : tls.ca ? [tls.ca] : undefined;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = globalThis as any;
+  if (
+    typeof g.Deno !== "undefined"
+    && typeof g.Deno.createHttpClient === "function"
+  ) {
+    const client = g.Deno.createHttpClient({
+      caCerts: cas,
+      certChain: tls.cert,
+      privateKey: tls.key,
+    });
+    return Promise.resolve(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (url: RequestInfo | URL, init?: RequestInit) =>
+        globalThis.fetch(url, { ...init, client } as any),
+    );
+  }
+
+  const _undici = "undici";
+  return (import(_undici) as Promise<any>)
+    .then(({ fetch: f, Agent }: any) => {
+      const connect: Record<string, unknown> = {};
+      if (cas != null) connect.ca = cas;
+      if (tls.cert != null) connect.cert = tls.cert;
+      if (tls.key != null) connect.key = tls.key;
+      const agent = new Agent({ allowH2: true, connect });
+      return (url: RequestInfo | URL, init?: RequestInit) =>
+        f(url, { ...(init ?? {}), dispatcher: agent }) as Promise<Response>;
+    })
+    .catch(() => globalThis.fetch);
+}
 
 interface BatchGetResult {
   value: string;
@@ -100,7 +141,23 @@ export function createHttpKvClient(opts: KvHttpClientOptions): KvHttpClient {
   const nsIdx = nsToIndex(opts.namespace ?? "default");
   const retries = opts.retries ?? 2;
   const { timeout, onRequest, onResponse, onMetadataParseError } = opts;
-  const fetchFn = opts.fetch ?? globalThis.fetch;
+
+  let fetchFn: typeof globalThis.fetch;
+  if (opts.fetch) {
+    fetchFn = opts.fetch;
+  } else if (opts.tls) {
+    const tlsFetchPromise = buildTlsFetchPromise(opts.tls);
+    let resolvedTls: typeof globalThis.fetch | undefined;
+    const tlsInit = tlsFetchPromise.then((f) => {
+      resolvedTls = f;
+    });
+    fetchFn = async (url, init) => {
+      if (!resolvedTls) await tlsInit;
+      return (resolvedTls ?? globalThis.fetch)(url, init);
+    };
+  } else {
+    fetchFn = globalThis.fetch;
+  }
 
   function valueUrl(key: string): string {
     return `${base}/v1/kv/${encodeURIComponent(key)}?ns=${nsIdx}`;
