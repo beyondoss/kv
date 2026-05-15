@@ -14,13 +14,13 @@ use bytes::Bytes;
 use futures_channel::mpsc::Receiver;
 use futures_util::StreamExt as FuturesStreamExt;
 use futures_util::stream::SelectAll;
-use monoio::net::TcpStream;
 use monoio_codec::Framed;
 
 use crate::cross_shard::{CrossShardRequest, OwnedKeyFilter, ShardSenders};
 use crate::dispatch::dispatch;
 use crate::metrics::Metrics;
 use crate::routing::shard_for_key;
+use crate::tls::{BeyondStream, TlsAcceptor};
 
 pub struct ConnState {
     pub ns: String,
@@ -60,6 +60,7 @@ pub async fn serve(
     cross_shard_txs: ShardSenders,
     cross_shard_wakeups: Arc<[StdUnixStream]>,
     metrics: Arc<Metrics>,
+    tls: Option<TlsAcceptor>,
 ) {
     crate::serve_loop(
         rx,
@@ -73,10 +74,21 @@ pub async fn serve(
             let cross_shard_txs = cross_shard_txs.clone();
             let cross_shard_wakeups = cross_shard_wakeups.clone();
             let metrics = metrics.clone();
+            let tls = tls.clone();
             monoio::spawn(async move {
                 let _guard = guard;
+                let stream = match tls {
+                    Some(acceptor) => match acceptor.accept(s).await {
+                        Ok(tls_s) => BeyondStream::Tls(Box::new(tls_s)),
+                        Err(e) => {
+                            tracing::debug!("RESP TLS handshake failed: {e}");
+                            return;
+                        }
+                    },
+                    None => BeyondStream::Plain(s),
+                };
                 handle_conn(
-                    s,
+                    stream,
                     store,
                     idle_timeout,
                     ConnState {
@@ -96,7 +108,7 @@ pub async fn serve(
 }
 
 async fn handle_conn(
-    stream: TcpStream,
+    stream: BeyondStream,
     store: Rc<ShardStore>,
     idle_timeout: Duration,
     state: ConnState,
@@ -241,7 +253,7 @@ async fn watch_subscribe_remote(
 }
 
 async fn run_key_watch_loop(
-    framed: &mut Framed<TcpStream, RespCodec>,
+    framed: &mut Framed<BeyondStream, RespCodec>,
     store: &ShardStore,
     state: &ConnState,
     keys: Vec<Bytes>,
@@ -313,7 +325,7 @@ async fn run_key_watch_loop(
 }
 
 async fn run_prefix_watch_loop(
-    framed: &mut Framed<TcpStream, RespCodec>,
+    framed: &mut Framed<BeyondStream, RespCodec>,
     store: &ShardStore,
     state: &ConnState,
     prefix: Bytes,
@@ -389,7 +401,7 @@ async fn run_prefix_watch_loop(
 }
 
 async fn watch_stream_loop(
-    framed: &mut Framed<TcpStream, RespCodec>,
+    framed: &mut Framed<BeyondStream, RespCodec>,
     mut rx: SelectAll<Receiver<WatchEvent>>,
 ) {
     use monoio::io::sink::Sink;
@@ -453,7 +465,7 @@ fn is_unwatch(value: &Value) -> bool {
 }
 
 async fn send_watch_push(
-    framed: &mut Framed<TcpStream, RespCodec>,
+    framed: &mut Framed<BeyondStream, RespCodec>,
     event: &WatchEvent,
 ) -> Result<(), ()> {
     use monoio::io::sink::Sink;

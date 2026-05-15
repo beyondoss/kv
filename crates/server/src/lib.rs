@@ -5,6 +5,9 @@ pub mod http;
 pub mod metrics;
 pub mod resp;
 pub mod routing;
+pub mod tls;
+
+pub use tls::{BeyondStream, TlsAcceptor};
 
 use std::cell::Cell;
 use std::net::SocketAddr;

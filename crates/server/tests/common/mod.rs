@@ -147,6 +147,7 @@ impl TestServer {
                                 beyond_kv::metrics::Metrics::new(),
                                 http_sync_failures,
                                 3,
+                                None,
                             )
                             .await;
                         });
@@ -161,6 +162,7 @@ impl TestServer {
                             cross_shard_txs,
                             cross_shard_wakeups,
                             beyond_kv::metrics::Metrics::new(),
+                            None,
                         )
                         .await;
                     });

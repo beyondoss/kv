@@ -184,6 +184,23 @@ fn main() -> anyhow::Result<()> {
     let readyz_sync_failure_threshold = cfg.readyz_sync_failure_threshold;
     tracing::info!(http_address, "HTTP server enabled");
 
+    // Load the TLS acceptor once and share it across worker threads. When any
+    // of cert/key/ca is missing we fall back to plaintext; passing only a
+    // subset is a misconfiguration we surface up-front.
+    let tls_acceptor: Option<beyond_kv::tls::TlsAcceptor> =
+        match (&cfg.tls_cert, &cfg.tls_key, &cfg.tls_ca) {
+            (Some(c), Some(k), Some(ca)) => {
+                let config = beyond_kv::tls::load_server_config(c, k, ca)?;
+                tracing::info!(cert = c, ca = ca, "mTLS enabled");
+                Some(beyond_kv::tls::TlsAcceptor::from(config))
+            }
+            (None, None, None) => None,
+            _ => anyhow::bail!(
+                "TLS misconfigured: BEYOND_TLS_CERT, BEYOND_TLS_KEY, and BEYOND_TLS_CA \
+                 must all be set together (or all unset)"
+            ),
+        };
+
     // Per-worker, per-protocol channel + wakeup pipe.
     let mut resp_senders: Vec<SyncSender<(TcpStream, SocketAddr)>> = Vec::with_capacity(n_threads);
     let mut resp_wakeup_writers: Vec<UnixStream> = Vec::with_capacity(n_threads);
@@ -245,6 +262,7 @@ fn main() -> anyhow::Result<()> {
                 let shutdown_error = shutdown_error.clone();
                 let metrics = metrics.clone();
                 let sync_failures = Arc::clone(&sync_failures);
+                let tls_acceptor = tls_acceptor.clone();
                 std::thread::Builder::new()
                     .name(format!("kv-worker-{i}"))
                     .spawn(move || {
@@ -349,6 +367,7 @@ fn main() -> anyhow::Result<()> {
                             let http_wakeups = cross_shard_wakeups.clone();
                             let http_metrics = metrics.clone();
                             let http_sync_failures = Arc::clone(&sync_failures);
+                            let http_tls = tls_acceptor.clone();
                             monoio::spawn(async move {
                                 beyond_kv::http::serve_routed(
                                     http_store,
@@ -364,6 +383,7 @@ fn main() -> anyhow::Result<()> {
                                     http_metrics,
                                     http_sync_failures,
                                     readyz_sync_failure_threshold,
+                                    http_tls,
                                 )
                                 .await;
                             });
@@ -392,6 +412,7 @@ fn main() -> anyhow::Result<()> {
                                 cross_shard_txs,
                                 cross_shard_wakeups,
                                 metrics.clone(),
+                                tls_acceptor,
                             )
                             .await;
 

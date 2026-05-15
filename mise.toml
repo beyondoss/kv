@@ -39,7 +39,7 @@ dir = "sdk/ts"
 run = "cargo test --lib"
 
 [tasks."test:integration:rs"]
-run = "cargo test --test cross_shard --test http --test resp"
+run = "cargo test --test cross_shard --test http --test resp --test tls"
 
 [tasks."test:integration:ts"]
 description = "Run TypeScript SDK e2e tests against a freshly-built debug server"

@@ -46,6 +46,19 @@ pub struct Config {
     /// Number of consecutive log-sync failures on any shard before /readyz returns 503.
     #[arg(long, env = "KV_READYZ_SYNC_FAILURE_THRESHOLD", default_value_t = 3)]
     pub readyz_sync_failure_threshold: u32,
+
+    /// Path to the PEM-encoded server certificate chain. When set together with
+    /// `tls_key` and `tls_ca`, the HTTP and RESP listeners require mTLS.
+    #[arg(long, env = "BEYOND_TLS_CERT")]
+    pub tls_cert: Option<String>,
+
+    /// Path to the PEM-encoded server private key.
+    #[arg(long, env = "BEYOND_TLS_KEY")]
+    pub tls_key: Option<String>,
+
+    /// Path to the PEM-encoded CA bundle used to verify client certificates.
+    #[arg(long, env = "BEYOND_TLS_CA")]
+    pub tls_ca: Option<String>,
 }
 
 impl Config {

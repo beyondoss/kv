@@ -36,7 +36,8 @@ use futures_util::stream::SelectAll;
 use monoio::io::{
     AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable, sink::Sink, stream::Stream,
 };
-use monoio::net::TcpStream;
+
+use crate::tls::{BeyondStream, TlsAcceptor};
 use monoio_http::common::body::{Body, BodyExt, FixedBody, HttpBody};
 use monoio_http::h1::codec::decoder::FillPayload;
 use monoio_http::h1::codec::decoder::RequestDecoder;
@@ -59,6 +60,7 @@ pub async fn serve_routed(
     metrics: Arc<Metrics>,
     sync_failures: Arc<[AtomicU32]>,
     sync_failure_threshold: u32,
+    tls: Option<TlsAcceptor>,
 ) {
     crate::serve_loop(
         rx,
@@ -73,10 +75,21 @@ pub async fn serve_routed(
             let wakeups = cross_shard_wakeups.clone();
             let metrics = metrics.clone();
             let sync_failures = sync_failures.clone();
+            let tls = tls.clone();
             monoio::spawn(async move {
                 let _guard = guard;
+                let stream = match tls {
+                    Some(acceptor) => match acceptor.accept(s).await {
+                        Ok(tls_s) => BeyondStream::Tls(Box::new(tls_s)),
+                        Err(e) => {
+                            tracing::debug!("HTTP TLS handshake failed: {e}");
+                            return;
+                        }
+                    },
+                    None => BeyondStream::Plain(s),
+                };
                 handle_conn(
-                    s,
+                    stream,
                     store,
                     idle_timeout,
                     max_value_bytes,
@@ -97,7 +110,7 @@ pub async fn serve_routed(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_conn(
-    stream: TcpStream,
+    stream: BeyondStream,
     store: Rc<ShardStore>,
     idle_timeout: Duration,
     max_value_bytes: usize,
@@ -111,7 +124,7 @@ async fn handle_conn(
 ) {
     // Split so we can keep the write half for SSE streaming later.
     let (r, mut w) = stream.into_split();
-    let mut decoder: RequestDecoder<OwnedReadHalf<TcpStream>> = RequestDecoder::new(r);
+    let mut decoder: RequestDecoder<OwnedReadHalf<BeyondStream>> = RequestDecoder::new(r);
 
     loop {
         let req = match monoio::time::timeout(idle_timeout, Stream::next(&mut decoder)).await {
@@ -1791,7 +1804,7 @@ fn parse_watch_params(path: &str, query: &str) -> Option<WatchParams> {
 }
 
 async fn handle_watch_sse(
-    w: &mut OwnedWriteHalf<TcpStream>,
+    w: &mut OwnedWriteHalf<BeyondStream>,
     store: &ShardStore,
     params: WatchParams,
     shard_idx: usize,

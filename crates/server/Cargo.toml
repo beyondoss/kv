@@ -27,8 +27,11 @@ mimalloc.workspace = true
 monoio.workspace = true
 monoio-codec.workspace = true
 monoio-http.workspace = true
+monoio-rustls.workspace = true
 prometheus.workspace = true
 rustc-hash.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -43,7 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 base64.workspace = true
+rcgen = "0.14"
 redis = { version = "0.27", features = ["tcp_nodelay"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ureq = "2"
 urlencoding = "2"

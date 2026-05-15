@@ -121,6 +121,7 @@ impl ShardedServer {
                                             .collect::<Vec<_>>(),
                                     ),
                                     3,
+                                    None,
                                 )
                                 .await;
                             });
@@ -135,6 +136,7 @@ impl ShardedServer {
                                 cross_shard_txs,
                                 cross_shard_wakeups,
                                 beyond_kv::metrics::Metrics::new(),
+                                None,
                             )
                             .await;
                         });
