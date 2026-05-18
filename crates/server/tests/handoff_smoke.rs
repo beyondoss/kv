@@ -13,9 +13,35 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Kill + reap on drop unless `disarm`ed. Without this, a panic between spawn
+/// and the `try_wait` loop drops the `Child` without killing — leaving an
+/// orphan whose tempdir gets cleaned out from under it.
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn new(c: Child) -> Self {
+        Self(Some(c))
+    }
+    fn as_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("disarmed")
+    }
+    fn disarm(mut self) -> Child {
+        self.0.take().expect("disarmed twice")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
 
 use handoff::frame::{read_message, write_message};
 use handoff::protocol::{HandoffId, Message, PROTO_MAX};
@@ -46,23 +72,25 @@ fn full_handoff_protocol_exits_kv_on_commit() {
     let resp_port = ephemeral_port();
     let http_addr = format!("127.0.0.1:{}", ephemeral_port());
 
-    let mut child = Command::new(TEST_BINARY)
-        .arg("serve")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("--resp-port")
-        .arg(resp_port.to_string())
-        .arg("--http-address")
-        .arg(&http_addr)
-        .arg("--threads")
-        .arg("1")
-        .arg("--handoff-socket-path")
-        .arg(&sock_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn beyond-kv");
+    let mut child = KillOnDrop::new(
+        Command::new(TEST_BINARY)
+            .arg("serve")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--resp-port")
+            .arg(resp_port.to_string())
+            .arg("--http-address")
+            .arg(&http_addr)
+            .arg("--threads")
+            .arg("1")
+            .arg("--handoff-socket-path")
+            .arg(&sock_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn beyond-kv"),
+    );
 
     assert!(
         wait_for_path(&sock_path, 10),
@@ -137,19 +165,19 @@ fn full_handoff_protocol_exits_kv_on_commit() {
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match child.try_wait().unwrap() {
+        match child.as_mut().try_wait().unwrap() {
             Some(status) => {
                 assert!(
                     status.success() || status.code() == Some(0),
                     "KV exited with: {status:?}"
                 );
+                let _ = child.disarm();
                 return;
             }
             None if Instant::now() < exit_deadline => {
                 thread::sleep(Duration::from_millis(50));
             }
             None => {
-                let _ = child.kill();
                 panic!("KV did not exit within 10s of Commit");
             }
         }

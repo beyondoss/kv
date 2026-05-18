@@ -9,8 +9,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use beyond_kv::cross_shard;
@@ -22,11 +23,38 @@ const N_SHARDS: usize = 4;
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 struct ShardedServer {
     _serial: std::sync::MutexGuard<'static, ()>,
     _tmp: TempDir,
     resp_port: u16,
     http_port: u16,
+    shutdown: Arc<AtomicBool>,
+    threads: Option<ServerThreads>,
+}
+
+struct ServerThreads {
+    listener_resp: JoinHandle<()>,
+    listener_http: JoinHandle<()>,
+    shards: Vec<JoinHandle<()>>,
+}
+
+impl Drop for ShardedServer {
+    fn drop(&mut self) {
+        // See crates/server/tests/common/mod.rs for the shutdown rationale.
+        if let Some(threads) = self.threads.take() {
+            self.shutdown.store(true, Ordering::Release);
+            let _ = threads.listener_resp.join();
+            let _ = threads.listener_http.join();
+            // Listener threads dropped the senders / wakeup writers above;
+            // the per-shard serve loops now see EOF on their wakeup pipes and
+            // block_on completes — letting each shard runtime drop cleanly.
+            for h in threads.shards {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl ShardedServer {
@@ -34,10 +62,13 @@ impl ShardedServer {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_owned();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        let resp_listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let resp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        resp_listener.set_nonblocking(true).unwrap();
         let resp_port = resp_listener.local_addr().unwrap().port();
-        let http_listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        http_listener.set_nonblocking(true).unwrap();
         let http_port = http_listener.local_addr().unwrap().port();
 
         let mut resp_senders: Vec<SyncSender<(TcpStream, SocketAddr)>> =
@@ -77,6 +108,7 @@ impl ShardedServer {
             .zip(cross_wake_reads)
             .zip(http_inboxes)
             .collect();
+        let mut shard_handles: Vec<JoinHandle<()>> = Vec::with_capacity(N_SHARDS);
         for (
             (((i, (resp_rx, resp_wake_read)), cross_rx), cross_wake_read),
             (http_rx, http_wake_read),
@@ -85,7 +117,7 @@ impl ShardedServer {
             let cross_shard_txs = cross_shard_txs.clone();
             let cross_shard_wakeups = cross_shard_wakeups.clone();
             let shard_dir = data_dir.join(format!("shard-{i}"));
-            std::thread::Builder::new()
+            let h = std::thread::Builder::new()
                 .name(format!("kv-test-shard-{i}"))
                 .spawn(move || {
                     monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
@@ -142,49 +174,71 @@ impl ShardedServer {
                         });
                 })
                 .expect("spawn shard thread");
+            shard_handles.push(h);
         }
 
-        // RESP accept thread: peek the first key, route to that shard.
-        std::thread::spawn(move || {
-            let rr = AtomicUsize::new(0);
-            for stream in resp_listener.incoming().flatten() {
-                let peer = match stream.peer_addr() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                let idx = match peek_resp_key(&stream) {
-                    Some(k) => shard_for_key(&k, N_SHARDS),
-                    None => rr.fetch_add(1, Ordering::Relaxed) % N_SHARDS,
-                };
-                if resp_senders[idx].send((stream, peer)).is_err() {
-                    break;
-                }
-                if resp_wakeup_writers[idx].write_all(&[1u8]).is_err() {
-                    break;
-                }
-            }
-        });
+        // RESP accept thread: peek the first key, route to that shard. Polls
+        // (non-blocking accept + short sleep) so it can observe `shutdown`.
+        let listener_resp = {
+            let shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("kv-test-resp-listener-{resp_port}"))
+                .spawn(move || {
+                    let rr = AtomicUsize::new(0);
+                    while !shutdown.load(Ordering::Acquire) {
+                        match resp_listener.accept() {
+                            Ok((stream, peer)) => {
+                                let idx = match peek_resp_key(&stream) {
+                                    Some(k) => shard_for_key(&k, N_SHARDS),
+                                    None => rr.fetch_add(1, Ordering::Relaxed) % N_SHARDS,
+                                };
+                                if resp_senders[idx].send((stream, peer)).is_err() {
+                                    break;
+                                }
+                                if resp_wakeup_writers[idx].write_all(&[1u8]).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("spawn resp listener thread")
+        };
 
         // HTTP accept thread: peek the URI key, route to that shard.
-        std::thread::spawn(move || {
-            let rr = AtomicUsize::new(0);
-            for stream in http_listener.incoming().flatten() {
-                let peer = match stream.peer_addr() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                let idx = match peek_http_key(&stream) {
-                    Some(k) => shard_for_key(&k, N_SHARDS),
-                    None => rr.fetch_add(1, Ordering::Relaxed) % N_SHARDS,
-                };
-                if http_senders[idx].send((stream, peer)).is_err() {
-                    break;
-                }
-                if http_wakeup_writers[idx].write_all(&[1u8]).is_err() {
-                    break;
-                }
-            }
-        });
+        let listener_http = {
+            let shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("kv-test-http-listener-{http_port}"))
+                .spawn(move || {
+                    let rr = AtomicUsize::new(0);
+                    while !shutdown.load(Ordering::Acquire) {
+                        match http_listener.accept() {
+                            Ok((stream, peer)) => {
+                                let idx = match peek_http_key(&stream) {
+                                    Some(k) => shard_for_key(&k, N_SHARDS),
+                                    None => rr.fetch_add(1, Ordering::Relaxed) % N_SHARDS,
+                                };
+                                if http_senders[idx].send((stream, peer)).is_err() {
+                                    break;
+                                }
+                                if http_wakeup_writers[idx].write_all(&[1u8]).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("spawn http listener thread")
+        };
 
         wait_for_port(resp_port);
         wait_for_port(http_port);
@@ -193,6 +247,12 @@ impl ShardedServer {
             _tmp: tmp,
             resp_port,
             http_port,
+            shutdown,
+            threads: Some(ServerThreads {
+                listener_resp,
+                listener_http,
+                shards: shard_handles,
+            }),
         }
     }
 

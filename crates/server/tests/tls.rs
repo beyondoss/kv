@@ -5,8 +5,11 @@
 //! into `http::serve_routed`. The test client uses `reqwest` over rustls.
 
 use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
@@ -85,6 +88,21 @@ pub struct TlsTestServer {
     _key_file: NamedTempFile,
     _ca_file: NamedTempFile,
     _tmp_dir: tempfile::TempDir,
+    shutdown: Arc<AtomicBool>,
+    threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
+}
+
+impl Drop for TlsTestServer {
+    fn drop(&mut self) {
+        // Mirrors crates/server/tests/common/mod.rs: signal the listener to
+        // exit, then join all threads so the monoio runtime (and its io_uring
+        // queue) is fully reclaimed before the next test starts.
+        if let Some((listener, runtime)) = self.threads.take() {
+            self.shutdown.store(true, Ordering::Release);
+            let _ = listener.join();
+            let _ = runtime.join();
+        }
+    }
 }
 
 fn start_tls_server(certs: &CertBundle) -> TlsTestServer {
@@ -102,33 +120,48 @@ fn start_tls_server(certs: &CertBundle) -> TlsTestServer {
 
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let data_dir = tmp_dir.path().to_owned();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    http_listener.set_nonblocking(true).unwrap();
     let http_port = http_listener.local_addr().unwrap().port();
 
     let (http_tx, http_rx) =
         std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
-    let (http_wakeup_read, http_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (http_wakeup_read, http_wakeup_write) = UnixStream::pair().unwrap();
 
     // Bridge the std listener to the worker channel; mirrors the production
-    // accept loop but without per-shard routing (single shard).
-    std::thread::spawn(move || {
-        let mut w = http_wakeup_write;
-        for stream in http_listener.incoming().flatten() {
-            let peer = match stream.peer_addr() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if http_tx.send((stream, peer)).is_err() {
-                break;
-            }
-            if w.write_all(&[1u8]).is_err() {
-                break;
-            }
-        }
-    });
+    // accept loop but without per-shard routing (single shard). Polls every
+    // 10 ms so it can observe `shutdown` and exit cleanly on test teardown.
+    let listener_thread = {
+        let shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name(format!("kv-tls-test-listener-{http_port}"))
+            .spawn(move || {
+                let mut w = http_wakeup_write;
+                while !shutdown.load(Ordering::Acquire) {
+                    match http_listener.accept() {
+                        Ok((stream, peer)) => {
+                            if http_tx.send((stream, peer)).is_err() {
+                                break;
+                            }
+                            if w.write_all(&[1u8]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Dropping `w` closes the wakeup pipe; serve_routed sees EOF
+                // on its end and returns, completing block_on.
+            })
+            .expect("spawn tls listener thread")
+    };
 
-    std::thread::Builder::new()
+    let runtime_thread = std::thread::Builder::new()
         .name(format!("kv-tls-test-{http_port}"))
         .spawn(move || {
             monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
@@ -189,6 +222,8 @@ fn start_tls_server(certs: &CertBundle) -> TlsTestServer {
         _key_file: key_file,
         _ca_file: ca_file,
         _tmp_dir: tmp_dir,
+        shutdown,
+        threads: Some((listener_thread, runtime_thread)),
     }
 }
 

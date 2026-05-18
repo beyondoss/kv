@@ -1,7 +1,11 @@
 #![allow(dead_code)]
 use beyond_kv_engine::store::ShardStore;
 use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use tempfile::TempDir;
 
 fn wait_for_port(port: u16) {
@@ -22,13 +26,54 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A single-shard KV server running on two ephemeral ports.
 ///
 /// Both the HTTP and RESP listeners are live by the time `start()` returns.
-/// RocksDB data lives in a [`TempDir`] that is removed on drop.
+/// RocksDB data lives in a [`TempDir`] that is removed on drop. The runtime
+/// and listener threads are shut down and joined in [`Drop`], so each test
+/// fully reclaims its resources before the next one starts.
 pub struct TestServer {
     // Holds the serial lock for the duration of the test; released on drop.
     _serial: std::sync::MutexGuard<'static, ()>,
     _tmp: TempDir,
     pub http_port: u16,
     pub resp_port: u16,
+    shutdown: Arc<AtomicBool>,
+    threads: Option<TestServerThreads>,
+}
+
+struct TestServerThreads {
+    listener_resp: JoinHandle<()>,
+    listener_http: JoinHandle<()>,
+    runtime: JoinHandle<()>,
+}
+
+// Polled by the listener threads while their TcpListeners are in non-blocking
+// mode. 10 ms keeps test startup snappy without spinning the CPU.
+const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn run_accept_loop(
+    listener: std::net::TcpListener,
+    tx: std::sync::mpsc::SyncSender<(std::net::TcpStream, std::net::SocketAddr)>,
+    mut wakeup: UnixStream,
+    shutdown: Arc<AtomicBool>,
+) {
+    use std::io::Write as _;
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if tx.send((stream, peer)).is_err() {
+                    break;
+                }
+                if wakeup.write_all(&[1u8]).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(_) => break,
+        }
+    }
+    // Dropping `wakeup` (the writer end) closes the pipe; the monoio serve
+    // loop reads EOF on its end and returns, which lets block_on complete.
 }
 
 impl TestServer {
@@ -43,53 +88,38 @@ impl TestServer {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_owned();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        let resp_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let resp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        resp_listener.set_nonblocking(true).unwrap();
         let resp_port = resp_listener.local_addr().unwrap().port();
-        let http_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        http_listener.set_nonblocking(true).unwrap();
         let http_port = http_listener.local_addr().unwrap().port();
 
         let (resp_tx, resp_rx) =
             std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
-        let (resp_wakeup_read, resp_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (resp_wakeup_read, resp_wakeup_write) = UnixStream::pair().unwrap();
         let (http_tx, http_rx) =
             std::sync::mpsc::sync_channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
-        let (http_wakeup_read, http_wakeup_write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (http_wakeup_read, http_wakeup_write) = UnixStream::pair().unwrap();
 
-        std::thread::spawn(move || {
-            use std::io::Write as _;
-            let mut w = resp_wakeup_write;
-            for stream in resp_listener.incoming().flatten() {
-                let peer = match stream.peer_addr() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if resp_tx.send((stream, peer)).is_err() {
-                    break;
-                }
-                if w.write_all(&[1u8]).is_err() {
-                    break;
-                }
-            }
-        });
-        std::thread::spawn(move || {
-            use std::io::Write as _;
-            let mut w = http_wakeup_write;
-            for stream in http_listener.incoming().flatten() {
-                let peer = match stream.peer_addr() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if http_tx.send((stream, peer)).is_err() {
-                    break;
-                }
-                if w.write_all(&[1u8]).is_err() {
-                    break;
-                }
-            }
-        });
+        let listener_resp = {
+            let shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("kv-test-resp-listener-{resp_port}"))
+                .spawn(move || run_accept_loop(resp_listener, resp_tx, resp_wakeup_write, shutdown))
+                .expect("spawn resp listener thread")
+        };
+        let listener_http = {
+            let shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("kv-test-http-listener-{http_port}"))
+                .spawn(move || run_accept_loop(http_listener, http_tx, http_wakeup_write, shutdown))
+                .expect("spawn http listener thread")
+        };
 
-        std::thread::Builder::new()
+        let runtime = std::thread::Builder::new()
             .name(format!("kv-test-shards{n_shards}-{http_port}"))
             .spawn(move || {
                 monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
@@ -177,6 +207,12 @@ impl TestServer {
             _tmp: tmp,
             http_port,
             resp_port,
+            shutdown,
+            threads: Some(TestServerThreads {
+                listener_resp,
+                listener_http,
+                runtime,
+            }),
         }
     }
 
@@ -280,6 +316,27 @@ impl TestServer {
             .unwrap()
             .get_connection()
             .unwrap()
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        // Shutdown sequence:
+        //   1. Flip the shutdown flag; both listener threads exit their poll
+        //      loops at the next iteration (≤ ACCEPT_POLL_INTERVAL).
+        //   2. Listener threads drop their wakeup-pipe writer ends.
+        //   3. The monoio serve loops read EOF on those pipes, return, and
+        //      block_on completes — dropping the runtime and freeing every
+        //      io_uring queue / FD it owned.
+        // Joining all three threads here means temp-dir cleanup (handled by
+        // the _tmp field) never races against a ShardStore that still holds
+        // file descriptors into it.
+        if let Some(threads) = self.threads.take() {
+            self.shutdown.store(true, Ordering::Release);
+            let _ = threads.listener_resp.join();
+            let _ = threads.listener_http.join();
+            let _ = threads.runtime.join();
+        }
     }
 }
 
