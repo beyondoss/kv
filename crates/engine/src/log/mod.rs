@@ -199,13 +199,17 @@ impl NamespaceLog {
         self.sealed.borrow().len()
     }
 
+    /// Returns the tstamp (revision) assigned to this write. Callers must use
+    /// this — NOT [`last_revision`](Self::last_revision) — for cache updates
+    /// and client-visible revisions, because concurrent writes increment
+    /// `last_tstamp` before any one of them commits.
     pub async fn put_full(
         &self,
         key: Bytes,
         value: &[u8],
         metadata: &[u8],
         expires_at_ms: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
@@ -232,15 +236,19 @@ impl NamespaceLog {
         if active.write_offset() >= self.config.rotate_threshold {
             self.rotate_active().await?;
         }
-        Ok(())
+        Ok(tstamp)
     }
 
     /// Conditional write: write only if the current live state of `key` satisfies `cond`.
     ///
-    /// Returns `Ok(true)` if written and indexed, `Ok(false)` if the condition was not
-    /// met. A concurrent write that lands during the disk-I/O await is detected by a
-    /// post-write re-check before the index is updated; if the race is lost the
-    /// on-disk record becomes an unreferenced orphan reclaimed during next compaction.
+    /// Returns `Ok(Some(tstamp))` if written and indexed, `Ok(None)` if the condition was
+    /// not met. The returned tstamp is THIS write's revision — callers must use it
+    /// instead of [`last_revision`](Self::last_revision) when updating caches or
+    /// returning a revision to clients, because concurrent writes that pass pre-check
+    /// but later fail post-check still bump `last_tstamp`. A concurrent write that
+    /// lands during the disk-I/O await is detected by a post-write re-check before
+    /// the index is updated; if the race is lost the on-disk record becomes an
+    /// unreferenced orphan reclaimed during next compaction.
     pub async fn put_full_cond(
         &self,
         key: Bytes,
@@ -249,14 +257,14 @@ impl NamespaceLog {
         expires_at_ms: Option<u64>,
         cond: WriteCondition,
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<u64>> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
         // Pre-check: verify condition before incurring disk I/O.
         if !cond.check(Self::live_rev(&self.index.borrow(), &key, now)) {
-            return Ok(false);
+            return Ok(None);
         }
         let tstamp = self.next_tstamp();
         let mut flags = 0u8;
@@ -279,14 +287,14 @@ impl NamespaceLog {
         // modified the same key during the disk-I/O await will have already updated
         // the index; if that breaks our condition, abort without touching the index.
         if !cond.check(Self::live_rev(&self.index.borrow(), &key, now)) {
-            return Ok(false);
+            return Ok(None);
         }
         let entry = IndexEntry::new(active.file_id, offset, record_size, tstamp);
         self.index.borrow_mut().insert(key, entry, expires_at_ms);
         if active.write_offset() >= self.config.rotate_threshold {
             self.rotate_active().await?;
         }
-        Ok(true)
+        Ok(Some(tstamp))
     }
 
     fn live_rev(idx: &NsIndex, key: &[u8], now: u64) -> Option<u64> {
@@ -297,14 +305,17 @@ impl NamespaceLog {
         }
     }
 
-    /// Coalesce many puts into a single `write_at` + single `fsync`.
-    pub async fn put_many(&self, pairs: &[(Bytes, Bytes)]) -> Result<()> {
+    /// Coalesce many puts into a single `write_at` + single `fsync`. Returns
+    /// the tstamps assigned to each pair, in input order. Use these instead
+    /// of [`last_revision`](Self::last_revision) — concurrent writes can bump
+    /// `last_tstamp` higher than any tstamp this batch produced.
+    pub async fn put_many(&self, pairs: &[(Bytes, Bytes)]) -> Result<Vec<u64>> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
         if pairs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let estimated: usize = pairs
             .iter()
@@ -339,19 +350,22 @@ impl NamespaceLog {
         if active.write_offset() >= self.config.rotate_threshold {
             self.rotate_active().await?;
         }
-        Ok(())
+        Ok(layout.into_iter().map(|(_, _, t)| t).collect())
     }
 
     /// Append a tombstone for `key`; drop it from the index.
-    /// Returns true iff the key was present.
-    pub async fn tombstone(&self, key: &[u8]) -> Result<bool> {
+    /// Returns `Some(tstamp)` if the key was present and tombstoned, `None`
+    /// otherwise. Callers must use this tstamp (not [`last_revision`](Self::last_revision))
+    /// for watch events and any client-visible revision — concurrent writes
+    /// can bump `last_tstamp` beyond this specific tombstone's tstamp.
+    pub async fn tombstone(&self, key: &[u8]) -> Result<Option<u64>> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
         let was_present = self.index.borrow_mut().remove(key).is_some();
         if !was_present {
-            return Ok(false);
+            return Ok(None);
         }
         let tstamp = self.next_tstamp();
         let mut buf = pool_acquire_write(HEADER_LEN + key.len());
@@ -361,13 +375,20 @@ impl NamespaceLog {
         let (_, buf) = active.append(buf).await?;
         pool_release_write(buf);
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
-        Ok(true)
+        Ok(Some(tstamp))
     }
 
     /// Conditional tombstone: delete only if the current revision matches `expected_rev`.
-    /// Returns `Ok(true)` if tombstoned, `Ok(false)` if revision did not match.
+    /// Returns `Some(tstamp)` if tombstoned, `None` if revision did not match.
     /// Atomic: the index removal is synchronous (no yield between check and removal).
-    pub async fn tombstone_cond(&self, key: &[u8], expected_rev: u64, now: u64) -> Result<bool> {
+    /// Callers must use the returned tstamp, not [`last_revision`](Self::last_revision),
+    /// for client-visible revisions and watch events.
+    pub async fn tombstone_cond(
+        &self,
+        key: &[u8],
+        expected_rev: u64,
+        now: u64,
+    ) -> Result<Option<u64>> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
@@ -375,7 +396,7 @@ impl NamespaceLog {
         // Both check and removal happen without yielding — no interleaving possible.
         let current_rev = Self::live_rev(&self.index.borrow(), key, now);
         if current_rev != Some(expected_rev) {
-            return Ok(false);
+            return Ok(None);
         }
         self.index.borrow_mut().remove(key);
         // Disk write (yields, but index already updated)
@@ -387,11 +408,13 @@ impl NamespaceLog {
         let (_, buf) = active.append(buf).await?;
         pool_release_write(buf);
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
-        Ok(true)
+        Ok(Some(tstamp))
     }
 
-    /// Append a TTL-update record; modify only the sidecar.
-    pub async fn ttl_update(&self, key: &[u8], expires_at_ms: Option<u64>) -> Result<()> {
+    /// Append a TTL-update record; modify only the sidecar. Returns the
+    /// tstamp assigned to this update — callers must use it (not
+    /// [`last_revision`](Self::last_revision)) for watch events.
+    pub async fn ttl_update(&self, key: &[u8], expires_at_ms: Option<u64>) -> Result<u64> {
         let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
@@ -414,7 +437,7 @@ impl NamespaceLog {
         self.unsynced_bytes.set(self.unsynced_bytes.get() + buf_len);
         let key_bytes = Bytes::copy_from_slice(key);
         self.index.borrow_mut().set_ttl(&key_bytes, expires_at_ms);
-        Ok(())
+        Ok(tstamp)
     }
 
     fn locate_file(&self, file_id: u16) -> Option<Rc<LogFile>> {
@@ -712,13 +735,22 @@ impl NamespaceLog {
     /// with the parent fork (parent's inode still references the old blocks;
     /// the new active file's blocks are local).
     ///
+    /// Returns the tstamp assigned to this flush — use it (not
+    /// [`last_revision`](Self::last_revision)) when emitting per-key Del
+    /// watch events for the wiped namespace, so all events share a single
+    /// monotonic revision that's strictly newer than every prior write.
+    ///
     /// NOT safe under concurrent reads/writes — caller must serialize.
-    pub async fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<u64> {
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
         self.reclaim_in_progress.set(true);
-        let result = self.flush_inner().await;
+        // Burn a tstamp for the flush event itself. Doing this BEFORE the
+        // flush guarantees the revision exceeds anything previously committed
+        // (or even speculatively assigned by concurrent failed writes).
+        let revision = self.next_tstamp();
+        let result = self.flush_inner().await.map(|()| revision);
         self.reclaim_in_progress.set(false);
         result
     }

@@ -361,7 +361,7 @@ impl ShardStore {
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        if !nslog
+        let revision = match nslog
             .put_full_cond(
                 key_bytes.clone(),
                 &value,
@@ -372,9 +372,9 @@ impl ShardStore {
             )
             .await?
         {
-            return Ok(false);
-        }
-        let revision = nslog.last_revision();
+            Some(t) => t,
+            None => return Ok(false),
+        };
         self.upsert_cache(
             ns,
             key,
@@ -540,10 +540,9 @@ impl ShardStore {
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog
+        let revision = nslog
             .put_full(key_bytes.clone(), &value, &meta_bytes, expires_at_ms)
             .await?;
-        let revision = nslog.last_revision();
         self.upsert_cache(
             ns,
             key,
@@ -571,13 +570,12 @@ impl ShardStore {
     /// supported; use `set` for keys that require them.
     pub async fn mset(&self, ns: &str, pairs: &[(Bytes, Bytes)]) -> Result<()> {
         let nslog = self.ensure_ns(ns).await?;
-        nslog.put_many(pairs).await?;
-        let revision = nslog.last_revision();
-        for (key, value) in pairs {
+        let revisions = nslog.put_many(pairs).await?;
+        for ((key, value), &revision) in pairs.iter().zip(revisions.iter()) {
             self.upsert_cache(ns, key, value.clone(), None, None, 0, revision);
         }
         let mut w = self.watchers.borrow_mut();
-        for (key, value) in pairs {
+        for ((key, value), &revision) in pairs.iter().zip(revisions.iter()) {
             w.notify(
                 ns,
                 key,
@@ -611,11 +609,12 @@ impl ShardStore {
         }
 
         let mut count = 0u64;
-        let revision = nslog.last_revision();
-        for ((key, was_present), expired) in keys.iter().zip(tombstone_results).zip(was_expired) {
+        for ((key, tomb_result), expired) in keys.iter().zip(tombstone_results).zip(was_expired) {
             // Mirror the previous Rocks-based semantics: an expired-but-not-yet-tombstoned
             // key counts as 0 (already semantically gone).
-            if was_present? && !expired {
+            if let Some(revision) = tomb_result?
+                && !expired
+            {
                 count += 1;
                 self.watchers.borrow_mut().notify(
                     ns,
@@ -659,11 +658,10 @@ impl ShardStore {
         let new_ms = Self::validate_ttl(ttl, now)?;
         // Read value before evicting cache — needed for watch notification.
         let entry = self.get_inline(&nslog, ns, key, now, now_instant).await?;
-        nslog.ttl_update(key, Some(new_ms)).await?;
+        let revision = nslog.ttl_update(key, Some(new_ms)).await?;
         // L1 carries its own copy of expires_at_ms; refresh on next get.
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
         if let Some(e) = entry {
-            let revision = nslog.last_revision();
             self.watchers.borrow_mut().notify(
                 ns,
                 key,
@@ -696,10 +694,9 @@ impl ShardStore {
         }
         // Read value before evicting cache — needed for watch notification.
         let entry = self.get_inline(&nslog, ns, key, now, now_instant).await?;
-        nslog.ttl_update(key, None).await?;
+        let revision = nslog.ttl_update(key, None).await?;
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
         if let Some(e) = entry {
-            let revision = nslog.last_revision();
             self.watchers.borrow_mut().notify(
                 ns,
                 key,
@@ -804,8 +801,7 @@ impl ShardStore {
         let old = self.get_inline(&nslog, ns, key, now, now_instant).await?;
         // Inline set — same nslog, no second ensure_ns call.
         let key_bytes = Bytes::copy_from_slice(key);
-        nslog.put_full(key_bytes.clone(), &value, &[], None).await?;
-        let revision = nslog.last_revision();
+        let revision = nslog.put_full(key_bytes.clone(), &value, &[], None).await?;
         self.upsert_cache(ns, key, value.clone(), None, None, 0, revision);
         self.watchers.borrow_mut().notify(
             ns,
@@ -826,10 +822,9 @@ impl ShardStore {
         let now_instant = Instant::now();
         let nslog = self.ensure_ns(ns).await?;
         let old = self.get_inline(&nslog, ns, key, now, now_instant).await?;
-        nslog.tombstone(key).await?;
+        let tomb_rev = nslog.tombstone(key).await?;
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
-        if old.is_some() {
-            let revision = nslog.last_revision();
+        if let (Some(_), Some(revision)) = (&old, tomb_rev) {
             self.watchers.borrow_mut().notify(
                 ns,
                 key,
@@ -882,7 +877,7 @@ impl ShardStore {
             .transpose()?
             .unwrap_or_default();
         let key_bytes = Bytes::copy_from_slice(key);
-        if !nslog
+        let revision = match nslog
             .put_full_cond(
                 key_bytes.clone(),
                 &value,
@@ -893,9 +888,9 @@ impl ShardStore {
             )
             .await?
         {
-            return Ok(None);
-        }
-        let revision = nslog.last_revision();
+            Some(t) => t,
+            None => return Ok(None),
+        };
         self.upsert_cache(
             ns,
             key,
@@ -924,11 +919,11 @@ impl ShardStore {
     pub async fn delrev(&self, ns: &str, key: &[u8], expected_rev: u64) -> Result<Option<()>> {
         let now = now_ms();
         let nslog = self.ensure_ns(ns).await?;
-        if !nslog.tombstone_cond(key, expected_rev, now).await? {
-            return Ok(None);
-        }
+        let revision = match nslog.tombstone_cond(key, expected_rev, now).await? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
         Self::with_cache_key(ns, key, |ck| self.cache.remove(ck));
-        let revision = nslog.last_revision();
         self.watchers.borrow_mut().notify(
             ns,
             key,
@@ -1011,15 +1006,15 @@ impl ShardStore {
             let new_bytes = Bytes::from(new_val.to_string());
             let key_bytes = Bytes::copy_from_slice(key);
 
-            if !nslog
+            let revision = match nslog
                 .put_full_cond(key_bytes.clone(), &new_bytes, &[], expires_at_ms, cond, now)
                 .await?
             {
+                Some(t) => t,
                 // CAS lost to a concurrent write on this key; re-read and retry.
-                continue;
-            }
+                None => continue,
+            };
 
-            let revision = nslog.last_revision();
             self.upsert_cache(ns, key, new_bytes.clone(), expires_at_ms, None, 0, revision);
             self.watchers.borrow_mut().notify(
                 ns,
@@ -1271,7 +1266,6 @@ impl ShardStore {
         // Snapshot live keys before flush clears the index, so watch subscribers
         // receive a Del event for every key that just disappeared.
         let now = now_ms();
-        let revision = nslog.last_revision();
         let live_keys: Vec<Bytes> = {
             let idx = nslog.index.borrow();
             idx.iter()
@@ -1285,7 +1279,10 @@ impl ShardStore {
                 .collect()
         };
 
-        nslog.flush().await?;
+        // `flush()` returns a fresh tstamp that is strictly newer than every
+        // prior write — see its doc for why this beats reading last_revision()
+        // here under concurrent writers.
+        let revision = nslog.flush().await?;
 
         let mut w = self.watchers.borrow_mut();
         for key in live_keys {
@@ -2189,6 +2186,84 @@ mod tests {
             let result = s.delrev("default", b"k", 0).await.unwrap();
             assert!(result.is_none());
             assert!(get_value(&s, b"k").await.is_some());
+        });
+    }
+
+    /// Concurrent CAS on the same key: among N writers contending against the
+    /// same starting revision, exactly one wins. The revision the winner
+    /// returns must match the revision a subsequent GET reports, and a
+    /// follow-up setrev with that revision must succeed.
+    ///
+    /// Regression test for a cache/revision skew bug where successful
+    /// conditional writes were upserting the cache with `last_revision()`
+    /// (the GLOBAL tstamp counter) instead of THIS write's tstamp — failed
+    /// concurrent writers still bumped `next_tstamp` before their post-check
+    /// failed, so the cache ended up holding a tstamp higher than the one
+    /// actually committed to the index. Subsequent CAS using the cached
+    /// revision then failed pre-check ("revision mismatch") forever.
+    #[test]
+    fn concurrent_setrev_one_winner_consistent_revision() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"k", b"v0").await;
+            let start_rev = s.get("default", b"k").await.unwrap().unwrap().revision;
+
+            // Fire N concurrent setrev calls all expecting `start_rev`.
+            const N: usize = 8;
+            let futures = (0..N).map(|i| {
+                let s = &s;
+                async move {
+                    s.setrev(
+                        "default",
+                        b"k",
+                        Bytes::from(format!("v{}", i + 1)),
+                        SetOptions::default(),
+                        start_rev,
+                    )
+                    .await
+                    .unwrap()
+                }
+            });
+            let results = futures_util::future::join_all(futures).await;
+
+            // Exactly one must report Some(new_rev); the rest must be None.
+            let winners: Vec<u64> = results.iter().filter_map(|r| *r).collect();
+            assert_eq!(
+                winners.len(),
+                1,
+                "exactly one concurrent setrev must win, got {} winners",
+                winners.len()
+            );
+            let winner_rev = winners[0];
+
+            // The cache (and index) must agree with the winner's reported rev.
+            // If they don't, this is the bug we're guarding against: cached
+            // rev > committed rev, breaking every subsequent CAS.
+            let after = s.get("default", b"k").await.unwrap().unwrap();
+            assert_eq!(
+                after.revision, winner_rev,
+                "GET after concurrent setrev returned rev={} but the winner said it wrote rev={}",
+                after.revision, winner_rev
+            );
+
+            // And a follow-up CAS using that revision must succeed — this is
+            // the operation the cache-skew bug would have made impossible.
+            let follow_up = s
+                .setrev(
+                    "default",
+                    b"k",
+                    Bytes::from("vN"),
+                    SetOptions::default(),
+                    winner_rev,
+                )
+                .await
+                .unwrap();
+            assert!(
+                follow_up.is_some(),
+                "setrev with the revision GET just reported must succeed"
+            );
         });
     }
 

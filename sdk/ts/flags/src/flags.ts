@@ -194,14 +194,12 @@ async function mutateUserPrefs(
     }
     if (!casErr) return;
     if (casErr.status !== 409) throw casErr;
-    // Conflict: another writer beat us. Jittered backoff (0–10 ms ×
-    // 2^attempt, capped at 100 ms) lets contenders spread out instead of
-    // re-racing at exactly the same tick — without that, N concurrent
-    // writers can collide on every retry and exhaust the budget.
+    // Jittered exponential backoff: with N concurrent writers, microtask
+    // scheduling can keep them re-racing at exactly the same tick. The
+    // 0–10ms × 2^attempt window (capped at 100ms) spreads them out.
     const backoffMs = Math.min(100, Math.random() * 10 * 2 ** attempt);
     await new Promise<void>((r) => setTimeout(r, backoffMs));
   }
-  // Out of attempts — surface a clear error rather than silently succeeding.
   throw new Error(
     `flags: failed to update prefs for id="${id}" after ${maxAttempts} retries (concurrent contention)`,
   );
