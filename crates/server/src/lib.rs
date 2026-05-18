@@ -1,6 +1,7 @@
 pub mod config;
 pub mod cross_shard;
 pub mod dispatch;
+pub mod handoff;
 pub mod http;
 pub mod metrics;
 pub mod resp;

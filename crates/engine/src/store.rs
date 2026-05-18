@@ -949,8 +949,15 @@ impl ShardStore {
     pub async fn incr(&self, ns: &str, key: &[u8], delta: i64) -> Result<i64> {
         let nslog = self.ensure_ns(ns).await?;
 
-        // CAS retry loop: in cooperative single-threaded async the loop body fires at most
-        // twice in practice (the only yield is the disk write inside put_full_cond).
+        // Serialize INCRs within this namespace. Without the lock, every concurrent
+        // CAS attempt submits a (futile) disk append and only one wins per round —
+        // io_uring completion order is roughly submission order, so a late submitter
+        // can lose every round as new contenders refill the in-flight pool. Holding
+        // the lock makes each INCR's read-modify-write run to completion; the small
+        // retry budget below only needs to cover cross-op contention (a SET/DEL
+        // squeezing in while we're between read and write).
+        let _incr_guard = nslog.incr_lock.lock().await;
+
         for _ in 0..8u8 {
             let now = now_ms();
 
@@ -1107,15 +1114,63 @@ impl ShardStore {
     /// Write a footer to every active namespace file. Call on clean shutdown after
     /// `sync_logs` so the next startup loads each file via fast footer read instead
     /// of replaying records.
+    ///
+    /// Each namespace is frozen (new writes return `EngineError::Frozen`) and any
+    /// in-flight writes are drained before the footer is built. Without this,
+    /// writes whose `.await` overlaps with `write_footer().await` would be
+    /// appended to the file but absent from the footer entries — and thus
+    /// invisible to the successor process that reads only the footer.
     pub async fn seal_all_for_shutdown(&self) -> crate::error::Result<()> {
         let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
+        // Freeze writes and wait for in-flight writes to complete on every
+        // namespace in parallel.
+        join_all(ns_list.iter().map(|ns| ns.freeze_and_drain())).await;
         let results = join_all(ns_list.iter().map(|ns| ns.seal_active_for_shutdown())).await;
+        // Propagate the first error. Earlier behavior was to log-and-continue,
+        // but the handoff seal path needs to surface failures so the protocol
+        // can send `SealFailed` and keep O as the writer. The SIGTERM path's
+        // caller already handles `Err` here gracefully.
+        let mut first_err: Option<crate::error::EngineError> = None;
         for result in results {
             if let Err(e) = result {
                 tracing::warn!(error = %e, "failed to seal namespace on shutdown");
+                first_err.get_or_insert(e);
             }
         }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Reopen a fresh active log segment for every namespace that was previously
+    /// sealed via [`seal_all_for_shutdown`]. Used by the handoff abort path
+    /// (`Drainable::resume_after_abort`) to put the store back into a
+    /// writable state. Also clears the per-namespace freeze flag so writes
+    /// can proceed again.
+    pub async fn resume_after_abort(&self) -> crate::error::Result<()> {
+        let ns_list: Vec<Rc<NamespaceLog>> = self.namespaces.borrow().values().cloned().collect();
+        let results = join_all(ns_list.iter().map(|ns| ns.reopen_active_after_seal())).await;
+        for result in results {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "failed to reopen namespace active log on resume");
+                return Err(e);
+            }
+        }
+        for ns in &ns_list {
+            ns.unfreeze();
+        }
         Ok(())
+    }
+
+    /// One revision per open namespace, the highest `tstamp_ms` known for each.
+    /// Used by the handoff protocol to report per-shard high-water marks.
+    pub fn last_revision_per_namespace(&self) -> Vec<u64> {
+        self.namespaces
+            .borrow()
+            .values()
+            .map(|ns| ns.last_revision())
+            .collect()
     }
 
     /// Trigger reclaim on one namespace. Used by `BGREWRITEAOF`.
@@ -2250,5 +2305,43 @@ mod tests {
         // unclosed '[' treated as literal
         assert!(glob_match(b"[abc", b"[abc"));
         assert!(!glob_match(b"[abc", b"a"));
+    }
+
+    // ── Concurrent INCR ───────────────────────────────────────────────────────
+
+    #[test]
+    fn concurrent_incr_under_contention_produces_correct_sum() {
+        // Exercises the CAS retry loop in `incr`. The real server spawns each
+        // client connection on its own monoio task, so the contenders here are
+        // independent `monoio::spawn`-ed tasks (not sub-futures of a single
+        // `join_all`, which polls round-robin within one task and gives the
+        // first-polled sub-future a deterministic scheduling advantage that
+        // doesn't reflect production behavior). The final counter must equal
+        // CONTENDERS × PER_CONTENDER regardless of CAS interleaving.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = Rc::new(open_store(&path).await);
+            const CONTENDERS: usize = 4;
+            const PER_CONTENDER: i64 = 25;
+            let handles: Vec<_> = (0..CONTENDERS)
+                .map(|_| {
+                    let s = s.clone();
+                    monoio::spawn(async move {
+                        for _ in 0..PER_CONTENDER {
+                            s.incr("default", b"ctr", 1).await.unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.await;
+            }
+            let final_val: i64 = std::str::from_utf8(&get_value(&s, b"ctr").await.unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(final_val, CONTENDERS as i64 * PER_CONTENDER);
+        });
     }
 }

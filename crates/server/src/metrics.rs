@@ -195,6 +195,24 @@ define_metrics! {
         // ── Namespaces ────────────────────────────────────────────────────────
         gauge_vec namespaces_open("kv_namespaces_open")["shard"]
             => "Open namespace count per shard (limit 1024)",
+
+        // ── Handoff ───────────────────────────────────────────────────────────
+        counter_vec handoff_handoffs_total("handoff_handoffs_total")["result"]
+            => "Handoff outcomes by result (committed/seal_failed/resumed)",
+
+        counter handoff_seal_failures_total("handoff_seal_failures_total")
+            => "Seal-phase failures (engine returned Err during seal)",
+
+        counter handoff_rolled_back_total("handoff_rolled_back_total")
+            => "Number of `resume_after_abort` calls (handoff rolled back to incumbent)",
+
+        histogram handoff_drain_seconds("handoff_drain_seconds")
+            buckets = DB_OP_BUCKETS
+            => "Time spent in the drain phase per handoff",
+
+        histogram handoff_seal_seconds("handoff_seal_seconds")
+            buckets = DB_OP_BUCKETS
+            => "Time spent in the seal phase per handoff",
     }
 }
 

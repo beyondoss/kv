@@ -91,6 +91,26 @@ pub struct NamespaceLog {
     /// the threshold is crossed simultaneously (monoio yields between the check
     /// and the rotate_active await).
     rotate_in_progress: Cell<bool>,
+    /// When set, all write paths return `Frozen` immediately. Used by the
+    /// handoff seal path to guarantee that the index snapshot the footer is
+    /// built from matches what's actually on disk — without it, writes that
+    /// happen while `write_footer` awaits will be in the WAL but absent from
+    /// the footer, and thus invisible to the successor process.
+    frozen: Cell<bool>,
+    /// Count of write methods currently between their entry check and exit.
+    /// `freeze_and_drain` polls this to 0 before allowing the seal to proceed.
+    in_flight_writes: Cell<u32>,
+    /// Serializes INCR/DECR within this namespace.
+    ///
+    /// Why: under contention, optimistic CAS on the same key has every
+    /// concurrent writer submit a (futile) disk append, then race to win the
+    /// post-write index update — only one wins per round, the rest become
+    /// orphans. Worse, io_uring completion order is roughly submission order,
+    /// so a late-submitting task can keep losing every round as new contenders
+    /// refill the in-flight pool, exhausting any finite retry budget. A single
+    /// async mutex collapses the herd: one INCR's read-modify-write completes
+    /// at a time, eliminating wasted disk writes and starvation.
+    pub(crate) incr_lock: futures_util::lock::Mutex<()>,
 }
 
 impl NamespaceLog {
@@ -112,6 +132,42 @@ impl NamespaceLog {
             last_tstamp: Cell::new(0),
             reclaim_in_progress: Cell::new(false),
             rotate_in_progress: Cell::new(false),
+            frozen: Cell::new(false),
+            in_flight_writes: Cell::new(0),
+            incr_lock: futures_util::lock::Mutex::new(()),
+        })
+    }
+
+    /// Block all subsequent writes (they return [`EngineError::Frozen`]) and
+    /// wait for any already-in-flight writes to complete. Used by the seal
+    /// path so the footer it writes is a consistent snapshot of on-disk state.
+    pub async fn freeze_and_drain(&self) {
+        self.frozen.set(true);
+        // Already-in-flight writes incremented `in_flight_writes` before the
+        // freeze (the check+increment is sync-atomic in `WriteGuard::enter`).
+        // Poll until they all finish.
+        while self.in_flight_writes.get() > 0 {
+            monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Clear the freeze flag, allowing writes to proceed again. Used by the
+    /// resume-after-abort path.
+    pub fn unfreeze(&self) {
+        self.frozen.set(false);
+    }
+
+    /// Atomically check the freeze flag and increment the in-flight counter.
+    /// Returns a guard that decrements on drop. The check + increment is
+    /// synchronous (no `.await`) so it is serialized with `freeze_and_drain`'s
+    /// flag-set + counter-poll under monoio's single-threaded scheduler.
+    fn begin_write(&self) -> Result<WriteGuard<'_>> {
+        if self.frozen.get() {
+            return Err(EngineError::Frozen);
+        }
+        self.in_flight_writes.set(self.in_flight_writes.get() + 1);
+        Ok(WriteGuard {
+            counter: &self.in_flight_writes,
         })
     }
 
@@ -150,6 +206,7 @@ impl NamespaceLog {
         metadata: &[u8],
         expires_at_ms: Option<u64>,
     ) -> Result<()> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -193,6 +250,7 @@ impl NamespaceLog {
         cond: WriteCondition,
         now: u64,
     ) -> Result<bool> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -241,6 +299,7 @@ impl NamespaceLog {
 
     /// Coalesce many puts into a single `write_at` + single `fsync`.
     pub async fn put_many(&self, pairs: &[(Bytes, Bytes)]) -> Result<()> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -286,6 +345,7 @@ impl NamespaceLog {
     /// Append a tombstone for `key`; drop it from the index.
     /// Returns true iff the key was present.
     pub async fn tombstone(&self, key: &[u8]) -> Result<bool> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -308,6 +368,7 @@ impl NamespaceLog {
     /// Returns `Ok(true)` if tombstoned, `Ok(false)` if revision did not match.
     /// Atomic: the index removal is synchronous (no yield between check and removal).
     pub async fn tombstone_cond(&self, key: &[u8], expected_rev: u64, now: u64) -> Result<bool> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -331,6 +392,7 @@ impl NamespaceLog {
 
     /// Append a TTL-update record; modify only the sidecar.
     pub async fn ttl_update(&self, key: &[u8], expires_at_ms: Option<u64>) -> Result<()> {
+        let _wg = self.begin_write()?;
         if self.reclaim_in_progress.get() {
             return Err(EngineError::ReclamationBusy);
         }
@@ -520,7 +582,26 @@ impl NamespaceLog {
     /// so the next startup can load this file as a sealed file (fast footer read)
     /// instead of replaying it record-by-record.
     pub async fn seal_active_for_shutdown(&self) -> Result<()> {
+        // Test-only fail-once hook. Production never sets the env var. When
+        // set and the named file exists, we unlink the file (consume the
+        // signal) and return Err so the seal protocol path is exercised
+        // end-to-end against the real engine. The next seal succeeds.
+        if let Ok(p) = std::env::var("KV_TEST_FAIL_ONCE_FILE")
+            && std::path::Path::new(&p).exists()
+        {
+            let _ = std::fs::remove_file(&p);
+            return Err(EngineError::TestSealFailure);
+        }
         let active = self.active.borrow().clone();
+        // Fsync the records BEFORE building the footer. Without this, records
+        // appended after the last `sync_logs` tick sit in the OS page cache;
+        // the footer references them but a process crash between SealComplete
+        // and exit would lose the records, leaving the successor with footer
+        // entries that point at bytes that never made it to disk.
+        if self.unsynced_bytes.get() != 0 {
+            active.sync().await?;
+            self.unsynced_bytes.set(0);
+        }
         let footer: Vec<FooterEntry> = {
             let index = self.index.borrow();
             index
@@ -536,6 +617,38 @@ impl NamespaceLog {
                 .collect()
         };
         active.write_footer(&footer).await
+    }
+
+    /// Move the (already-footered) active file into the sealed map and open a
+    /// fresh active file. Used by [`crate::store::ShardStore::resume_after_abort`]
+    /// to recover from a post-seal handoff abort: the seal footer was written
+    /// to the active file by `seal_active_for_shutdown`, but no new active file
+    /// was opened. This method completes that transition without writing a
+    /// second footer.
+    pub async fn reopen_active_after_seal(&self) -> Result<()> {
+        let old_active = self.active.borrow().clone();
+        let next_id = {
+            let sealed = self.sealed.borrow();
+            let max_existing = sealed
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(old_active.file_id);
+            max_existing
+                .checked_add(1)
+                .ok_or(EngineError::CapacityExceeded {
+                    reason: "file_id overflow: namespace has too many log files",
+                })?
+        };
+        self.sealed
+            .borrow_mut()
+            .insert(old_active.file_id, old_active);
+        let new_path = self.dir.join(data_filename(next_id));
+        let new_active = Rc::new(LogFile::open_rw(new_path, next_id).await?);
+        *self.active.borrow_mut() = new_active;
+        self.unsynced_bytes.set(0);
+        Ok(())
     }
 
     /// Seal the current active file (writing its footer) and open a new active file.
@@ -740,6 +853,19 @@ impl NamespaceLog {
         self.unsynced_bytes.set(0);
 
         Ok(report)
+    }
+}
+
+/// RAII counter increment returned by [`NamespaceLog::begin_write`]. Each
+/// write method holds one for its lifetime; [`NamespaceLog::freeze_and_drain`]
+/// polls the counter to zero before allowing a seal to proceed.
+struct WriteGuard<'a> {
+    counter: &'a Cell<u32>,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.set(self.counter.get().saturating_sub(1));
     }
 }
 

@@ -11,6 +11,7 @@ rust-version = "1.85"
 beyond-kv-engine = { path = "crates/engine" }
 beyond-kv-proto = { path = "crates/proto" }
 beyond-resp = { version = "0.1.1", features = ["monoio"] }
+handoff = { version = "0.1", package = "beyond-handoff" }
 
 base64 = "0.22"
 bytes = "1.11"

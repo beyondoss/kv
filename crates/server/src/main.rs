@@ -75,6 +75,12 @@ fn accept_one(
 
 /// Non-blocking accept loop shared by both protocols. Exits when the shutdown
 /// flag is set or a worker channel is permanently disconnected.
+///
+/// While `accept_closed` is set (handoff drain in progress), the loop stops
+/// dispatching new connections to workers but does NOT exit. The kernel's
+/// accept queue absorbs incoming SYNs during this brief window; once the
+/// handoff completes — either committing (process exits, successor's listener
+/// inherits the queue) or aborting (flag cleared) — accepts resume.
 #[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: &TcpListener,
@@ -84,12 +90,17 @@ fn accept_loop(
     wakeup_writers: &mut [UnixStream],
     rr: &AtomicUsize,
     shutdown: &AtomicBool,
+    accept_closed: &AtomicBool,
     label: &str,
 ) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("{label} accept loop: shutdown signal received, draining");
             break;
+        }
+        if accept_closed.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
         }
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -172,6 +183,45 @@ fn main() -> anyhow::Result<()> {
         "starting beyond-kv"
     );
 
+    // Decide our role before opening anything: a Successor must wait for the
+    // supervisor's `Begin` cue before acquiring the data-dir lock, since the
+    // incumbent still holds it until SealComplete. The typestate chain
+    // (Successor → HandshookSuccessor → BegunSuccessor) makes out-of-order
+    // calls compile-time impossible.
+    let (resp_inherited, http_inherited, mut successor) = match handoff::detect_role()
+        .map_err(|e| anyhow::anyhow!("handoff::detect_role: {e}"))?
+    {
+        handoff::Role::ColdStart { mut inherited } => {
+            tracing::info!(
+                inherited_listeners = ?inherited.names(),
+                "starting in cold-start mode"
+            );
+            let r = inherited.take("resp");
+            let h = inherited.take("http");
+            (r, h, None)
+        }
+        handoff::Role::Successor(s) => {
+            let build_id = env!("CARGO_PKG_VERSION").as_bytes().to_vec();
+            let s = s
+                .handshake(build_id)
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            tracing::info!(handoff_id = %s.handoff_id(), "handshake complete; waiting for Begin");
+            let mut s = s
+                .wait_for_begin()
+                .map_err(|e| anyhow::anyhow!("wait_for_begin: {e}"))?;
+            tracing::info!(handoff_id = %s.handoff_id(), "Begin received; proceeding with successor startup");
+            let r = s.take_listener("resp");
+            let h = s.take_listener("http");
+            (r, h, Some(s))
+        }
+    };
+
+    // Acquire the data-dir lock. For a Successor this succeeds immediately
+    // because the prior incumbent has already released it (post-SealComplete).
+    // For a Cold Start we break stale pidfiles from crashed predecessors.
+    let data_dir_lock = handoff::DataDirLock::acquire_or_break_stale(&cfg.data_dir)
+        .map_err(|e| anyhow::anyhow!("acquire data-dir lock {}: {e}", cfg.data_dir.display()))?;
+
     let data_dir = cfg.data_dir.clone();
     let resp_port = cfg.resp_port;
     let http_address = cfg.http_address.clone();
@@ -226,6 +276,10 @@ fn main() -> anyhow::Result<()> {
         worker_inboxes.push((resp_rx, resp_wake_read, http_rx, http_wake_read));
     }
 
+    // Per-worker handoff control channels (mirrors the cross-shard pattern).
+    let (handoff_txs, handoff_wake_writes, handoff_rxs, handoff_wake_reads) =
+        beyond_kv::handoff::build_channels(n_threads);
+
     // Cross-shard request channels: one inbox per shard, shared sender array.
     // Senders are cheap to clone; the `Arc<[Sender]>` lets every connection
     // route a sub-request to any shard without taking a lock.
@@ -251,10 +305,18 @@ fn main() -> anyhow::Result<()> {
         .zip(worker_inboxes)
         .zip(cross_shard_rx_vec)
         .zip(cross_shard_wake_reads)
+        .zip(handoff_rxs)
+        .zip(handoff_wake_reads)
         .map(
             |(
-                ((i, (resp_rx, resp_wake_read, http_rx, http_wake_read)), cross_shard_rx),
-                cross_shard_wake_read,
+                (
+                    (
+                        ((i, (resp_rx, resp_wake_read, http_rx, http_wake_read)), cross_shard_rx),
+                        cross_shard_wake_read,
+                    ),
+                    handoff_rx,
+                ),
+                handoff_wake_read,
             )| {
                 let data_dir = data_dir.clone();
                 let cross_shard_txs = cross_shard_txs.clone();
@@ -401,6 +463,18 @@ fn main() -> anyhow::Result<()> {
                                 .await;
                             });
 
+                            // Handoff control handler: drains drain/seal/resume
+                            // requests sent by the handoff control thread.
+                            let handoff_store = store.clone();
+                            monoio::spawn(async move {
+                                beyond_kv::handoff::serve_handoff_inbox(
+                                    handoff_store,
+                                    handoff_rx,
+                                    handoff_wake_read,
+                                )
+                                .await;
+                            });
+
                             beyond_kv::resp::serve(
                                 store.clone(),
                                 resp_rx,
@@ -443,15 +517,42 @@ fn main() -> anyhow::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
 
+    // `accept_closed` is set by the handoff drain path. It pauses (but does
+    // not exit) the accept loops while the handoff runs.
+    let accept_closed = Arc::new(AtomicBool::new(false));
+
+    // Build the `Drainable` bridge. The actual `Incumbent::bind` (which
+    // touches the control socket path) is deferred to after `announce_ready`
+    // in the successor case, so that a successor crashing before Ready does
+    // NOT unlink the incumbent's still-bound socket file.
+    let kv_handoff = beyond_kv::handoff::KvHandoff::new(
+        handoff_txs,
+        handoff_wake_writes,
+        Arc::clone(&accept_closed),
+        Arc::clone(&metrics),
+    );
+
     // HTTP accept thread (non-blocking listener + shutdown-aware loop).
+    // Use the inherited listener (from the supervisor or from a prior process
+    // in a handoff chain) when available, else bind fresh.
     let http_addr = http_address;
-    let http_listener = TcpListener::bind(&http_addr)?;
+    let http_listener = match http_inherited {
+        Some(l) => {
+            tracing::info!(addr = ?l.local_addr().ok(), "HTTP listening on inherited fd");
+            l
+        }
+        None => {
+            let l = TcpListener::bind(&http_addr)?;
+            tracing::info!("HTTP listening on {http_addr}");
+            l
+        }
+    };
     http_listener.set_nonblocking(true)?;
-    tracing::info!("HTTP listening on {http_addr}");
 
     let http_thread = {
         let rr = rr.clone();
         let shutdown = Arc::clone(&shutdown);
+        let accept_closed_for_http = Arc::clone(&accept_closed);
         std::thread::Builder::new()
             .name("kv-http-accept".into())
             .spawn(move || {
@@ -463,6 +564,7 @@ fn main() -> anyhow::Result<()> {
                     &mut http_wakeup_writers,
                     &rr,
                     &shutdown,
+                    &accept_closed_for_http,
                     "HTTP",
                 );
                 // Dropping http_senders + http_wakeup_writers here signals workers.
@@ -471,9 +573,64 @@ fn main() -> anyhow::Result<()> {
 
     // RESP accept loop runs on the main thread.
     let resp_addr = format!("0.0.0.0:{resp_port}");
-    let resp_listener = TcpListener::bind(&resp_addr)?;
+    let resp_listener = match resp_inherited {
+        Some(l) => {
+            tracing::info!(addr = ?l.local_addr().ok(), "RESP listening on inherited fd");
+            l
+        }
+        None => {
+            let l = TcpListener::bind(&resp_addr)?;
+            tracing::info!("RESP listening on {resp_addr}");
+            l
+        }
+    };
     resp_listener.set_nonblocking(true)?;
-    tracing::info!("RESP listening on {resp_addr}");
+
+    // Bind the control socket. For a successor we go through
+    // `announce_and_bind` so `Ready` is sent before we touch the path; for
+    // cold start we go directly to `bind_cold_start`. The successor path's
+    // bind happens AFTER `Ready` (and thus after the supervisor will commit
+    // the prior incumbent), so a successor that dies pre-Ready never
+    // touches the path.
+    let incumbent = match successor.take() {
+        Some(s) => {
+            // Test hook: simulate a successor crash *before* Ready so the
+            // supervisor hits the `ResumeAfterAbort` path and the old
+            // incumbent has to recover for real. Honored only when the env
+            // var is set — production never sets it.
+            if std::env::var("KV_TEST_PANIC_BEFORE_READY").is_ok() {
+                tracing::warn!("KV_TEST_PANIC_BEFORE_READY set; exiting before announce_ready");
+                std::process::exit(42);
+            }
+            let snapshot = handoff::ReadinessSnapshot {
+                listening_on: vec![resp_addr.clone(), http_addr.clone()],
+                healthz_ok: true,
+                advertised_revision_per_shard: Vec::new(),
+            };
+            s.announce_and_bind(snapshot, &cfg.handoff_socket_path, data_dir_lock)
+                .map_err(|e| anyhow::anyhow!("announce_and_bind: {e}"))?
+        }
+        None => handoff::Incumbent::bind_cold_start(&cfg.handoff_socket_path, data_dir_lock)
+            .map_err(|e| anyhow::anyhow!("bind handoff control socket: {e}"))?,
+    }
+    .with_build_id(env!("CARGO_PKG_VERSION").as_bytes().to_vec());
+    let handoff_shutdown = Arc::clone(&shutdown);
+    let handoff_metrics = Arc::clone(&metrics);
+    let _handoff_thread = std::thread::Builder::new()
+        .name("kv-handoff".into())
+        .spawn(move || match incumbent.serve(kv_handoff) {
+            Ok(()) => {
+                handoff_metrics
+                    .handoff_handoffs_total
+                    .with_label_values(&["committed"])
+                    .inc();
+                tracing::info!("handoff committed; signaling main to exit");
+                handoff_shutdown.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "handoff control thread exited with error");
+            }
+        })?;
 
     accept_loop(
         &resp_listener,
@@ -483,6 +640,7 @@ fn main() -> anyhow::Result<()> {
         &mut resp_wakeup_writers,
         &rr,
         &shutdown,
+        &accept_closed,
         "RESP",
     );
 

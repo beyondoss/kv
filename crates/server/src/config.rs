@@ -59,6 +59,15 @@ pub struct Config {
     /// Path to the PEM-encoded CA bundle used to verify client certificates.
     #[arg(long, env = "BEYOND_TLS_CA")]
     pub tls_ca: Option<String>,
+
+    /// Unix-domain socket where the handoff control channel is exposed. The
+    /// supervisor connects here to drive zero-downtime binary swaps.
+    #[arg(
+        long,
+        env = "KV_HANDOFF_SOCKET_PATH",
+        default_value = "/run/beyond/kv/control.sock"
+    )]
+    pub handoff_socket_path: PathBuf,
 }
 
 impl Config {

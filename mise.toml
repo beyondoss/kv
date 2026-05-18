@@ -17,13 +17,19 @@ run = "npm run build"
 dir = "sdk/ts"
 depends = ["generate:types"]
 
+[tasks."build:ts:kv"]
+description = "Build the @beyond.dev/kv package (its dist/ provides types consumed by rate-limit and flags)"
+run = "npm run build -w @beyond.dev/kv"
+dir = "sdk/ts"
+depends = ["generate:types"]
+
 [tasks."check:rs"]
 run = "cargo clippy --workspace -- -D warnings"
 
 [tasks."check:ts"]
 run = "npm run typecheck"
 dir = "sdk/ts"
-depends = ["generate:types"]
+depends = ["generate:types", "build:ts:kv"]
 
 [tasks."check:fmt"]
 run = "dprint check"
@@ -40,6 +46,10 @@ run = "cargo test --lib"
 
 [tasks."test:integration:rs"]
 run = "cargo test --test cross_shard --test http --test resp --test tls"
+
+[tasks."test:handoff:rs"]
+description = "End-to-end handoff tests (real beyond-kv subprocesses, listener-FD inheritance, flock dance, data persistence across binary swap). Serial because each test spawns 2+ KV processes with their own ephemeral ports."
+run = "cargo test --test handoff_smoke --test handoff_e2e --test handoff_rigorous -- --test-threads=1"
 
 [tasks."test:integration:ts"]
 description = "Run TypeScript SDK e2e tests against a freshly-built debug server"
