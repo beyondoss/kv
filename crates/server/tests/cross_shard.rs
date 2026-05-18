@@ -120,7 +120,10 @@ impl ShardedServer {
             let h = std::thread::Builder::new()
                 .name(format!("kv-test-shard-{i}"))
                 .spawn(move || {
-                    monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    // LegacyDriver — see crates/server/tests/common/mod.rs
+                    // for why io_uring's per-ring memory still accumulates on
+                    // CI even with clean shutdown joining the runtime thread.
+                    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
                         .enable_timer()
                         .build()
                         .expect("monoio runtime")

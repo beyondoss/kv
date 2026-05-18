@@ -164,7 +164,10 @@ fn start_tls_server(certs: &CertBundle) -> TlsTestServer {
     let runtime_thread = std::thread::Builder::new()
         .name(format!("kv-tls-test-{http_port}"))
         .spawn(move || {
-            monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            // LegacyDriver — see crates/server/tests/common/mod.rs for why
+            // io_uring's per-ring memory still accumulates on CI even with
+            // clean shutdown joining the runtime thread.
+            monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
                 .enable_timer()
                 .build()
                 .expect("monoio runtime")

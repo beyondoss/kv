@@ -122,7 +122,13 @@ impl TestServer {
         let runtime = std::thread::Builder::new()
             .name(format!("kv-test-shards{n_shards}-{http_port}"))
             .spawn(move || {
-                monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                // LegacyDriver (epoll), not FusionDriver. Drop now reliably
+                // joins this thread so each runtime really does go away, but
+                // on CI's kernel/cgroup config io_uring's per-ring memory is
+                // not reclaimed quickly enough for back-to-back tests, and
+                // ~80 builds in we hit ENOMEM. epoll has no such accounting.
+                // Production still uses FusionDriver via main.rs.
+                monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
                     .enable_timer()
                     .build()
                     .expect("monoio runtime")
