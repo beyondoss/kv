@@ -195,6 +195,9 @@ beforeAll(async () => {
       KV_RESP_PORT: String(respPort),
       KV_MEMORY_BYTES: String(32 * 1024 * 1024),
       KV_THREADS: "1",
+      // Default is /run/beyond/kv/control.sock — not writable as a regular
+      // user. Park the handoff socket inside the test's temp data dir.
+      KV_HANDOFF_SOCKET_PATH: join(tempDataDir, "handoff.sock"),
       RUST_LOG: "error",
       BEYOND_TLS_CERT: certFile,
       BEYOND_TLS_KEY: keyFile,

@@ -170,7 +170,8 @@ async function mutateUserPrefs(
   mutator: (prefs: UserPrefs) => UserPrefs,
 ): Promise<void> {
   const key = userKey(id);
-  for (let attempt = 0; attempt < 5; attempt++) {
+  const maxAttempts = 10;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const { data: entry, error } = await kv.get(key);
     if (error) throw error;
 
@@ -185,21 +186,24 @@ async function mutateUserPrefs(
     }
 
     const value = JSON.stringify(next);
+    let casErr;
     if (entry) {
-      const { error: casErr } = await kv.cas(key, value, entry.revision);
-      if (!casErr) return;
-      if (casErr.status !== 409) throw casErr;
-      // Revision mismatch → retry.
-      continue;
+      ({ error: casErr } = await kv.cas(key, value, entry.revision));
+    } else {
+      ({ error: casErr } = await kv.set(key, value, { ifAbsent: true }));
     }
-    const { error: setErr } = await kv.set(key, value, { ifAbsent: true });
-    if (!setErr) return;
-    if (setErr.status !== 409) throw setErr;
-    // Someone else created it — retry.
+    if (!casErr) return;
+    if (casErr.status !== 409) throw casErr;
+    // Conflict: another writer beat us. Jittered backoff (0–10 ms ×
+    // 2^attempt, capped at 100 ms) lets contenders spread out instead of
+    // re-racing at exactly the same tick — without that, N concurrent
+    // writers can collide on every retry and exhaust the budget.
+    const backoffMs = Math.min(100, Math.random() * 10 * 2 ** attempt);
+    await new Promise<void>((r) => setTimeout(r, backoffMs));
   }
   // Out of attempts — surface a clear error rather than silently succeeding.
   throw new Error(
-    `flags: failed to update prefs for id="${id}" after 5 retries (concurrent contention)`,
+    `flags: failed to update prefs for id="${id}" after ${maxAttempts} retries (concurrent contention)`,
   );
 }
 

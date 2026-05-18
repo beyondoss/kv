@@ -12,7 +12,7 @@
 //!     loop to exit, and main to fall through to its cleanup path.
 
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,7 +55,7 @@ fn ephemeral_port() -> u16 {
     p
 }
 
-fn wait_for_path(path: &PathBuf, secs: u64) -> bool {
+fn wait_for_path(path: &Path, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !path.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
@@ -171,7 +171,11 @@ fn full_handoff_protocol_exits_kv_on_commit() {
                     status.success() || status.code() == Some(0),
                     "KV exited with: {status:?}"
                 );
-                let _ = child.disarm();
+                // try_wait above already reaped the child; this extra wait
+                // returns ECHILD but satisfies clippy::zombie_processes and
+                // prevents KillOnDrop from signaling a potentially-recycled
+                // PID.
+                let _ = child.disarm().wait();
                 return;
             }
             None if Instant::now() < exit_deadline => {

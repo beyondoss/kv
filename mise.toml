@@ -24,7 +24,7 @@ dir = "sdk/ts"
 depends = ["generate:types"]
 
 [tasks."check:rs"]
-run = "cargo clippy --workspace -- -D warnings"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks."check:ts"]
 run = "npm run typecheck"

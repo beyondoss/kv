@@ -225,8 +225,9 @@ describe("flag.set — CAS contention", () => {
   });
 
   it("concurrent set calls on the same user all succeed (CAS retry handles contention)", async () => {
-    // n=5 concurrent writers on the same key: each needs at most 4 retries
-    // (one loss per round), which fits within the 5-retry budget.
+    // n=5 concurrent writers on the same key. mutateUserPrefs retries
+    // with jittered backoff up to 10 times, which is comfortably above
+    // the worst-case scheduling unfairness for this n.
     const n = 5;
     const flagsList = Array.from(
       { length: n },
@@ -240,7 +241,7 @@ describe("flag.set — CAS contention", () => {
     expect(Object.keys(prefs ?? {}).length).toBe(n);
   });
 
-  it("set throws a clear error after 5 consecutive CAS conflicts", async () => {
+  it("set throws a clear error after exhausting CAS retries", async () => {
     // Pre-populate so the code takes the CAS (not ifAbsent) path.
     await kv.set("flags:user:u_exhaust", JSON.stringify({ existing: true }));
 
@@ -257,8 +258,8 @@ describe("flag.set — CAS contention", () => {
     };
 
     const f = flags("exhaust-flag", false);
-    await expect(f.set({ id: "u_exhaust" }, true)).rejects.toThrow(/5 retries/);
-    expect(casCount).toBe(5);
+    await expect(f.set({ id: "u_exhaust" }, true)).rejects.toThrow(/retries/);
+    expect(casCount).toBe(10);
   });
 });
 

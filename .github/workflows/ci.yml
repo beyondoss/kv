@@ -23,6 +23,8 @@ jobs:
         run: mise run test:unit:rs
       - name: test:integration:rs
         run: mise run test:integration:rs
+      - name: test:handoff:rs
+        run: mise run test:handoff:rs
       - name: check:ts
         run: mise run check:ts
       - name: build:rs:release
