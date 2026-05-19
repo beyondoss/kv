@@ -142,8 +142,7 @@ enum Command {
 fn generate_openapi() -> anyhow::Result<()> {
     use utoipa::OpenApi as _;
     let doc = beyond_kv::http::ApiDoc::openapi();
-    let mut json = serde_json::to_string_pretty(&doc)?;
-    json.push('\n');
+    let json = serde_json::to_string_pretty(&doc)?;
     std::fs::create_dir_all("openapi")?;
     std::fs::write("openapi/v1.json", json)?;
     println!("wrote openapi/v1.json");

@@ -59,7 +59,7 @@ depends = ["generate:types", "build:rs"]
 
 [tasks."generate:openapi"]
 description = "Generate openapi/v1.json from annotated routes"
-run = "cargo run -p beyond-kv -- generate-openapi"
+run = "cargo run -p beyond-kv -- generate-openapi && dprint fmt openapi/v1.json"
 
 [tasks."generate:types"]
 description = "Generate TypeScript types from the OpenAPI spec"
