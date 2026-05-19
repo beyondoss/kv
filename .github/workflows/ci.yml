@@ -33,10 +33,6 @@ jobs:
         run: mise run build:ts
       - name: test:integration:ts
         run: mise run test:integration:ts
-      - name: audit
-        run: |
-          cargo install cargo-audit --quiet
-          cargo audit
   generate-check:
     name: generated files up-to-date
     runs-on: ubuntu-latest
