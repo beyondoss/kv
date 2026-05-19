@@ -556,13 +556,28 @@ for (const { name, make } of backends) {
     let rl: RateLimiter;
     afterEach(() => rl.close());
 
+    // Two awaited limit() calls can straddle a window boundary on a slow
+    // runner (limitFixedWindow buckets by Math.floor(now / window)), so the
+    // "second request is denied" precondition is racy. Drive each limiter
+    // until we observe a real denial, then verify the retryAfter sleep
+    // actually unblocks. Bounded to a small max so a broken limiter still
+    // fails the test loudly.
+    async function untilDenied(rl: RateLimiter, key: string) {
+      for (let i = 0; i < 6; i++) {
+        const { data, error } = await rl.limit(key);
+        if (error) throw error;
+        if (!data!.allowed) return data!;
+      }
+      throw new Error("limiter never denied after 6 calls");
+    }
+
     it("fixed window: sleeping retryAfter ms allows the next request", async () => {
       rl = make(fixedWindow({ limit: 1, window: 500 }));
       const key = uniqueKey();
       await rl.limit(key);
-      const { data } = await rl.limit(key);
-      expect(data?.allowed).toBe(false);
-      await sleep(data!.retryAfter! + 50);
+      const data = await untilDenied(rl, key);
+      expect(data.retryAfter).toBeGreaterThan(0);
+      await sleep(data.retryAfter! + 50);
       const { data: retry } = await rl.limit(key);
       expect(retry?.allowed).toBe(true);
     });
@@ -572,9 +587,9 @@ for (const { name, make } of backends) {
       rl = make(tokenBucket({ capacity: 1, refillRate: 5 }));
       const key = uniqueKey();
       await rl.limit(key); // empty the bucket
-      const { data } = await rl.limit(key); // denied
-      expect(data?.retryAfter).toBeGreaterThan(0);
-      await sleep(data!.retryAfter! + 50);
+      const data = await untilDenied(rl, key);
+      expect(data.retryAfter).toBeGreaterThan(0);
+      await sleep(data.retryAfter! + 50);
       const { data: retry } = await rl.limit(key);
       expect(retry?.allowed).toBe(true);
     });
@@ -583,11 +598,11 @@ for (const { name, make } of backends) {
       rl = make(slidingWindow({ limit: 1, window: 500 }));
       const key = uniqueKey();
       await rl.limit(key);
-      const { data } = await rl.limit(key); // denied; retryAfter ≈ time to next bucket
-      expect(data?.retryAfter).toBeGreaterThan(0);
+      const data = await untilDenied(rl, key);
+      expect(data.retryAfter).toBeGreaterThan(0);
       // Add 100ms buffer: at the bucket boundary elapsed≈0, so the weighted
       // estimate still equals prevCount; a few ms further it drops below limit.
-      await sleep(data!.retryAfter! + 100);
+      await sleep(data.retryAfter! + 100);
       const { data: retry } = await rl.limit(key);
       expect(retry?.allowed).toBe(true);
     });
