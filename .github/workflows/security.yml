@@ -1,0 +1,29 @@
+name: Security
+on:
+  schedule:
+    # Mondays 14:00 UTC. Weekly cadence — real advisory churn, not per-push theater.
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        id: deny
+        with:
+          command: check advisories licenses bans sources
+          arguments: --workspace --all-features
+      - name: open regression issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --title "cargo-deny regression ($(date -u +%Y-%m-%d))" \
+            --label security,automation \
+            --body "Weekly cargo-deny found a new advisory/license/ban/source issue. Run: $RUN_URL"

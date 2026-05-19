@@ -1,0 +1,23 @@
+name: setup-rust
+description: |
+  Common setup for jobs that need Rust + mise. Caller must run
+  actions/checkout@v6 before this composite. Pass a distinct cache-key per
+  job so rust-cache slots do not evict each other (which is the single
+  biggest source of cold-rebuild waste in the old CI).
+inputs:
+  cache-key:
+    description: rust-cache shared-key. Use a unique value per job (e.g. lint, rust-test, handoff-test, ts-test, sqlx-check, gen).
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@v4
+      with:
+        cache: true
+    - name: rustup components
+      shell: bash
+      run: rustup component add rustfmt clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        cache-on-failure: true
