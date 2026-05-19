@@ -269,13 +269,16 @@ for (const backend of ["http", "resp"] as const) {
       it("prefix watch emits typed set events", async () => {
         const opts = baseOpts();
         const kv = createKvClient({ ...opts, schema });
-        const k2 = uniqueKey();
+        // Use key as a sub-prefix so the watch is scoped to this test only.
+        // All HTTP tests share namespace 0 (nsToIndex maps arbitrary names to 0),
+        // so a bare "users:" prefix would pick up other tests' keys.
+        const pfx = `users:${key}:`;
         const events = await watchCollect(
-          (signal) => kv.watch("users:", { prefix: true, signal }),
+          (signal) => kv.watch(pfx, { prefix: true, signal }),
           (evs) => evs.filter((e) => e.type === "set").length >= 2,
           async () => {
-            await kv.set(`users:${key}`, { username: "pfxA" } as any);
-            await kv.set(`users:${k2}`, { username: "pfxB" } as any);
+            await kv.set(`${pfx}a`, { username: "pfxA" } as any);
+            await kv.set(`${pfx}b`, { username: "pfxB" } as any);
           },
         );
         const setEvents = events.filter((e) => e.type === "set");
@@ -285,7 +288,8 @@ for (const backend of ["http", "resp"] as const) {
             expect(ev.value).toHaveProperty("username");
           }
         }
-        await kv.delete(`users:${k2}`);
+        await kv.delete(`${pfx}a`);
+        await kv.delete(`${pfx}b`);
         await kv.close();
       });
     }
