@@ -56,23 +56,32 @@ futures::join_all([read_exact(), read_exact(), ...])  — concurrent io_uring op
 [Option<Bytes>, ...]
 ```
 
-### Reclaim (compaction)
+### Reclaim (size-tiered compaction)
+
+Reclaim is size-tiered, not full-merge: each merge rewrites only one level's
+runs, so write amplification is ~O(log N) instead of O(reclaims × live-set), and
+on GlideFS a reclaim re-uploads one level rather than the whole namespace.
 
 ```
-reclaim_namespace()
+NamespaceLog::reclaim()
   │
-  ├─ 1. Seal active file — write footer (per-key metadata + CRC64 + magic)
+  ├─ 1. Seal active file — write footer — and insert it as a fresh level-0 run
   │
-  ├─ 2. Read all live index entries → read records from sealed files
+  ├─ 2. Cascade: while some level L holds >= `fanout` runs:
+  │       │
+  │       ├─ collect that level's live records (index entries with those file_ids)
+  │       ├─ reclaim_namespace(): read them concurrently, write one merged file
+  │       │     to data-{next_id}.log.tmp, footer + fsync, rename .tmp → .log,
+  │       │     fsync dir, unlink the input files (leak-logged, never errors)
+  │       ├─ open_ro the merged file FIRST (only fallible step), THEN swap index
+  │       │     + sealed map atomically — a failed open leaves state consistent
+  │       └─ tag the merged run at level L+1
   │
-  ├─ 3. Write live records to data-{next_id}.log.tmp
-  │
-  ├─ 4. rename() .tmp → .log   (atomic)
-  │
-  ├─ 5. Drop old sealed files  (unlink; logs failures but does not error)
-  │
-  └─ 6. Open fresh active LogFile → return ReclaimReport
+  └─ 3. Open a fresh active LogFile → return ReclaimReport
 ```
+
+`fanout` (default 8) is the per-level run count that triggers a merge. Levels
+are in-memory only (`level: file_id → u8`); recovered runs start at level 0.
 
 ### Recovery (startup)
 
@@ -91,27 +100,33 @@ open_namespace(dir, config)
   │     footer absent  (crash)          → replay records from offset 0,
   │                                       truncate at first bad CRC
   │
-  └─ apply in order:
-       full record  → NsIndex::insert()
-       tombstone    → NsIndex::remove()
-       ttl_update   → NsIndex::update_ttl() (only if key still present)
+  ├─ apply in order:
+  │    full record  → NsIndex::insert() (+ value-sep sidecar if VALUE_SEP)
+  │    tombstone    → NsIndex::remove()
+  │    ttl_update   → NsIndex::set_ttl() (only if key still present)
+  │
+  └─ NamespaceLog::open() post-steps:
+       rebuild blob refcounts (one incr_ref per live value-separated key)
+       sweep_orphans() — unlink any blob no live key references (crash leftover)
+       seed the revision clock from the highest recovered tstamp_ms
 ```
 
 ## Concepts & Terminology
 
-| Term           | What It Controls                                                                                          | NOT                                                                              |
-| -------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set                                           | Not a shard — multiple namespaces can live in one shard                          |
-| `LogFile`      | One `data-{id}.log` file; tracks write offset, exposes positioned I/O                                     | Not a WAL segment; the log IS the store                                          |
-| `active` file  | The only writable file at any time; receives all new appends                                              | Not memory-mapped; accessed via io_uring                                         |
-| `sealed` files | Immutable; readable only; eligible for reclaim                                                            | Not deleted until reclaim completes the rename                                   |
-| Footer         | Per-key metadata block at the end of a file; enables fast recovery                                        | Written to the active file on clean shutdown; absence means crash or in-progress |
-| Tombstone      | A record with the `TOMBSTONE` flag; marks a key as deleted in the log                                     | Not a physical delete — the old record remains until reclaim                     |
-| TTL-update     | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy                               | Not authoritative until replayed against the index                               |
-| `NsIndex`      | In-memory `FxHashMap` from key → `IndexEntry`; the read path                                              | Not persisted — rebuilt from log on every open                                   |
-| `IndexEntry`   | 16-byte struct: file_id + record_offset + record_size + flags                                             | Does not hold the value or the key                                               |
-| Reclaim        | GC: rewrites live keys into one new file; auto-triggered by sealed-file count threshold or `BGREWRITEAOF` | Caller must serialize with writes; cannot run concurrently with appends          |
-| `flush()`      | Unlinks and recreates all files (CoW snapshot invalidation)                                               | Not fsync — this destroys all data in the namespace                              |
+| Term           | What It Controls                                                                                          | NOT                                                                                 |
+| -------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `NamespaceLog` | All reads/writes for one key-space; owns the index and file set                                           | Not a shard — multiple namespaces can live in one shard                             |
+| `LogFile`      | One `data-{id}.log` file; tracks write offset, exposes positioned I/O                                     | Not a WAL segment; the log IS the store                                             |
+| `active` file  | The only writable file at any time; receives all new appends                                              | Not memory-mapped; accessed via io_uring                                            |
+| `sealed` files | Immutable; readable only; eligible for reclaim                                                            | Not deleted until reclaim completes the rename                                      |
+| Footer         | Per-key metadata block at the end of a file; enables fast recovery                                        | Written to the active file on clean shutdown; absence means crash or in-progress    |
+| Tombstone      | A record with the `TOMBSTONE` flag; marks a key as deleted in the log                                     | Not a physical delete — the old record remains until reclaim                        |
+| TTL-update     | A tiny record with the `TTL_UPDATE` flag; updates expiry with no value copy                               | Not authoritative until replayed against the index                                  |
+| `NsIndex`      | In-memory key → `IndexEntry` map (`BTreeMap`, ordered for SCAN) + TTL sidecar + value-sep sidecar         | Not persisted — rebuilt from log on every open                                      |
+| `IndexEntry`   | 24-byte struct: record_offset (u64) + record_size (u32) + file_id (u32) + tstamp_ms (u64)                 | Does not hold the value, the key, or flags; `tstamp_ms` doubles as the CAS revision |
+| `ValueStore`   | Content-addressed blob store for large (value-separated) values; refcounted, deduped, deferred-GC         | Not in the log — compaction moves only the 16-byte pointer, never the blob          |
+| Reclaim        | GC: rewrites live keys into one new file; auto-triggered by sealed-file count threshold or `BGREWRITEAOF` | Caller must serialize with writes; cannot run concurrently with appends             |
+| `flush()`      | Unlinks and recreates all files (CoW snapshot invalidation)                                               | Not fsync — this destroys all data in the namespace                                 |
 
 ## Core Mechanisms
 
@@ -127,7 +142,7 @@ Every record on disk is self-describing:
 Byte range   Field           Notes
 0..8         crc64-nvme      covers bytes 8..end of record
 8..16        tstamp_ms       monotonic; used for tie-breaking on recovery
-16           flags           TOMBSTONE=0x01 | NO_EXPIRY=0x02 | TTL_UPDATE=0x04
+16           flags           TOMBSTONE=0x01 | NO_EXPIRY=0x02 | TTL_UPDATE=0x04 | VALUE_SEP=0x08
 17..25       expires_at_ms   0 when NO_EXPIRY flag set
 25..29       key_size        u32
 29..33       val_size        u32
@@ -135,17 +150,34 @@ Byte range   Field           Notes
 37..         key || val || meta
 ```
 
-The CRC covers the entire record body. Any byte-level corruption causes the record to be skipped on recovery (active file is truncated to the last clean record).
+`HEADER_LEN = 37`. When `VALUE_SEP` is set the `val` field is not the value but
+a 16-byte BLAKE3-128 content hash pointing into the blob store (see Value
+Separation below); `val_size == 16` in that case.
+
+The CRC covers the entire record body. Any byte-level corruption causes the
+record to be skipped: on recovery the active file is truncated to the last clean
+record, and on the watch catch-up path (`scan_since` / `scan_file_records`) the
+scan of that file stops at the first bad CRC rather than streaming a corrupt
+event.
 
 ### Sealed file footer (`file.rs`)
 
-When a file is sealed (by reclaim or a future rotation), a footer is appended:
+When a file is sealed (by reclaim, rotation, or clean-shutdown seal), a footer is appended:
 
 ```
-[ IndexEntry × N ][ entry_count: u64 ][ crc64: u64 ][ magic: u64 = 0x4259_4F4E_445F_4B56 ]
+[ FooterEntry × N ][ footer_body_len: u64 ][ crc64: u64 ][ magic: u64 = 0x4259_4F4E_445F_4B58 ]
 ```
 
-The magic value (`BYOND_KV` in ASCII) lets recovery distinguish a cleanly sealed file from a crashed active file. If the footer is present and CRC-valid, recovery uses it to populate the index without scanning the full file body.
+Each `FooterEntry` carries `key`, `record_offset`, `record_size`,
+`expires_at_ms` (optional), `tstamp_ms`, and the optional 16-byte value-sep hash
+— enough to rebuild the index, the TTL sidecar, and the blob refcounts without
+reading record bodies. The 24-byte trailer is `footer_body_len`, the body CRC,
+and the magic.
+
+The magic value (`BYOND_KX` in ASCII — the `X` marks the v3 format that added
+the per-entry tstamp and value-sep hash) lets recovery distinguish a cleanly
+sealed file from a crashed active file. If the footer is present and CRC-valid,
+recovery uses it to populate the index without scanning the full file body.
 
 ### In-memory index and TTL sidecar (`index.rs`)
 
@@ -156,6 +188,30 @@ The magic value (`BYOND_KV` in ASCII) lets recovery distinguish a cleanly sealed
 ### Reclaim atomicity (`reclaim.rs`)
 
 The compaction rename (`data-{id}.log.tmp` → `data-{id}.log`) is the only atomic step. If the process crashes before the rename, the `.tmp` file is abandoned and recovery ignores it. If the crash happens after the rename but before old files are unlinked, the old sealed files remain; the next reclaim will skip them because the index no longer references their entries. Dead files produce a log warning, not an error.
+
+### Value separation (`value_store.rs`)
+
+Values `>= config.value_sep_threshold` (default 128 KiB = one GlideFS block) are
+written WiscKey-style to a content-addressed blob store at `{dir}/values/`
+instead of inline in the log. The log record then carries only a 16-byte
+BLAKE3-128 content hash (the `VALUE_SEP` flag marks this). Because the pointer is
+tiny and immutable, compaction relocates pointers, never large values —
+collapsing large-value write amplification.
+
+Blobs are:
+
+- **Deduped** — identical content across keys/forks/tenants maps to one blob.
+- **Refcounted** — refcounts are in-memory, rebuilt from the live index on open.
+- **Write-once + crash-durable** — the blob's data AND its directory entry are
+  fsynced before the pointer record can become durable, so a crash can at worst
+  leave an orphan blob (reclaimed by `sweep_orphans`), never a dangling pointer.
+- **Deferred-GC** — when the last reference drops, the blob is queued and only
+  physically unlinked after the next log fsync (`collect_garbage`), so a
+  power-loss revert always finds its blob still present. A same-content `put`
+  racing the unlink is serialized by a per-hash file stripe.
+
+On read, the blob is fetched by hash and re-hashed to verify integrity — parity
+with the CRC the inline path pays on every read.
 
 ## State Machine
 
@@ -201,20 +257,28 @@ The engine runs on a single-threaded `monoio` runtime per shard. There is no cro
 
 ## Failure Modes
 
-| Failure                         | What Actually Happens                      | Recovery                                                                                          |
-| ------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Crash mid-append (active file)  | Partial record at tail of active file      | Recovery replays records; stops and truncates at first bad CRC                                    |
-| Crash mid-reclaim before rename | `.tmp` file left on disk                   | Ignored on next open (no `.log` suffix); old sealed files intact                                  |
-| Crash mid-reclaim after rename  | Old sealed files not unlinked              | Next reclaim drops them; logged as warnings                                                       |
-| Sealed file footer corrupt      | Footer CRC check fails                     | Falls back to full sequential record scan                                                         |
-| Read from expired key           | Returns `None`; tombstone appended lazily  | Tombstone write is best-effort; a crash before it completes means the key re-expires on next read |
-| `flush()` called accidentally   | All namespace files unlinked and recreated | Data is gone; no recovery — `flush()` is a destructive reset                                      |
-| Clean shutdown (SIGTERM/SIGINT) | Footer written to active file before exit  | Next startup treats it as sealed; no record replay needed                                         |
+| Failure                                       | What Actually Happens                       | Recovery                                                                                                        |
+| --------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Crash mid-append (active file)                | Partial record at tail of active file       | Recovery replays records; stops and truncates at first bad CRC                                                  |
+| Crash mid-reclaim before rename               | `.tmp` file left on disk                    | Ignored on next open (no `.log` suffix); old sealed files intact                                                |
+| Crash mid-reclaim after rename                | Old sealed files not unlinked               | Next reclaim drops them; logged as warnings                                                                     |
+| Sealed file footer corrupt                    | Footer CRC check fails                      | Falls back to full sequential record scan                                                                       |
+| Read from expired key                         | Returns `None`; tombstone appended lazily   | Tombstone write is best-effort; a crash before it completes means the key re-expires on next read               |
+| `flush()` called accidentally                 | All namespace files unlinked and recreated  | Data is gone; no recovery — `flush()` is a destructive reset                                                    |
+| Clean shutdown (SIGTERM/SIGINT)               | Footer written to active file before exit   | Next startup treats it as sealed; no record replay needed                                                       |
+| Crash after blob write, before pointer record | Orphan blob on disk, no referencing key     | `sweep_orphans` unlinks it on next open (refcounts rebuilt from the live index first)                           |
+| Corrupt record on watch replay                | CRC mismatch in `scan_file_records`         | Scan of that file stops at the bad record; no bogus event is streamed                                           |
+| `open_ro` of merged file fails mid-reclaim    | Merged file on disk, in-memory swap aborted | Index/sealed left untouched; old (unlinked-but-open) fds keep serving reads until restart finds the merged file |
 
 ## Configuration
 
 `LogConfig` (`config.rs`):
 
-| Field           | Default      | What It Controls                                                                        |
-| --------------- | ------------ | --------------------------------------------------------------------------------------- |
-| `max_file_size` | (caller-set) | Byte threshold at which the active file is rotated to sealed and a new active is opened |
+| Field                 | Default | What It Controls                                                                              |
+| --------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `rotate_threshold`    | 1 GiB   | Byte threshold at which the active file is sealed and a fresh active is opened                |
+| `fanout`              | 8       | Size-tiered compaction fanout: a level merges into the next once it holds this many runs      |
+| `value_sep_threshold` | 128 KiB | Values `>=` this go to the content-addressed blob store instead of inline (one GlideFS block) |
+
+`KV_COMPACTION_FANOUT` and `KV_VALUE_SEP_THRESHOLD` env vars override `fanout`
+and `value_sep_threshold` at `ShardStore::open` (fanout is clamped to `>= 2`).

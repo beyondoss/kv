@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 /// (header + key + value + metadata). The header carries key/value/meta sizes so
 /// we can slice the value out in-memory.
 ///
-/// Layout: u64 + u32 + u16 + (2 pad) + u64 = 24 bytes.
+/// Layout: u64 + u32 + u32 + (2 pad) + u64 = 24 bytes.
 ///
 /// 4 GiB single-record limit (well above Redis's 512 MiB string ceiling).
 /// 65k files per namespace × `rotate_threshold` = comfortable disk ceiling.
@@ -21,12 +21,12 @@ use rustc_hash::FxHashMap;
 pub struct IndexEntry {
     pub record_offset: u64,
     pub record_size: u32,
-    pub file_id: u16,
+    pub file_id: u32,
     pub tstamp_ms: u64,
 }
 
 impl IndexEntry {
-    pub fn new(file_id: u16, record_offset: u64, record_size: u32, tstamp_ms: u64) -> Self {
+    pub fn new(file_id: u32, record_offset: u64, record_size: u32, tstamp_ms: u64) -> Self {
         Self {
             record_offset,
             record_size,
@@ -41,6 +41,10 @@ pub struct NsIndex {
     map: BTreeMap<Bytes, IndexEntry>,
     /// TTL sidecar — only TTL'd keys pay extra memory. FxHashMap for O(1) point lookups.
     ttl: FxHashMap<Bytes, u64>,
+    /// Value-separation sidecar: `key -> content hash` for keys whose value lives
+    /// in the blob store. Only large-value keys pay this. Used to unref the old
+    /// blob on overwrite/delete and to rebuild blob refcounts on recovery.
+    valsep: FxHashMap<Bytes, crate::value_store::ContentHash>,
     /// Best-effort live key count: incremented on insert, decremented on remove.
     /// Lazy-expired keys are included until tombstoned, matching Redis DBSIZE semantics.
     live_count: usize,
@@ -57,8 +61,33 @@ impl NsIndex {
         Self {
             map: BTreeMap::new(),
             ttl: FxHashMap::default(),
+            valsep: FxHashMap::default(),
             live_count: 0,
         }
+    }
+
+    /// Content hash for a value-separated key, if any.
+    pub fn valsep(&self, key: &[u8]) -> Option<crate::value_store::ContentHash> {
+        self.valsep.get(key).copied()
+    }
+
+    /// Record (or clear) the blob hash for a key. `Some` marks it value-separated;
+    /// `None` clears (e.g. overwrite from a large value to a small inline one).
+    pub fn set_valsep(&mut self, key: &Bytes, hash: Option<crate::value_store::ContentHash>) {
+        match hash {
+            Some(h) => {
+                self.valsep.insert(key.clone(), h);
+            }
+            None => {
+                self.valsep.remove(key);
+            }
+        }
+    }
+
+    /// Iterate `(key, content hash)` for all value-separated keys. Used at open
+    /// to rebuild blob refcounts.
+    pub fn valsep_iter(&self) -> impl Iterator<Item = (&Bytes, &crate::value_store::ContentHash)> {
+        self.valsep.iter()
     }
 
     pub fn len(&self) -> usize {
@@ -104,6 +133,7 @@ impl NsIndex {
 
     pub fn remove(&mut self, key: &[u8]) -> Option<IndexEntry> {
         self.ttl.remove(key);
+        self.valsep.remove(key);
         let removed = self.map.remove(key);
         if removed.is_some() {
             self.live_count = self.live_count.saturating_sub(1);
@@ -114,6 +144,7 @@ impl NsIndex {
     pub fn clear(&mut self) {
         self.map.clear();
         self.ttl.clear();
+        self.valsep.clear();
         self.live_count = 0;
     }
 

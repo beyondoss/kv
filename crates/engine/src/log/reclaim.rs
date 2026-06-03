@@ -11,6 +11,23 @@ use crate::log::file::{
     BufGuard, FooterEntry, LogFile, data_filename, footer_entry_from_index, reclaim_tmp_filename,
 };
 use crate::log::index::IndexEntry;
+use crate::log::record::{HEADER_LEN, flags as rflags, parse_header};
+
+/// If `record_bytes` is a value-separated record, return its 16-byte blob hash
+/// so the new sealed file's footer carries it forward (recovery + GC depend on
+/// the footer hash). The record bytes themselves are copied verbatim by reclaim.
+fn value_hash_of(record_bytes: &[u8]) -> Option<[u8; 16]> {
+    let hdr = parse_header(record_bytes, 0).ok()?;
+    if hdr.flags & rflags::VALUE_SEP == 0 || hdr.val_size as usize != 16 {
+        return None;
+    }
+    let start = HEADER_LEN + hdr.key_size as usize;
+    let end = start + 16;
+    let slice = record_bytes.get(start..end)?;
+    let mut h = [0u8; 16];
+    h.copy_from_slice(slice);
+    Some(h)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReclaimReport {
@@ -20,7 +37,7 @@ pub struct ReclaimReport {
     /// Files whose unlink failed after compaction; disk space is not freed until
     /// a subsequent reclaim or manual cleanup.
     pub dead_files_leaked: u32,
-    pub new_file_id: u16,
+    pub new_file_id: u32,
 }
 
 /// Read every live entry from `sealed_files` and write them into a single new
@@ -32,7 +49,7 @@ pub struct ReclaimReport {
 pub async fn reclaim_namespace(
     dir: PathBuf,
     sealed_files: &[Rc<LogFile>],
-    next_file_id: u16,
+    next_file_id: u32,
     live: &[(Bytes, IndexEntry, Option<u64>)],
 ) -> Result<(ReclaimReport, Vec<(Bytes, IndexEntry, Option<u64>)>)> {
     let tmp_path = dir.join(reclaim_tmp_filename(next_file_id));
@@ -52,7 +69,7 @@ pub async fn reclaim_namespace(
     new_file.truncate_to(0).await?;
 
     // Build an owned-Rc map so read futures can capture file handles without borrowing.
-    let file_map: FxHashMap<u16, Rc<LogFile>> = sealed_files
+    let file_map: FxHashMap<u32, Rc<LogFile>> = sealed_files
         .iter()
         .map(|f| (f.file_id, Rc::clone(f)))
         .collect();
@@ -84,6 +101,7 @@ pub async fn reclaim_namespace(
 
     for ((key, old_entry, ttl), bytes_res) in live.iter().zip(read_results) {
         let bytes = bytes_res?.into_inner();
+        let value_hash = value_hash_of(&bytes);
         let (new_offset, _) = new_file.append(bytes).await?;
         live_bytes += old_entry.record_size as u64;
         let new_entry = IndexEntry::new(
@@ -93,7 +111,12 @@ pub async fn reclaim_namespace(
             old_entry.tstamp_ms,
         );
         new_entries.push((key.clone(), new_entry, *ttl));
-        footer.push(footer_entry_from_index(key.clone(), &new_entry, *ttl));
+        footer.push(footer_entry_from_index(
+            key.clone(),
+            &new_entry,
+            *ttl,
+            value_hash,
+        ));
     }
 
     new_file.write_footer(&footer).await?;
@@ -101,6 +124,10 @@ pub async fn reclaim_namespace(
 
     let final_path = dir.join(data_filename(next_file_id));
     monoio::fs::rename(&tmp_path, &final_path).await?;
+    // Make the rename durable: without fsyncing the directory, a power loss could
+    // leave the merged file under its tmp name (or nameless) while old inputs are
+    // already unlinked below — losing the compacted data.
+    crate::log::file::sync_dir(&dir).await;
 
     let live_keys = new_entries.len() as u64;
 
