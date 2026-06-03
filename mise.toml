@@ -42,10 +42,13 @@ run = "npm ci"
 dir = "sdk/ts"
 
 [tasks."test:unit:rs"]
-run = "cargo test --lib"
+# Serialized (--test-threads=1): each test builds its own monoio io_uring
+# runtime; running many in parallel exhausts the CI runner's lockable memory and
+# io_uring_setup fails with ENOMEM. One ring at a time keeps memory bounded.
+run = "cargo test --lib -- --test-threads=1"
 
 [tasks."test:integration:rs"]
-run = "cargo test --test cross_shard --test http --test resp --test tls"
+run = "cargo test --test cross_shard --test http --test resp --test tls -- --test-threads=1"
 
 [tasks."test:handoff:rs"]
 description = "End-to-end handoff tests (real beyond-kv subprocesses, listener-FD inheritance, flock dance, data persistence across binary swap). Serial because each test spawns 2+ KV processes with their own ephemeral ports."
