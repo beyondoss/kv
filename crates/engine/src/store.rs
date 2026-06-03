@@ -383,7 +383,15 @@ impl ShardStore {
         } else {
             WriteCondition::KeyAbsent
         };
-        let expires_at_ms = opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?;
+        // Honor KEEPTTL the same way `set` does: preserve the key's existing
+        // expiry instead of silently clearing it. Relevant to SETXX (the key
+        // exists, so it may carry a TTL); on SETNX the key is absent, so the
+        // index lookup returns None and this is a no-op.
+        let expires_at_ms = if opts.keep_ttl {
+            nslog.index.borrow().ttl(key)
+        } else {
+            opts.ttl.map(|d| Self::validate_ttl(d, now)).transpose()?
+        };
         let meta_bytes: Vec<u8> = opts
             .metadata
             .as_ref()
@@ -978,7 +986,11 @@ impl ShardStore {
         // stripe and checks BEFORE appending, so a lost race writes nothing (no
         // futile append) and simply returns `None` — the retry below re-reads and
         // tries again. No dedicated INCR lock is needed any more.
-        for _ in 0..8u8 {
+        // 64 attempts, not 8: a hot counter incremented hundreds of times per
+        // tick can legitimately lose 8 CAS races in a row and still be making
+        // progress. The cap only exists to bound a pathological livelock, so set
+        // it well above realistic same-key contention before surfacing Conflict.
+        for _ in 0..64u16 {
             let now = now_ms();
 
             // Read current value + TTL + revision for the CAS condition.
@@ -1078,11 +1090,11 @@ impl ShardStore {
             KeyFilter::Exact(k) => self
                 .watchers
                 .borrow_mut()
-                .subscribe_key(ns_b, Bytes::copy_from_slice(k)),
+                .subscribe_key(ns_b, Bytes::copy_from_slice(k))?,
             KeyFilter::Prefix(p) => self
                 .watchers
                 .borrow_mut()
-                .subscribe_prefix(ns_b, Bytes::copy_from_slice(p)),
+                .subscribe_prefix(ns_b, Bytes::copy_from_slice(p))?,
         };
 
         let nslog = self.ensure_ns(ns).await?;
@@ -2444,6 +2456,113 @@ mod tests {
                 .parse()
                 .unwrap();
             assert_eq!(final_val, CONTENDERS as i64 * PER_CONTENDER);
+        });
+    }
+
+    /// Regression: `set_conditional` (SETXX/SETNX) used to ignore `keep_ttl` and
+    /// silently clear the key's TTL. SETXX with KEEPTTL must preserve the
+    /// existing expiry, matching `set`'s behavior.
+    #[test]
+    fn setxx_keep_ttl_preserves_existing_expiry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set_ttl(&s, b"kt", b"v1", Duration::from_secs(3600)).await;
+            let ok = s
+                .setxx(
+                    "default",
+                    b"kt",
+                    Bytes::from_static(b"v2"),
+                    SetOptions {
+                        ttl: None,
+                        metadata: None,
+                        keep_ttl: true,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(ok, "setxx on a live key must succeed");
+            assert_eq!(get_value(&s, b"kt").await.unwrap().as_ref(), b"v2");
+            match s.ttl("default", b"kt").await.unwrap() {
+                TtlResult::Remaining(secs) => {
+                    assert!(secs > 0, "KEEPTTL must preserve the existing TTL")
+                }
+                other => panic!("expected Remaining, got {other:?}"),
+            }
+        });
+    }
+
+    /// Regression: `current_entries` emitted `revision: 0` for every initial
+    /// watch event, breaking the documented "dedup by revision" contract across
+    /// the subscribe→scan window. Initial events must carry the key's real
+    /// revision — the same value a subsequent GET reports.
+    #[test]
+    fn watch_initial_event_carries_real_revision() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"wr", b"v").await;
+            let expected = s.get("default", b"wr").await.unwrap().unwrap().revision;
+            let (initial, _rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"wr"), 0)
+                .await
+                .unwrap();
+            assert_eq!(initial.len(), 1);
+            match &initial[0] {
+                WatchEvent::Set { revision, .. } => {
+                    assert!(
+                        *revision > 0,
+                        "initial event must carry a real revision, not 0"
+                    );
+                    assert_eq!(
+                        *revision, expected,
+                        "initial revision must match GET revision so callers can dedup"
+                    );
+                }
+                other => panic!("expected Set, got {other:?}"),
+            }
+        });
+    }
+
+    /// Regression: `scan_file_records` (the watch catch-up / `scan_since` path)
+    /// skipped the CRC check every other record-reading path performs, so a
+    /// bit-flipped record would be streamed to subscribers as a bogus event.
+    /// With the CRC check, the corrupt record is skipped and no event is emitted.
+    #[test]
+    fn watch_replay_skips_crc_corrupted_record() {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        run(async move {
+            let s = open_store(&path).await;
+            set(&s, b"ck", b"hello").await;
+            // Flush so the record bytes are on disk where scan_since reads them.
+            s.sync_logs().await.unwrap();
+            let active_path = s.get_ns("default").unwrap().active.borrow().path.clone();
+
+            // Corrupt the first value byte. Record at offset 0: HEADER_LEN(37) +
+            // key "ck"(2) = byte 39 is the first value byte. Flipping it breaks
+            // the record CRC without disturbing the parseable header.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&active_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(39)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.flush().unwrap();
+
+            // since=1 (< the record's ms-epoch tstamp) routes through scan_since,
+            // which reads from disk and now hits the corrupted bytes.
+            let (initial, _rx) = s
+                .watch_subscribe("default", KeyFilter::Exact(b"ck"), 1)
+                .await
+                .unwrap();
+            assert!(
+                initial.is_empty(),
+                "a CRC-corrupt record must not be replayed as a watch event, got {initial:?}"
+            );
         });
     }
 }

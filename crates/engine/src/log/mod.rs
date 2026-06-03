@@ -43,7 +43,13 @@ use crate::value_store::{ContentHash, ValueStore};
 
 pub fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as u64,
+        Ok(d) => u64::try_from(d.as_millis()).unwrap_or_else(|_| {
+            // ~584 million years past the epoch — not reachable in practice,
+            // but saturate explicitly rather than silently truncating, matching
+            // the checked conversion in `ShardStore::validate_ttl`.
+            warn!("millisecond timestamp exceeds u64::MAX; saturating");
+            u64::MAX
+        }),
         Err(_) => {
             warn!("system clock is before UNIX epoch; timestamps will be 0");
             0
@@ -706,11 +712,26 @@ impl NamespaceLog {
         }
         let futures: Vec<_> = misses.iter().map(|(_, e)| self.read_record(*e)).collect();
         let results: Vec<Result<BufGuard>> = join_all(futures).await;
-        let mut out: Vec<(usize, Bytes, Bytes)> = Vec::with_capacity(misses.len());
+        // Extract synchronously, then deref all value-separated blobs concurrently
+        // — the same io_uring batching the record reads above already get. Without
+        // this, a bulk_read over N large (value-separated) values fans out the
+        // record reads in parallel but then fetches the N blobs one at a time.
+        let mut extracted: Vec<(usize, Bytes, Bytes, u8)> = Vec::with_capacity(misses.len());
         for ((slot, _entry), bytes_res) in misses.into_iter().zip(results.into_iter()) {
             let bytes = bytes_res?;
             let (value, metadata, flags) = Self::extract_value_meta(&bytes)?;
-            out.push((slot, self.deref(value, flags).await?, metadata));
+            extracted.push((slot, value, metadata, flags));
+        }
+        let deref_results = join_all(
+            extracted
+                .iter()
+                .map(|(_, value, _, flags)| self.deref(value.clone(), *flags)),
+        )
+        .await;
+        let mut out: Vec<(usize, Bytes, Bytes)> = Vec::with_capacity(extracted.len());
+        for ((slot, _value, metadata, _flags), derefed) in extracted.into_iter().zip(deref_results)
+        {
+            out.push((slot, derefed?, metadata));
         }
         Ok(out)
     }
@@ -746,7 +767,7 @@ impl NamespaceLog {
 
         let mut events = Vec::with_capacity(live.len());
         for (slot, value, meta_bytes) in read_results {
-            let (key, _, expires_at_ms) = &live[slot];
+            let (key, entry, expires_at_ms) = &live[slot];
             let metadata = if meta_bytes.is_empty() {
                 None
             } else {
@@ -763,7 +784,11 @@ impl NamespaceLog {
                 value,
                 metadata,
                 expires_at_ms: *expires_at_ms,
-                revision: 0,
+                // The key's real revision (its record tstamp), NOT 0. The
+                // subscribe-then-scan window can surface a write in both `initial`
+                // and the live channel; callers dedup by revision, so an `initial`
+                // event must carry the same revision the live channel will.
+                revision: entry.tstamp_ms,
             });
         }
         Ok(events)
@@ -1036,8 +1061,12 @@ impl NamespaceLog {
     /// start of every write (before `begin_write`), so writes stall during a
     /// reclaim instead of erroring, and waiters never hold the in-flight count.
     async fn await_reclaim(&self) {
+        // 500µs, not 50µs: a reclaim of a large namespace can take seconds, and
+        // every concurrent writer parks here for its whole duration. The coarser
+        // interval cuts timer-wheel churn ~10× across all waiting writers while
+        // adding at most ~half a millisecond to post-reclaim write latency.
         while self.reclaim_in_progress.get() {
-            monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+            monoio::time::sleep(std::time::Duration::from_micros(500)).await;
         }
     }
 
@@ -1135,6 +1164,18 @@ impl NamespaceLog {
             total.dead_files_dropped += report.dead_files_dropped;
             total.dead_files_leaked += report.dead_files_leaked;
 
+            // Open the merged file FIRST — it is the only fallible step left. If
+            // it fails (EMFILE, hardware error), we return with the index and
+            // sealed map untouched: they still reference the old file_ids, whose
+            // `Rc<LogFile>` handles remain open. On Linux those fds keep serving
+            // reads even though `reclaim_namespace` already unlinked the paths, so
+            // no key goes dark before the next restart (which finds the merged
+            // file on disk). Mutating in-memory state before this open could leave
+            // the index pointing at a `next_id` absent from `sealed` — reads of
+            // those keys would fail with "file_id not found" until restart.
+            let new_file =
+                Rc::new(LogFile::open_ro(self.dir.join(data_filename(next_id)), next_id).await?);
+            // From here on every step is infallible: commit the swap atomically.
             {
                 let mut index = self.index.borrow_mut();
                 for (key, entry, ttl) in new_entries {
@@ -1148,13 +1189,9 @@ impl NamespaceLog {
                     sealed.remove(id);
                     levels.remove(id);
                 }
+                sealed.insert(next_id, new_file);
+                levels.insert(next_id, lvl.saturating_add(1));
             }
-            let new_file =
-                Rc::new(LogFile::open_ro(self.dir.join(data_filename(next_id)), next_id).await?);
-            self.sealed.borrow_mut().insert(next_id, new_file);
-            self.level
-                .borrow_mut()
-                .insert(next_id, lvl.saturating_add(1));
         }
 
         // 3. Open a fresh active file.
@@ -1236,6 +1273,19 @@ async fn scan_file_records(
                 Ok(b) => b,
                 Err(_) => break,
             };
+            // Verify integrity before trusting bytes we hand to a subscriber: a
+            // corrupt record must not be streamed as a bogus watch event. Every
+            // other record-reading path (replay_active, rebuild_from_records,
+            // extract_value_meta) checks the CRC; this one must too. Stop scanning
+            // this file at the first bad CRC — the record_len we'd skip forward by
+            // is itself covered by the CRC and can't be trusted past a mismatch.
+            if record::verify_crc(&hdr, &hdr_bytes, &body, offset).is_err() {
+                warn!(
+                    offset,
+                    "bad CRC during watch replay; stopping scan of this file"
+                );
+                break;
+            }
             let key = &body[..hdr.key_size as usize];
             if filter.matches(key) {
                 let is_tombstone = hdr.flags & record::flags::TOMBSTONE != 0;
@@ -2701,13 +2751,8 @@ mod reclaim_concurrency_tests {
             let b = log.clone();
             let t_reclaim = monoio::spawn(async move { a.reclaim().await });
             let t_write = monoio::spawn(async move {
-                b.put_full(
-                    Bytes::from_static(b"during-reclaim"),
-                    &[1u8; 80],
-                    &[],
-                    None,
-                )
-                .await
+                b.put_full(Bytes::from_static(b"during-reclaim"), &[1u8; 80], &[], None)
+                    .await
             });
             let wr = t_write.await;
             let rr = t_reclaim.await;

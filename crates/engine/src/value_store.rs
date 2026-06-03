@@ -132,7 +132,10 @@ impl ValueStore {
     /// data, then fsync the parent directory so the new directory entry survives a
     /// power loss. Returns only once the blob is durable on stable storage.
     async fn write_blob_durable(&self, h: &ContentHash, value: &[u8]) -> Result<()> {
-        let _ = monoio::fs::create_dir_all(&self.dir).await; // idempotent
+        // Propagate a create failure rather than swallow it: if the directory
+        // can't be made, the `open` below fails with a generic ENOENT that hides
+        // the real cause (e.g. EACCES on the parent). idempotent: Ok if it exists.
+        monoio::fs::create_dir_all(&self.dir).await?;
         let file = monoio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -144,15 +147,18 @@ impl ValueStore {
         file.sync_all().await?; // blob bytes durable
         let _ = file.close().await;
         // fsync the directory so the blob's name is durable before any pointer
-        // record referencing it can become durable.
-        if let Ok(dir) = monoio::fs::OpenOptions::new()
+        // record referencing it can become durable. A failure here weakens the
+        // crash-durability contract (the blob's directory entry may not survive a
+        // power loss, leaving a durable pointer aimed at a nameless blob), so
+        // surface it as an error rather than swallow it. The caller rolls back the
+        // refcount on Err, so a failed durability step never leaves a phantom ref.
+        let dir = monoio::fs::OpenOptions::new()
             .read(true)
             .open(&self.dir)
-            .await
-        {
-            let _ = dir.sync_all().await;
-            let _ = dir.close().await;
-        }
+            .await?;
+        let sync_res = dir.sync_all().await;
+        let _ = dir.close().await;
+        sync_res?;
         Ok(())
     }
 

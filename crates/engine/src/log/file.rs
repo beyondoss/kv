@@ -97,6 +97,10 @@ impl Deref for BufGuard {
 
 impl BufGuard {
     pub(crate) fn into_inner(mut self) -> Vec<u8> {
+        // SAFETY: `take` moves the inner Vec out of the ManuallyDrop exactly
+        // once. The immediately-following `mem::forget(self)` prevents `Drop`
+        // from running and taking it a second time, so the single-take
+        // invariant holds across both code paths (this and `drop`).
         let buf = unsafe { ManuallyDrop::take(&mut self.0) };
         std::mem::forget(self);
         buf
@@ -105,6 +109,9 @@ impl BufGuard {
 
 impl Drop for BufGuard {
     fn drop(&mut self) {
+        // SAFETY: `Drop::drop` runs at most once per value, and `into_inner`
+        // is the only other consumer — it `mem::forget`s the guard so this
+        // `drop` cannot run after it. Thus the inner Vec is taken exactly once.
         let buf = unsafe { ManuallyDrop::take(&mut self.0) };
         pool_release(buf);
     }
