@@ -21,7 +21,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 http = "1.0"
 memchr = "2"
 mimalloc = { version = "0.1", features = ["v2"] }
-monoio = { version = "0.2", features = ["io-uring", "unlinkat", "renameat", "sync"] }
+monoio = { version = "0.2", features = ["io-uring", "unlinkat", "renameat", "mkdirat", "sync"] }
 monoio-codec = "0.3"
 monoio-http = "0.3"
 monoio-rustls = "0.4"

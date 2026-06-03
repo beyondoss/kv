@@ -82,7 +82,27 @@ impl ShardStore {
     /// from a hot async path after the runtime is handling requests.
     pub async fn open(data_dir: &Path, memory_bytes: usize) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let config = LogConfig::default();
+        // Compaction is size-tiered (GlideFS-friendly). `KV_COMPACTION_FANOUT`
+        // tunes the per-level fanout; `KV_VALUE_SEP_THRESHOLD` the
+        // value-separation cutoff.
+        let config = {
+            let mut c = LogConfig::default();
+            if let Ok(n) = std::env::var("KV_COMPACTION_FANOUT")
+                .unwrap_or_default()
+                .parse::<usize>()
+            {
+                if n >= 2 {
+                    c.fanout = n;
+                }
+            }
+            if let Ok(n) = std::env::var("KV_VALUE_SEP_THRESHOLD")
+                .unwrap_or_default()
+                .parse::<usize>()
+            {
+                c.value_sep_threshold = n;
+            }
+            c
+        };
         let mut namespaces: FxHashMap<String, Rc<NamespaceLog>> = FxHashMap::default();
 
         // Collect valid namespace subdirectories, then open them concurrently.
@@ -160,13 +180,23 @@ impl ShardStore {
         }
         let dir = self.data_dir.join(ns);
         let nslog = Rc::new(NamespaceLog::open(dir, self.config).await?);
-        // Re-check after the await — another spawned task may have beaten us.
-        Ok(self
-            .namespaces
-            .borrow_mut()
-            .entry(ns.to_string())
-            .or_insert(nslog)
-            .clone())
+        // Re-check after the await: a concurrent task may have inserted this same
+        // namespace (dedup — return theirs, drop ours), OR filled the map to the
+        // cap while we were opening. Without the cap re-check, N concurrent opens
+        // of distinct new namespaces could all pass the pre-await gate at
+        // `len == MAX-1` and each insert, overshooting the cap.
+        let mut ns_map = self.namespaces.borrow_mut();
+        if let Some(existing) = ns_map.get(ns) {
+            return Ok(existing.clone());
+        }
+        if ns_map.len() >= MAX_NAMESPACES {
+            // Our freshly-created (empty) namespace dir is left behind; it is
+            // harmless and reused idempotently if this namespace is opened later.
+            return Err(EngineError::CapacityExceeded {
+                reason: "namespace limit reached",
+            });
+        }
+        Ok(ns_map.entry(ns.to_string()).or_insert(nslog).clone())
     }
 
     /// Test-only accessor that bypasses `ensure_ns` validation. Do not use in production code.
@@ -944,15 +974,10 @@ impl ShardStore {
     pub async fn incr(&self, ns: &str, key: &[u8], delta: i64) -> Result<i64> {
         let nslog = self.ensure_ns(ns).await?;
 
-        // Serialize INCRs within this namespace. Without the lock, every concurrent
-        // CAS attempt submits a (futile) disk append and only one wins per round —
-        // io_uring completion order is roughly submission order, so a late submitter
-        // can lose every round as new contenders refill the in-flight pool. Holding
-        // the lock makes each INCR's read-modify-write run to completion; the small
-        // retry budget below only needs to cover cross-op contention (a SET/DEL
-        // squeezing in while we're between read and write).
-        let _incr_guard = nslog.incr_lock.lock().await;
-
+        // Optimistic read-modify-write. `put_full_cond` now holds the key's write
+        // stripe and checks BEFORE appending, so a lost race writes nothing (no
+        // futile append) and simply returns `None` — the retry below re-reads and
+        // tries again. No dedicated INCR lock is needed any more.
         for _ in 0..8u8 {
             let now = now_ms();
 
@@ -1283,6 +1308,8 @@ impl ShardStore {
         // prior write — see its doc for why this beats reading last_revision()
         // here under concurrent writers.
         let revision = nslog.flush().await?;
+        // Drop all value-separated blobs for this namespace (FLUSHDB clears everything).
+        nslog.values.clear();
 
         let mut w = self.watchers.borrow_mut();
         for key in live_keys {
@@ -2417,6 +2444,157 @@ mod tests {
                 .parse()
                 .unwrap();
             assert_eq!(final_val, CONTENDERS as i64 * PER_CONTENDER);
+        });
+    }
+}
+
+#[cfg(test)]
+mod namespace_cap_tests {
+    use super::*;
+    use crate::error::EngineError;
+    use crate::types::SetOptions;
+    use bytes::Bytes;
+    use std::future::Future;
+    use std::rc::Rc;
+    use tempfile::TempDir;
+
+    fn run<F: Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("monoio runtime")
+            .block_on(f)
+    }
+
+    /// Concurrent opens of distinct new namespaces cannot overshoot the cap.
+    /// With one slot free, two tasks both pass the synchronous pre-await gate
+    /// (`len == MAX-1`), both open concurrently, then resume: the first inserts
+    /// (filling the slot) and the second's post-await re-check must reject it.
+    /// Without the cap re-check after the await, both insert → `MAX+1`: teeth.
+    #[test]
+    fn concurrent_boundary_opens_do_not_overshoot_cap() {
+        run(async {
+            let dir = TempDir::new().unwrap();
+            let s = Rc::new(ShardStore::open(dir.path(), 4 << 20).await.unwrap());
+
+            // Fill to exactly one slot below the cap.
+            let mut i = 0usize;
+            while s.namespace_count() < MAX_NAMESPACES - 1 {
+                s.set(
+                    &format!("db{i}"),
+                    b"k",
+                    Bytes::from_static(b"v"),
+                    SetOptions::default(),
+                )
+                .await
+                .unwrap();
+                i += 1;
+            }
+            assert_eq!(s.namespace_count(), MAX_NAMESPACES - 1);
+
+            // Two concurrent opens of distinct new namespaces racing for the last slot.
+            let (s1, s2) = (s.clone(), s.clone());
+            let t1 = monoio::spawn(async move {
+                s1.set(
+                    "race_a",
+                    b"k",
+                    Bytes::from_static(b"v"),
+                    SetOptions::default(),
+                )
+                .await
+            });
+            let t2 = monoio::spawn(async move {
+                s2.set(
+                    "race_b",
+                    b"k",
+                    Bytes::from_static(b"v"),
+                    SetOptions::default(),
+                )
+                .await
+            });
+            let (r1, r2) = (t1.await, t2.await);
+
+            assert_eq!(
+                s.namespace_count(),
+                MAX_NAMESPACES,
+                "cap must hold exactly under concurrent boundary opens (no overshoot)"
+            );
+            let wins = [r1.is_ok(), r2.is_ok()].into_iter().filter(|b| *b).count();
+            assert_eq!(wins, 1, "exactly one concurrent open wins the last slot");
+            let rejected = [&r1, &r2]
+                .into_iter()
+                .filter(|r| matches!(r, Err(EngineError::CapacityExceeded { .. })))
+                .count();
+            assert_eq!(rejected, 1, "the loser must get a clean CapacityExceeded");
+        });
+    }
+
+    /// The per-shard namespace cap degrades gracefully: opening distinct
+    /// namespaces succeeds up to `MAX_NAMESPACES`, the next one is rejected with a
+    /// clean `CapacityExceeded` (no panic, the map does not grow), and existing
+    /// namespaces — including `default` — keep serving reads and writes at the cap.
+    /// This is the bound that keeps NamespaceLog + file-descriptor growth finite.
+    #[test]
+    fn namespace_cap_is_enforced_and_existing_namespaces_keep_working() {
+        run(async {
+            let dir = TempDir::new().unwrap();
+            let s = ShardStore::open(dir.path(), 4 << 20).await.unwrap();
+
+            // "default" pre-exists; open distinct namespaces until the map is full.
+            let mut i = 0usize;
+            while s.namespace_count() < MAX_NAMESPACES {
+                let ns = format!("db{i}");
+                s.set(&ns, b"k", Bytes::from_static(b"v"), SetOptions::default())
+                    .await
+                    .unwrap();
+                i += 1;
+            }
+            assert_eq!(s.namespace_count(), MAX_NAMESPACES);
+
+            // One namespace over the cap: clean rejection, map unchanged.
+            let over = s
+                .set(
+                    &format!("db{i}"),
+                    b"k",
+                    Bytes::from_static(b"v"),
+                    SetOptions::default(),
+                )
+                .await;
+            assert!(
+                matches!(over, Err(EngineError::CapacityExceeded { .. })),
+                "expected CapacityExceeded at the cap, got {over:?}"
+            );
+            assert_eq!(
+                s.namespace_count(),
+                MAX_NAMESPACES,
+                "rejected open must not grow the map"
+            );
+
+            // Existing namespaces are unaffected by the cap.
+            s.set(
+                "db0",
+                b"k2",
+                Bytes::from_static(b"v2"),
+                SetOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                s.get("db0", b"k2").await.unwrap().is_some(),
+                "existing ns still writable at cap"
+            );
+            s.set(
+                "default",
+                b"dk",
+                Bytes::from_static(b"dv"),
+                SetOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                s.get("default", b"dk").await.unwrap().is_some(),
+                "default ns still works at cap"
+            );
         });
     }
 }

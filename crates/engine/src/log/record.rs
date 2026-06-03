@@ -28,6 +28,10 @@ pub mod flags {
     pub const TOMBSTONE: u8 = 0b0000_0001;
     pub const NO_EXPIRY: u8 = 0b0000_0010;
     pub const TTL_UPDATE: u8 = 0b0000_0100;
+    /// Value-separated: the record's value field is a 16-byte content hash, not
+    /// the value itself. The value lives in the content-addressed blob store
+    /// (`value_store`). Set for values >= `LogConfig::value_sep_threshold`.
+    pub const VALUE_SEP: u8 = 0b0000_1000;
 }
 
 /// Fixed header bytes preceding every record.

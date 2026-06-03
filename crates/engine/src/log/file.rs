@@ -113,7 +113,7 @@ impl Drop for BufGuard {
 /// Magic at the very end of every sealed file. Lets recovery distinguish
 /// "sealed cleanly" from "active or crashed mid-seal" without scanning.
 /// v2: includes tstamp_ms per entry for O(1) CAS revision checks.
-pub const FOOTER_MAGIC: u64 = 0x4259_4F4E_445F_4B57; // "BYOND_KW" (v2)
+pub const FOOTER_MAGIC: u64 = 0x4259_4F4E_445F_4B58; // "BYOND_KX" (v3: + value-sep hash)
 /// Footer trailer size: footer_body_len (8) + footer_crc (8) + magic (8).
 pub const FOOTER_TRAILER_LEN: u64 = 24;
 
@@ -122,6 +122,7 @@ pub const FOOTER_TRAILER_LEN: u64 = 24;
 /// Wire layout (little-endian):
 ///   [key_size: u32][record_offset: u64][record_size: u32]
 ///   [expires_at_ms: u64 (0 if absent)][has_expiry: u8][tstamp_ms: u64]
+///   [has_valsep: u8][value_hash: 16 bytes (only if has_valsep)]
 ///   [key bytes]
 #[derive(Debug, Clone)]
 pub struct FooterEntry {
@@ -130,11 +131,15 @@ pub struct FooterEntry {
     pub record_size: u32,
     pub expires_at_ms: Option<u64>,
     pub tstamp_ms: u64,
+    /// Content hash if this key's value is value-separated (lives in the blob
+    /// store). Carried in the footer so recovery rebuilds the value-sep sidecar
+    /// and blob refcounts without reading record bodies.
+    pub value_hash: Option<[u8; 16]>,
 }
 
 impl FooterEntry {
     fn encoded_size(&self) -> usize {
-        4 + 8 + 4 + 8 + 1 + 8 + self.key.len()
+        4 + 8 + 4 + 8 + 1 + 8 + 1 + if self.value_hash.is_some() { 16 } else { 0 } + self.key.len()
     }
 
     fn encode_into(&self, buf: &mut Vec<u8>) {
@@ -148,11 +153,20 @@ impl FooterEntry {
         buf.extend_from_slice(&ms.to_le_bytes());
         buf.push(has_expiry);
         buf.extend_from_slice(&self.tstamp_ms.to_le_bytes());
+        match self.value_hash {
+            Some(h) => {
+                buf.push(1u8);
+                buf.extend_from_slice(&h);
+            }
+            None => buf.push(0u8),
+        }
         buf.extend_from_slice(&self.key);
     }
 
     fn parse(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 33 {
+        // Fixed prefix: key_size(4)+offset(8)+size(4)+expires(8)+has_expiry(1)
+        //               +tstamp(8)+has_valsep(1) = 34 bytes.
+        if buf.len() < 34 {
             return None;
         }
         let key_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -167,11 +181,25 @@ impl FooterEntry {
         let tstamp_ms = u64::from_le_bytes([
             buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32],
         ]);
-        let total = 33 + key_size;
+        let has_valsep = buf[33];
+        let mut cursor = 34usize;
+        let value_hash = if has_valsep != 0 {
+            let end = cursor + 16;
+            if buf.len() < end {
+                return None;
+            }
+            let mut h = [0u8; 16];
+            h.copy_from_slice(&buf[cursor..end]);
+            cursor = end;
+            Some(h)
+        } else {
+            None
+        };
+        let total = cursor + key_size;
         if buf.len() < total {
             return None;
         }
-        let key = bytes::Bytes::copy_from_slice(&buf[33..total]);
+        let key = bytes::Bytes::copy_from_slice(&buf[cursor..total]);
         Some((
             Self {
                 key,
@@ -183,17 +211,35 @@ impl FooterEntry {
                     None
                 },
                 tstamp_ms,
+                value_hash,
             },
             total,
         ))
     }
 }
 
-pub fn data_filename(file_id: u16) -> String {
+pub fn data_filename(file_id: u32) -> String {
     format!("data-{:010}.log", file_id)
 }
 
-pub fn reclaim_tmp_filename(file_id: u16) -> String {
+/// fsync a directory so that newly-created (or renamed) entries inside it are
+/// durable. A file's own `fsync` flushes its data + inode, but POSIX does not
+/// guarantee the *directory entry* (the name → inode link) is durable until the
+/// directory itself is fsynced. Without this, a power loss could leave a freshly
+/// created data file's bytes on disk while its name is lost — making records that
+/// were already fsynced unreachable, violating the `appendfsync everysec`
+/// contract. Called at every new-file creation / rename site (rare paths:
+/// rotate, reclaim, flush, startup), never on the per-write hot path.
+/// Best-effort: opening a directory read-only and fsyncing it is the portable
+/// way; on filesystems that reject it the link is still durable via journaling.
+pub(crate) async fn sync_dir(dir: &Path) {
+    if let Ok(d) = OpenOptions::new().read(true).open(dir).await {
+        let _ = d.sync_all().await;
+        let _ = d.close().await;
+    }
+}
+
+pub fn reclaim_tmp_filename(file_id: u32) -> String {
     format!("data-{:010}.log.tmp", file_id)
 }
 
@@ -206,15 +252,20 @@ pub fn reclaim_tmp_filename(file_id: u16) -> String {
 /// safe under single-thread (`!Sync`) access; sufficient since each shard runs
 /// on its own monoio runtime.
 pub struct LogFile {
-    pub file_id: u16,
+    pub file_id: u32,
     pub path: PathBuf,
     file: File,
     write_offset: Cell<u64>,
     poisoned: Cell<bool>,
+    /// Test-only: when set, the next `append` reserves its offset (as a real
+    /// append does) then fails with ENOSPC instead of touching the disk —
+    /// faithfully modeling a disk-full write without privileges or a real fill.
+    #[cfg(test)]
+    fail_next_write: Cell<bool>,
 }
 
 impl LogFile {
-    pub async fn open_rw(path: PathBuf, file_id: u16) -> Result<Self> {
+    pub async fn open_rw(path: PathBuf, file_id: u32) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -230,10 +281,12 @@ impl LogFile {
             file,
             write_offset: Cell::new(len),
             poisoned: Cell::new(false),
+            #[cfg(test)]
+            fail_next_write: Cell::new(false),
         })
     }
 
-    pub async fn open_ro(path: PathBuf, file_id: u16) -> Result<Self> {
+    pub async fn open_ro(path: PathBuf, file_id: u32) -> Result<Self> {
         let file = OpenOptions::new().read(true).open(&path).await?;
         let metadata = file.metadata().await?;
         let len = metadata.len();
@@ -243,7 +296,16 @@ impl LogFile {
             file,
             write_offset: Cell::new(len),
             poisoned: Cell::new(false),
+            #[cfg(test)]
+            fail_next_write: Cell::new(false),
         })
+    }
+
+    /// Test-only: arm the next `append` to fail with ENOSPC after reserving its
+    /// offset, exactly as a real disk-full write would (which then poisons the file).
+    #[cfg(test)]
+    pub(crate) fn force_next_write_failure(&self) {
+        self.fail_next_write.set(true);
     }
 
     pub async fn size(&self) -> Result<u64> {
@@ -289,6 +351,15 @@ impl LogFile {
         let len = buf.len() as u64;
         let offset = self.write_offset.get();
         self.write_offset.set(offset + len);
+        #[cfg(test)]
+        if self.fail_next_write.replace(false) {
+            // Model a disk-full write: offset already reserved, nothing hits disk,
+            // file poisoned so no later write can shadow this torn slot.
+            self.poisoned.set(true);
+            return Err(EngineError::Io {
+                source: std::io::Error::from_raw_os_error(28), // ENOSPC
+            });
+        }
         let (res, buf) = self.file.write_all_at(buf, offset).await;
         if let Err(e) = res {
             self.poisoned.set(true);
@@ -425,6 +496,7 @@ pub(crate) fn footer_entry_from_index(
     key: bytes::Bytes,
     entry: &IndexEntry,
     expires_at_ms: Option<u64>,
+    value_hash: Option<[u8; 16]>,
 ) -> FooterEntry {
     FooterEntry {
         key,
@@ -432,12 +504,13 @@ pub(crate) fn footer_entry_from_index(
         record_size: entry.record_size,
         expires_at_ms,
         tstamp_ms: entry.tstamp_ms,
+        value_hash,
     }
 }
 
 /// List all `data-*.log` files in `dir`, sorted ascending by file_id.
-pub fn list_data_files(dir: &Path) -> Result<Vec<(u16, PathBuf)>> {
-    let mut out: Vec<(u16, PathBuf)> = Vec::new();
+pub fn list_data_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>> {
+    let mut out: Vec<(u32, PathBuf)> = Vec::new();
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -456,14 +529,66 @@ pub fn list_data_files(dir: &Path) -> Result<Vec<(u16, PathBuf)>> {
         let Some(num) = rest.strip_suffix(".log") else {
             continue;
         };
-        let Ok(file_id_u32) = num.parse::<u32>() else {
+        let Ok(file_id) = num.parse::<u32>() else {
             continue;
         };
-        if file_id_u32 > u16::MAX as u32 {
-            continue;
-        }
-        out.push((file_id_u32 as u16, path));
+        out.push((file_id, path));
     }
     out.sort_by_key(|(id, _)| *id);
     Ok(out)
+}
+
+#[cfg(test)]
+mod enospc_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("monoio runtime")
+            .block_on(f)
+    }
+
+    /// A failed append (disk-full) poisons the file: the offset was reserved, but
+    /// every subsequent append fails immediately. This is what prevents a later
+    /// write from landing PAST the torn slot — which would survive recovery while
+    /// the records between it and the truncation point are silently lost. Remove
+    /// the `poisoned` set/check in `append` and the third write below succeeds at
+    /// the advanced offset, shadowing the gap on the next recovery: teeth.
+    #[test]
+    fn failed_append_poisons_file_and_blocks_later_writes() {
+        run(async {
+            let dir = TempDir::new().unwrap();
+            let f = LogFile::open_rw(dir.path().join("data-0000000000.log"), 0)
+                .await
+                .unwrap();
+
+            let (off_a, _) = f.append(b"AAAA".to_vec()).await.unwrap();
+            assert_eq!(off_a, 0);
+            assert_eq!(f.size().await.unwrap(), 4, "first record on disk");
+
+            // Disk fills: this append reserves offset 4 then fails with ENOSPC.
+            f.force_next_write_failure();
+            assert!(
+                f.append(b"BBBB".to_vec()).await.is_err(),
+                "disk-full write must error"
+            );
+
+            // The file is now poisoned. A later write must NOT succeed at the
+            // advanced offset (which would leave a gap at [4,8) shadowing it).
+            let after = f.append(b"CCCC".to_vec()).await;
+            assert!(
+                after.is_err(),
+                "poisoned file must reject writes — otherwise a later write shadows the torn slot on recovery"
+            );
+            // Nothing after the first record ever reached disk.
+            assert_eq!(
+                f.size().await.unwrap(),
+                4,
+                "no bytes written past the good prefix"
+            );
+        });
+    }
 }

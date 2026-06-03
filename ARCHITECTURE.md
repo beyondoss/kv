@@ -13,16 +13,23 @@ TCP Client
 RespCodec (beyond_resp)     ← RESP2/RESP3 framing
   │ RESP Array → Bytes
   ▼
-Command::parse()            ← command.rs  — stack-allocated parsing, arity check
+Command::parse()            ← command.rs — stack-allocated parsing, arity check
   │ Command::Set { key, value, args }
+  │   bad arity / unknown option ─────────────────────────────► ERR (connection stays open)
   ▼
 dispatch()                  ← dispatch.rs — NX/XX condition, TTL conversion
-  │ SetOptions { ttl: Duration, metadata }
+  │ SetOptions { ttl, metadata }
+  │   value > KV_MAX_VALUE_BYTES ─────────────────────────────► ERR 413 / RESP ERR
   ▼
 ShardStore::set()           ← store.rs (async)
-  ├─ record::encode(tstamp, flags, expires_at_ms, key, value, metadata)
-  ├─ NamespaceLog::put_full → active_file.append(buf) → fsync   ← L2 write (io_uring)
-  └─ MemCache::insert(key, value, ...)                          ← L1 write
+  │   frozen (handoff seal in progress) ──────────────────────► ERR Frozen
+  ├─ NamespaceLog::put_full
+  │    ├─ value ≥ 128 KiB → ValueStore::put(value)             ← blob write (io_uring, write-once)
+  │    │    io error ──────────────────────────────────────────► ERR propagated to client
+  │    ├─ record::encode(tstamp, flags, expires_at_ms, key, value-or-hash, metadata)
+  │    └─ active_file.append(buf) → fsync                       ← L2 write (io_uring)
+  │         io error → file poisoned ──────────────────────────► ERR; subsequent writes fail until restart
+  └─ MemCache::insert(key, value, ...)                          ← L1 write (stores full value)
   │
   ▼
 r::ok()                     ← response.rs
@@ -41,17 +48,22 @@ Command::Get { key }
   │
   ▼
 ShardStore::get() (async)
-  ├─ MemCache::get(key, now_ms)  ── hit? ──► check expiry ──► return Entry  (L1 fast path)
+  ├─ MemCache::get(key, now_ms)  ── hit? ──► check expiry ──► return Entry  (L1 fast path; full value)
   │                                                │ expired
   │                                                ▼
   │                                  remove from L1, append tombstone, return None
   │
   └─ miss? ──► NsIndex::get(key)
-                 ├─ None ──────────────────────────────────────────► return None
-                 ├─ expired (TTL sidecar) ──► append tombstone ────► None
-                 └─ live ──► file.read_at(record_offset, record_size)  (single io_uring SQE)
-                                ├─ parse header → slice value/metadata
-                                └─ MemCache::insert ──► return Entry
+                 ├─ None ──────────────────────────────────────────────────► return None
+                 ├─ expired (TTL sidecar) ──► append tombstone ────────────► None
+                 └─ live ──► file.read_at(record_offset, record_size)        (one io_uring SQE)
+                                │ parse header → slice value field
+                                ├─ VALUE_SEP flag clear: value field IS the value
+                                │    └─ MemCache::insert(full value) ──────► return Entry
+                                └─ VALUE_SEP flag set: value field is 16-byte hash
+                                     └─ ValueStore::get(hash)               (one io_uring SQE)
+                                          ├─ blob missing ─────────────────► ERR BadRecord
+                                          └─ ok ──► MemCache::insert ──────► return Entry
   │
   ▼
 r::bulk(entry.value) or r::nil()
@@ -90,6 +102,39 @@ http.rs router
   ▼
 HTTP Client
 ```
+
+### Startup / Recovery (per shard, per namespace)
+
+```
+ShardStore::open()
+  └─ for each namespace dir found on disk:
+       NamespaceLog::open()
+         ├─ recover::open_namespace()
+         │    ├─ for each sealed data-*.log (ascending file_id):
+         │    │    ├─ read_footer()  ── magic matches? ──► apply_footer_entries()  (O(1), no body scan)
+         │    │    │                                         └─ rebuilds index + TTL + valsep sidecars
+         │    │    └─ magic mismatch / CRC fail ──► rebuild_from_records()  (full body scan, fallback)
+         │    └─ highest file:
+         │         ├─ footer present (clean shutdown) ──► treat as sealed, open new active
+         │         └─ no footer (crash) ──► replay_active()
+         │              └─ scan records; bad CRC → truncate at last good boundary
+         ├─ for each live value-separated key: ValueStore::incr_ref(hash)
+         └─ ValueStore::sweep_orphans()  ──► delete values/blob-* with no live key reference
+```
+
+### Background Durability (per shard, every 1 second)
+
+```
+ShardStore::sync_all()
+  └─ for each open namespace:
+       NamespaceLog::sync()
+         └─ unsynced_bytes > 0? ──► active_file.fsync()  (io_uring)
+              io error ──► kv_log_sync_failures_total++ ──► /readyz 503 after threshold
+```
+
+This IS the durability mechanism — `appendfsync everysec`. Individual writes call `write_all_at` (goes to the OS page cache; not yet on stable storage) and increment `unsynced_bytes`. The 1-second timer is the only thing that calls `fsync`. A crash before the next timer fires can lose up to ~1 second of writes. The meaningful secondary effect is on `/readyz`: fsync failures increment `readyz_sync_failure_count`; once it exceeds `KV_READYZ_SYNC_FAILURE_THRESHOLD` the shard reports degraded and `/readyz` returns 503.
+
+**New-file directory durability.** Whenever a new `data-*.log` is created or renamed into place (fresh namespace, rotate, reclaim, FLUSHDB, clean-shutdown recovery), the engine fsyncs the _namespace directory_ (`file.rs:sync_dir`) so the file's directory entry is durable — not just its bytes. Without this a power loss could leave a created file's fsynced records unreachable (data present, name lost), violating the everysec contract for any file past the first. This runs only on those rare paths, never on the per-write hot path. (Residual assumption: that `fsync` is honest down through the filesystem/GlideFS/hardware stack — not verifiable in software.)
 
 ### TTL Expiry
 
@@ -142,18 +187,22 @@ SCAN iterates shards sequentially: when a shard's inner cursor returns `"0"` (ex
 
 ## Concepts & Terminology
 
-| Term                   | What It Controls                                                                                                                                                                                | NOT                                                                                               |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP); max 1024 open per shard | Not an auth or tenant boundary                                                                    |
-| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                                              | A partition of the keyspace: a key lives on exactly one shard, picked by `FxHash(key) % n_shards` |
-| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                                         | Not write-through durable storage                                                                 |
-| L2 / NamespaceLog      | Persistent on-disk store; in-RAM hash index over an append-only log file; authoritative source of truth                                                                                         | Not the hot path for reads after first access                                                     |
-| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                                                 | Not modified in place; only appended                                                              |
-| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                                          | Not deleted until reclaim runs again                                                              |
-| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                                                     | Not a tombstone or deletion marker                                                                |
-| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                                            | Not a literal zero integer                                                                        |
-| `\x01`-prefixed cursor | Single-shard continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                                   | Not a user-visible value; internal to scan                                                        |
-| `\x02`-prefixed cursor | Multi-shard continuation cursor: `b"\x02"` + `[shard_idx: u8]` + per-shard inner cursor; only emitted when `n_shards > 1`                                                                       | Never produced by single-shard deployments; not a user-visible value                              |
+| Term                   | What It Controls                                                                                                                                                                                                   | NOT                                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| Namespace (`ns`)       | Which `NamespaceLog` (and therefore which on-disk directory) receives reads/writes; set by `SELECT <n>` (RESP, any non-negative integer) or `/namespaces/{ns}/` (HTTP); max 1024 open per shard                    | Not an auth or tenant boundary                                                                                                    |
+| Shard / ShardStore     | One independent storage unit per OS thread — lazily-opened `NamespaceLog` per namespace + L1 cache                                                                                                                 | A partition of the keyspace: a key lives on exactly one shard, picked by `FxHash(key) % n_shards`                                 |
+| L1 / MemCache          | In-process S3-FIFO cache that short-circuits disk reads                                                                                                                                                            | Not write-through durable storage                                                                                                 |
+| L2 / NamespaceLog      | Persistent on-disk store; ordered in-RAM index (`BTreeMap`) over an append-only log file + a blob store; authoritative source of truth                                                                             | Not the hot path for reads after first access                                                                                     |
+| Active file            | The currently-writable log file. Records are appended, fsynced, then made visible via the index                                                                                                                    | Not modified in place; only appended                                                                                              |
+| Sealed file            | A previously-active file that has been merged through reclaim. Read-only, has a footer of live entries                                                                                                             | Not deleted until reclaim runs again                                                                                              |
+| Run / Level            | A run is one sealed file; its level is its size-tier. Reclaim merges `fanout` runs at level L into one run at L+1 — bounds write amplification to O(log N)                                                         | Not persisted: a restart resets every run to level 0                                                                              |
+| Write stripe (`wlock`) | One of 64 per-namespace async mutexes; a write locks `stripe[FxHash(key) % 64]` for check→append→commit. Serializes same-key writes; makes CAS/INCR atomic                                                         | Not cross-thread (shard is single-threaded); not taken by reads; not per-key (stripes are shared, collisions just over-serialize) |
+| Value separation       | A value ≥ `value_sep_threshold` (128 KiB) is stored in the content-addressed blob store; the log record carries only its 16-byte hash, so compaction never re-uploads the value                                    | Not applied to small values (they stay inline); not a per-key dedup of small data                                                 |
+| Blob                   | An immutable, content-addressed value file at `values/blob-{hash}`; refcounted, write-once, deduped across keys; at refcount 0 it is deleted by `collect_garbage` after the next fsync (deferred for crash-safety) | Not mutated in place; not moved by compaction; not deleted eagerly on unref                                                       |
+| Ghost Set              | MemCache tracking of recently evicted keys; a ghost hit promotes the next insert directly to the Main queue                                                                                                        | Not a tombstone or deletion marker                                                                                                |
+| Cursor `"0"`           | SCAN sentinel meaning "start from beginning" or "scan complete" — the same value signals both states                                                                                                               | Not a literal zero integer                                                                                                        |
+| `\x01`-prefixed cursor | Single-shard continuation cursor: `b"\x01"` + last_key from the previous page                                                                                                                                      | Not a user-visible value; internal to scan                                                                                        |
+| `\x02`-prefixed cursor | Multi-shard continuation cursor: `b"\x02"` + `[shard_idx: u8]` + per-shard inner cursor; only emitted when `n_shards > 1`                                                                                          | Never produced by single-shard deployments; not a user-visible value                                                              |
 
 ## Core Mechanism
 
@@ -182,7 +231,7 @@ The accept loop in `main.rs` peeks the first command's key on each new connectio
 
 ### Two-Level Storage
 
-Every read checks L1 first. L1 hits avoid all disk I/O. On L1 miss the engine looks up the key in the in-RAM hash index, then issues a single io_uring `read_at(record_offset, record_size)` against the file holding that record. The header carries `key_size`/`val_size`/`meta_size`, so the value and metadata are sliced out in-memory after the read completes.
+Every read checks L1 first. L1 hits avoid all disk I/O. On L1 miss the engine looks up the key in the in-RAM index (`BTreeMap`), then issues a single io_uring `read_at(record_offset, record_size)` against the file holding that record. The header carries `key_size`/`val_size`/`meta_size`, so the value and metadata are sliced out in-memory after the read completes. If the record's `VALUE_SEP` flag is set, the sliced "value" is a 16-byte hash and one additional blob read fetches the value — still O(1), since the hash came straight from the record. The blob is then re-hashed and checked against that content hash before being returned (parity with the CRC the inline path verifies on every read) — silent blob corruption or a blob/hash mismatch surfaces as an error instead of wrong data.
 
 Writes go to both levels in order: append + fsync to disk first (durable), then L1 (hot set).
 
@@ -208,26 +257,68 @@ Each namespace gets its own directory `{data_dir}/shard-{n}/{ns}/`. Files in tha
 | key bytes | value bytes | metadata bytes |
 ```
 
-CRC-64/NVME via `crc-fast` covers everything after the CRC field. `flags` carries `TOMBSTONE` (0x01), `NO_EXPIRY` (0x02), `TTL_UPDATE` (0x04). Tombstone and TTL-update records have `val_size = meta_size = 0`.
+CRC-64/NVME via `crc-fast` covers everything after the CRC field. `flags` carries `TOMBSTONE` (0x01), `NO_EXPIRY` (0x02), `TTL_UPDATE` (0x04), `VALUE_SEP` (0x08). Tombstone and TTL-update records have `val_size = meta_size = 0`. A `VALUE_SEP` record's "value bytes" are a 16-byte content hash, not the value — the value lives in the blob store (see [Value Separation](#value-separation)).
 
-**In-RAM index** (per namespace): `FxHashMap<Bytes, IndexEntry>`. `IndexEntry` is 24 bytes:
+**In-RAM index** (per namespace): `BTreeMap<Bytes, IndexEntry>` (ordered, so SCAN is a range walk). `IndexEntry` is 24 bytes:
 
 ```rust
 struct IndexEntry {
     record_offset: u64,
     record_size: u32,
-    file_id: u16,
+    file_id: u32, // u32 (not u16): file IDs are never reused, so a hot namespace
+    // must not exhaust them — u32 ≈ unbounded; still packs to 24 B
     tstamp_ms: u64, // revision — enables O(1) CAS checks without a disk read
 }
 ```
 
-Plus a TTL sidecar `FxHashMap<Bytes, u64>` so only TTL'd keys pay the extra 16-byte slot.
+Two FxHashMap sidecars, each paid only by the keys that need it: a TTL sidecar `FxHashMap<Bytes, u64>` (TTL'd keys) and a value-separation sidecar `FxHashMap<Bytes, [u8;16]>` mapping a large-value key to its blob hash (used to unref the old blob on overwrite/delete and to rebuild blob refcounts on recovery).
 
-**Sealed-file footer** (written when the active file is rotated by reclaim): array of `(key, record_offset, record_size, expires_at_ms, tstamp_ms)` entries followed by a 24-byte trailer (body length + CRC + magic `0x4259_4F4E_445F_4B57`). On startup, recovery reads the footer of each sealed file in O(1) and rebuilds the index without scanning the file body. Sealed files with the older magic (`0x4259_4F4E_445F_4B56`, written before the `tstamp_ms` footer field was added) fall back to a full sequential scan of the file body, reading `tstamp_ms` from each record header — no explicit migration needed. The active file's tail (between its last hint checkpoint and EOF) is replayed record-by-record; first bad CRC truncates the active file at the last good boundary.
+**Sealed-file footer** (written when a file is sealed by reclaim): one entry per live key — `(key, record_offset, record_size, expires_at_ms, tstamp_ms, value_hash?)` — followed by a 24-byte trailer (body length + CRC + magic `0x4259_4F4E_445F_4B58`, "BYOND_KX" v3). The `value_hash` (present only for value-separated keys) is carried in the footer so recovery rebuilds both the index and the value-sep sidecar in O(1) without reading record bodies. On startup, recovery reads each sealed file's footer; if the magic doesn't match (older format or crash mid-seal), it falls back to a full record scan — which still repopulates the value-sep sidecar from each record's `VALUE_SEP` flag. The active file's tail is replayed record-by-record; first bad CRC truncates the active file at the last good boundary. After the index is rebuilt, blob refcounts are reconstructed by walking the value-sep sidecar (one `incr_ref` per live large-value key).
 
-**Reclaim**: seal the current active file, walk live index entries, copy live records to a new sealed file, write its footer + fsync, atomic-rename, unlink old sealed files. A fresh active file is opened. Triggered two ways: `BGREWRITEAOF` (current namespace, synchronous from the client's perspective) or the auto-reclaim background task (every `KV_RECLAIM_INTERVAL_SECS`, default 300s) which reclaims any namespace whose sealed file count exceeds `KV_RECLAIM_SEALED_THRESHOLD` (default 4, 0 = disabled).
+**Reclaim (compaction)** is **size-tiered** — one strategy, no flag (`reclaim_inner`). Triggered two ways: `BGREWRITEAOF` (current namespace, synchronous from the client's perspective) or the auto-reclaim background task (every `KV_RECLAIM_INTERVAL_SECS`, default 300s) which reclaims any namespace whose sealed file count exceeds `KV_RECLAIM_SEALED_THRESHOLD` (default 4, 0 = disabled).
 
-**FLUSHDB** unlinks-and-recreates the namespace's data files (does NOT truncate in place) so CoW sharing with the parent fork's blocks is preserved.
+A reclaim seals the active file as a fresh level-0 run, then repeatedly finds the lowest level holding ≥ `fanout` (`KV_COMPACTION_FANOUT`, default 8) runs and merges just those into one run at the next level, cascading upward (`reclaim_namespace` copies each live record's bytes verbatim into the merged file and unlinks its inputs). Each reclaim rewrites **one level, not the whole live set** — O(log N) amortized write amplification. On GlideFS this matters directly: a reclaim re-uploads one level's worth of bytes to S3, not the entire namespace.
+
+**Reclaim does not error writes.** A write that arrives during a reclaim _waits_ (`await_reclaim`, before it takes the in-flight count) and proceeds when the reclaim finishes — it never returns `ReclamationBusy` to the client (only a second _concurrent reclaim_ gets that). Before sealing, reclaim **drains in-flight writes** (waits for `in_flight_writes == 0`) so the footer it writes is a consistent snapshot — a write that appended to the active file but hadn't yet updated the index can't be missed from the footer and silently lost on a later footer recovery. `FLUSHDB` uses the same gate + drain (so a write can't race the file replacement). Trade-off: writes _stall_ for the reclaim's duration (standard LSM write-stall, bounded by level size / tunable via `rotate_threshold`·`fanout`), but they always succeed.
+
+`NamespaceLog::compaction_bytes` counts the bytes each reclaim rewrites, so write-amp is directly measurable. Level assignments live in an in-memory `RefCell<FxHashMap<u32,u8>>`; **a restart resets all runs to level 0** (levels are not yet persisted).
+
+> **Why not full-merge** (rewrite the entire live set into one file per reclaim, the classic compacting-log design)? On GlideFS, full-merge re-uploads the whole namespace to S3 on _every_ reclaim — O(live-set) each time. Measured on the real engine over 12 reclaims of a churning ~200-key set, size-tiered rewrote **4.6× fewer bytes** than full-merge would. Point reads don't pay for the extra runs: the in-RAM index resolves each key straight to `(file_id, offset)`, so a GET is one read regardless of run count. Full-merge was removed, not flag-gated.
+
+**Forks need no special handling.** A GlideFS fork is a copy-on-write volume: the child shares the parent's packs and only pays for what it writes. Because reclaim writes merged runs to _new_ offsets (never rewriting a parent's packs) and large values live in immutable blobs the child shares for free, a fork's amplification is bounded by its own divergence with zero fork-awareness in the engine — no "freeze the inherited base" step, no fork-vs-restart detection. (An earlier `freeze_inherited` design was removed: it required a fork hook that doesn't exist and pinned dead inherited data forever, defeating GC.)
+
+**FLUSHDB** unlinks-and-recreates the namespace's data files (does NOT truncate in place) so CoW sharing with the parent fork's blocks is preserved, and drops the namespace's blob store (`values/`).
+
+### Value Separation
+
+A value whose length ≥ `LogConfig::value_sep_threshold` (default **128 KiB = one GlideFS block**) is written to a content-addressed blob store at `{ns}/values/blob-{hash}` instead of inline in the log; the log record carries only the 16-byte BLAKE3-128 hash with the `VALUE_SEP` flag set. Small values stay inline. `value_store.rs` is the store; the wiring lives in `log/mod.rs` (`put_full`/`put_full_cond`/`put_many` separate on write, `read_value`/`bulk_read` deref on read).
+
+```
+SET big (256 KiB) ─► blob store: values/blob-<hash>  (262,144 bytes, write-once)
+                  └► log record: header + key + 16-byte hash  (≈100 bytes)
+GET big ─► index → record (the hash) → blob store get(hash) → value   (still ONE disk read)
+```
+
+Behavior, observed on the running binary (256 KiB value):
+
+| event                        | what actually happens                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| SET large value              | 262,144 bytes written to `values/`; **log grows ~100 bytes** (the pointer)                                                                                         |
+| GET                          | index resolves the record → 16-byte hash → blob read; one read, value returned                                                                                     |
+| identical content (any keys) | deduped to **one blob** (content-addressed, write-once)                                                                                                            |
+| BGREWRITEAOF / reclaim       | copies the ~100-byte pointer record; the blob is **never touched** — log stays tiny                                                                                |
+| overwrite / delete / expire  | the old blob is `unref`'d; at refcount 0 it is **queued**, then physically unlinked by `collect_garbage` after the next fsync (deferred — see durability ordering) |
+
+**Why:** on GlideFS, the cost that matters is _bytes moved by compaction_ — relocating a record to a new offset re-uploads it to S3 (dedup is offset-keyed). Inline, every compaction re-moves the value; a value surviving N reclaims is uploaded N+1 times. Separated, compaction only ever moves the 16-byte pointer; the value is uploaded once and reclaimed by deletion (unlink → whole blocks freed → GlideFS dead-pack GC), never by rewrite. **Measured on the real engine** (60 keys × 32 KiB, 10 churning reclaims): inline moved **22.5 MiB** of compaction bytes, value-separated moved **0.01 MiB** — 3337× less. The threshold is one block because below it a blob-per-value wastes the rest of the block (space-amp explodes); at/above it write-amp collapses to ~1×.
+
+Blob I/O is async on the shard's io_uring reactor — `monoio::fs` `read`/`write`/`remove_file`/`create_dir`/`sync_all` (the `mkdirat`/`unlinkat` features), never a blocking syscall on the hot path. Reads re-hash the blob and verify it against the content hash (integrity, see above). Blob refcounts are in-memory, rebuilt on open from the value-sep sidecar (which the footer/scan recovery repopulates); immediately after, `ValueStore::sweep_orphans` deletes any blob on disk that no live key references. The create and delete of a given content hash are serialized by a per-content **file-op lock** (16 stripes), so `collect_garbage` can never unlink a blob a same-content `put` is concurrently recreating (a by-construction guard against io_uring completion reordering).
+
+**Durability ordering** — the pointer (in the log) and the value (in a blob file) live in _different_ files, so both edges of a blob's lifetime are ordered against the log's fsync:
+
+- **Create before reference.** `put` makes the blob crash-durable _before_ it returns, before the caller writes the pointer record: `write_all_at` → `sync_all` (blob bytes) → fsync the `values/` directory (blob's name). Write-ahead ordering: a durable pointer can never reference a non-durable blob.
+- **Delete after the superseding record is durable.** `unref` only drops the refcount and _queues_ the blob; `collect_garbage` (run after each `sync`) physically deletes it. So the old blob of an overwrite/delete survives until the record that superseded it is durable. Were it deleted eagerly, a power loss that lost the superseding record would revert the key to its old value — whose blob would be gone (a dangling pointer). Deferring makes the revert safe.
+
+The log itself is `appendfsync everysec` (≤1 s of writes lost on power loss), so the worst a crash does to a value-separated write is leave an **orphan blob** (durable blob, pointer lost, or queued-but-uncollected) — which `sweep_orphans` reclaims on the next open. **There is no dangling-pointer (durable pointer, missing blob) window.** This is verified exhaustively by the `crash_consistency` test module: `exhaustive_tail_truncation_is_consistent` truncates the un-fsynced tail at **every byte offset** (and includes a value-sep overwrite in the crash zone — the case the deferred-delete fix protects); `corruption_truncates_at_bad_record_keeping_prefix` does the same for single-byte bit-rot of durable records; `torn_footer_falls_back_to_scan_across_files` reclaims to a sealed+active multi-file layout, then cuts the sealed file's footer at every offset to exercise the `read_footer`→record-scan fallback (which rebuilds value-sep state from the `VALUE_SEP` flag). Each asserts a valid recovered prefix with zero dangling pointers and zero blob leaks. The harness has teeth: reintroducing the synchronous-delete bug makes it fail at the exact offset where the overwrite is lost.
 
 ### Command Parsing (`command.rs`)
 
@@ -262,13 +353,13 @@ A connection is pinned to one shard, but multi-key commands (MGET, MSET, DEL, EX
 
 ### SCAN Glob Matching
 
-Pattern matching uses a stack-based backtracking algorithm that handles `*` (any sequence) and `?` (single character). No heap allocation; runs inline during RocksDB iteration. See `store.rs:glob_match()`.
+Pattern matching uses a stack-based backtracking algorithm that handles `*` (any sequence), `?` (single character), and `[abc]` / `[a-z]` / `[^abc]` character classes. No heap allocation; runs inline during the `BTreeMap` range walk — each key is tested as the cursor advances. See `store.rs:glob_match()`.
 
 ### Watch / Subscribe
 
 Clients can subscribe to mutations on a key or a key prefix and receive a live stream of events. The mechanism is the same for both transports; only the framing differs.
 
-**Revision** — every log record's `tstamp_ms` field doubles as a revision ID. No separate counter. Revisions are monotonically increasing per-shard and are included in every `WatchEvent`, enabling resumable subscriptions.
+**Revision** — every log record's `tstamp_ms` field doubles as a revision ID. No separate counter. Revisions are monotonically increasing per-shard (a hybrid logical clock: `max(wall_clock_ms, last_revision + 1)`), so they advance even if two writes land in the same millisecond or the wall clock steps backward mid-run. On open, the clock is **seeded from the highest tstamp recovered**, so revisions stay monotonic across a restart too (a post-restart write can never be assigned a revision ≤ existing data, which would otherwise corrupt `scan_since` watch resumption). Revisions are included in every `WatchEvent`, enabling resumable subscriptions.
 
 **WatchRegistry** (`engine/src/watch.rs`) — one per `ShardStore`, owned behind `RefCell` (no locking needed; single-threaded per shard). Holds two tables:
 
@@ -280,7 +371,7 @@ After each successful `set`, `mset`, or `del`, the store calls `WatchRegistry::n
 **Initial state delivery** (`watch_subscribe`):
 
 - `since == 0` → call `NamespaceLog::current_entries` — reads the live index + fetches values from disk for matching keys. Delivers the current state snapshot immediately.
-- `since > 0` → call `NamespaceLog::scan_since` — scans all log files in `file_id` order to replay mutations with `tstamp_ms > since`. Used by clients that reconnect after a brief disconnection to catch up without missing writes.
+- `since > 0` → call `NamespaceLog::scan_since` — scans all log files in `file_id` order to replay mutations with `tstamp_ms > since`. Used by clients that reconnect after a brief disconnection to catch up without missing writes. Value-separated records are deref'd (and integrity-checked) during the scan, so replayed events carry the real value, not the blob-hash pointer.
 
 **RESP3 transport** — `WATCH key [key ...] [SINCE <revision>]` and `PWATCH prefix [SINCE <revision>]` intercept in `handle_conn` before `dispatch()`. They require RESP3 (`HELLO 3` first). Initial events are sent as Push frames, followed by a `>2 watch ready` frame, then a live select loop:
 
@@ -318,7 +409,7 @@ GET /v1/watch?prefix=<p>&since=<r> → resumable prefix stream
 
 ### Compare-And-Swap (CAS)
 
-CAS enables optimistic concurrency control: a write succeeds only if the current revision of the key matches the caller's expected value. Because each shard is single-threaded, the check-then-write is atomic with no race window.
+CAS enables optimistic concurrency control: a write succeeds only if the current revision of the key matches the caller's expected value. The check and the write are atomic — `put_full_cond` holds the key's write stripe across check→append→commit, so no concurrent same-key write can interleave (even at the disk-I/O `.await`). A failed condition writes nothing: it checks before appending, so there is no record on disk for a CAS that returned "no" (this is what makes CAS crash-safe — a failed CAS can never resurrect after a crash).
 
 **RESP** — `SET key value REV <n>`:
 
@@ -331,13 +422,14 @@ CAS enables optimistic concurrency control: a write succeeds only if the current
 - Mismatch → `409 Conflict` + `{"error":"conflict","message":"revision mismatch"}`.
 - `GET` always returns `X-KV-Revision: <n>` so the caller can capture the revision before a CAS write.
 
-**Implementation** — `ShardStore::setrev()`:
+**Implementation** — `ShardStore::setrev()` → `NamespaceLog::put_full_cond(key, …, WriteCondition::Revision(n))`:
 
-1. `ensure_ns()` borrows the in-memory index.
-2. Reads `IndexEntry.tstamp_ms` for the key (O(1), no disk read).
-3. Expired keys are treated as absent (revision mismatch).
-4. On match: write via `put_full()`, notify watchers, return `Ok(Some(new_rev))`.
-5. On mismatch: return `Ok(None)` — no write, no disk I/O.
+1. Acquire the key's write stripe (`wlock`) — held across the whole operation.
+2. Check `IndexEntry.tstamp_ms == n` (O(1), no disk read; expired keys count as absent → mismatch).
+3. On mismatch: return `Ok(None)` immediately — **no append, no disk I/O, no record**.
+4. On match: encode + append + commit + notify watchers, return `Ok(Some(new_rev))`.
+
+Because the stripe is held from the check through the commit, no concurrent same-key write can land in between — the check is authoritative and the failed path leaves nothing on disk.
 
 `REV` is mutually exclusive with `NX`/`XX` at the protocol layer.
 
@@ -368,7 +460,7 @@ CAS enables optimistic concurrency control: a write succeeds only if the current
 
 ```
 absent ──SET──► live
-  live ──GET──► live  (freq bumped in L1; revision returned in X-KV-Revision / Entry.revision)
+  live ──GET──► live  (freq bumped in L1; revision in X-KV-Revision / Entry.revision)
   live ──DEL──► absent
   live ──expired────► absent  (lazy, on next access or L1 sweep)
   live ──PERSIST──► live (TTL cleared)
@@ -378,11 +470,30 @@ absent ──SET──► live
 absent ──CAS──────────────────► absent (mismatch; 409 / nil returned)
 ```
 
+| From   | Event              | To     | Guard                          | What Actually Happens                                                                                                                                           |
+| ------ | ------------------ | ------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| absent | SET                | live   | —                              | Record appended + fsynced; index entry inserted; L1 populated. Large value written to blob store first; record carries 16-byte hash.                            |
+| live   | SET (overwrite)    | live   | —                              | New record appended; index entry replaced; L1 updated. Old blob `unref`'d if value-separated; new blob written (dedup: no write if identical content).          |
+| live   | SET NX             | live   | key present                    | No write, no disk I/O. Returns nil / 0.                                                                                                                         |
+| absent | SET NX             | live   | key absent                     | Same as SET.                                                                                                                                                    |
+| live   | SET XX             | live   | key present                    | Same as SET (overwrite).                                                                                                                                        |
+| absent | SET XX             | absent | key absent                     | No write. Returns nil / 0.                                                                                                                                      |
+| live   | DEL                | absent | —                              | Tombstone appended; index entry removed; L1 evicted. Blob `unref`'d if value-separated → unlinked at refcount 0.                                                |
+| live   | EXPIRE             | live   | —                              | TTL_UPDATE record appended; TTL sidecar updated. No value rewrite.                                                                                              |
+| live   | PERSIST            | live   | —                              | TTL_UPDATE record (NO_EXPIRY flag) appended; TTL sidecar entry removed.                                                                                         |
+| live   | GET (TTL elapsed)  | absent | `now_ms ≥ expires_at_ms`       | Tombstone appended; index + TTL sidecar cleared; L1 evicted. Blob `unref`'d. Caller receives nil.                                                               |
+| live   | CAS (rev matches)  | live   | `tstamp_ms == expected`        | Same as SET overwrite. New revision returned.                                                                                                                   |
+| live   | CAS (rev mismatch) | live   | `tstamp_ms != expected`        | No write, no disk I/O. 409 / nil returned.                                                                                                                      |
+| absent | CAS                | absent | key absent = revision mismatch | No write. 409 / nil returned.                                                                                                                                   |
+| live   | FLUSHDB            | absent | —                              | All data files unlinked and recreated; blob store directory removed; index and sidecars cleared. CoW sharing with parent fork preserved (unlink, not truncate). |
+
 ## Why It Behaves This Way
 
 ### Why each thread has its own engine instance
 
-Sharing storage across threads would require locking on the index and the active-file write offset. Per-thread instances eliminate that coordination entirely and keep the hot path lock-free. The tradeoff is that the routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
+Sharing storage across threads would require cross-thread locking on the index and the active-file write offset. Per-thread instances eliminate that coordination entirely: **reads are lock-free**, and there is no cross-thread synchronization anywhere. The tradeoff is that the routing layer must pin each client connection to a thread — a key read on thread 0 won't see a write made on thread 1.
+
+Within a shard, writes take one **per-key stripe lock** (64 stripes per namespace, `wlock(key)`) for their check→append→commit. This is _not_ cross-thread (the shard is single-threaded; it's an async mutex serializing the cooperative tasks that interleave at `.await` points). Writes to different keys hash to different stripes and proceed fully concurrently; only same-key writes serialize. It exists so conditional writes (CAS/NX/XX) and read-modify-write (INCR) are atomic on disk — the holder checks before appending, so a failed condition or lost race writes nothing (no orphan record). Reads never take it.
 
 Connection routing is built into the server: `peek_resp_key` peeks the first bytes of a new TCP connection (without consuming them), extracts the key from the first command, and runs `FxHash(key) % n_shards` to pick a worker thread. The connection is then pinned to that thread for its lifetime. Multi-key commands (MGET, MSET, DEL, EXISTS) whose keys span shards are transparently fanned out via per-shard request channels (see "Cross-Shard Fan-Out") so the client sees a single response in original key order — no `CROSSSLOT` error.
 
@@ -408,26 +519,28 @@ Redis protocol defines SCAN to return "0" when iteration is complete. Reusing "0
 
 ### Why MSET is atomic (within one shard)
 
-Redis MSET is documented as atomic. Within a single shard this implementation builds one buffer containing every record, calls `write_at(buf, base_offset)` and `fsync()` once, then bulk-updates the index — all keys land or none do. The L1 cache is populated after the disk fsync; in the narrow window between the two, a cache miss correctly falls back to disk and sees all keys.
+Redis MSET is documented as atomic. Within a single shard this implementation builds one buffer containing every record and calls `write_all_at(buf, base_offset)` — a single OS write — then bulk-updates the index atomically. All keys are visible together or not at all: a crash before the next 1-second fsync loses all of them; a crash after leaves all of them. The L1 cache is populated after the write; a cache miss in the narrow window correctly falls back to disk and sees all keys.
 
 Across shards (when MSET keys span shard boundaries), atomicity is **not** preserved: each shard's subset commits independently, matching Redis Cluster's semantics.
 
 ## Configuration
 
-| CLI Flag / Env Var                                                     | Default              | What It Controls at Runtime                                                                       |
-| ---------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------- |
-| `--data-dir` / `KV_DATA_DIR`                                           | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`)                                      |
-| `--resp-port` / `KV_RESP_PORT`                                         | `6379`               | TCP port each thread's RESP listener binds to                                                     |
-| `--http-address` / `KV_ADDRESS`                                        | `0.0.0.0:4869`       | Socket address each thread's HTTP listener binds to (full `ip:port`)                              |
-| `--threads` / `KV_THREADS`                                             | `num_cpus::get()`    | Number of OS threads (= number of shards)                                                         |
-| `--memory-bytes` / `KV_MEMORY_BYTES`                                   | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads                                              |
-| `--max-conns-per-shard` / `KV_MAX_CONNS_PER_SHARD`                     | `10000`              | Per-shard connection cap; connections beyond this are dropped immediately with a busy response    |
-| `--idle-timeout-secs` / `KV_IDLE_TIMEOUT_SECS`                         | `60`                 | Seconds of inactivity before a connection is closed                                               |
-| `--max-value-bytes` / `KV_MAX_VALUE_BYTES`                             | `67108864` (64 MB)   | Maximum accepted value size; larger bodies are rejected with HTTP 413 or RESP `ERR`               |
-| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD`           | `4`                  | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim |
-| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS`                 | `300`                | Seconds between auto-reclaim scans (ignored when threshold is 0)                                  |
-| `--readyz-sync-failure-threshold` / `KV_READYZ_SYNC_FAILURE_THRESHOLD` | `3`                  | Consecutive log-sync failures on any shard before `/readyz` returns 503                           |
-| `--log-level` / `LOG_LEVEL`                                            | `info`               | `tracing` filter level; set `ENVIRONMENT=development` for pretty-printed logs                     |
+| CLI Flag / Env Var                                                     | Default              | What It Controls at Runtime                                                                                                                                                |
+| ---------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--data-dir` / `KV_DATA_DIR`                                           | `/var/lib/beyond/kv` | Root path for all shard directories (`{data_dir}/shard-{n}`)                                                                                                               |
+| `--resp-port` / `KV_RESP_PORT`                                         | `6379`               | TCP port each thread's RESP listener binds to                                                                                                                              |
+| `--http-address` / `KV_ADDRESS`                                        | `0.0.0.0:4869`       | Socket address each thread's HTTP listener binds to (full `ip:port`)                                                                                                       |
+| `--threads` / `KV_THREADS`                                             | `num_cpus::get()`    | Number of OS threads (= number of shards)                                                                                                                                  |
+| `--memory-bytes` / `KV_MEMORY_BYTES`                                   | `268435456` (256 MB) | Total L1 cache budget; divided evenly across threads                                                                                                                       |
+| `--max-conns-per-shard` / `KV_MAX_CONNS_PER_SHARD`                     | `10000`              | Per-shard connection cap; connections beyond this are dropped immediately with a busy response                                                                             |
+| `--idle-timeout-secs` / `KV_IDLE_TIMEOUT_SECS`                         | `60`                 | Seconds of inactivity before a connection is closed                                                                                                                        |
+| `--max-value-bytes` / `KV_MAX_VALUE_BYTES`                             | `67108864` (64 MB)   | Maximum accepted value size; larger bodies are rejected with HTTP 413 or RESP `ERR`                                                                                        |
+| `--reclaim-sealed-threshold` / `KV_RECLAIM_SEALED_THRESHOLD`           | `4`                  | Auto-reclaim a namespace when its sealed file count exceeds this value; `0` disables auto-reclaim                                                                          |
+| `--reclaim-interval-secs` / `KV_RECLAIM_INTERVAL_SECS`                 | `300`                | Seconds between auto-reclaim scans (ignored when threshold is 0)                                                                                                           |
+| `KV_COMPACTION_FANOUT`                                                 | `8`                  | Size-tiered compaction: a level merges into the next once it holds this many runs (higher = less write-amp, more space-amp); values < 2 ignored                            |
+| `KV_VALUE_SEP_THRESHOLD`                                               | `131072` (128 KiB)   | Values ≥ this go to the content-addressed blob store instead of inline; one GlideFS block — below it a blob-per-value wastes space, at/above it write-amp collapses to ~1× |
+| `--readyz-sync-failure-threshold` / `KV_READYZ_SYNC_FAILURE_THRESHOLD` | `3`                  | Consecutive log-sync failures on any shard before `/readyz` returns 503                                                                                                    |
+| `--log-level` / `LOG_LEVEL`                                            | `info`               | `tracing` filter level; set `ENVIRONMENT=development` for pretty-printed logs                                                                                              |
 
 ## Observability
 
@@ -474,43 +587,50 @@ The server is designed to run inside a trusted network perimeter (the same Glide
 
 ## Failure Modes
 
-| Failure                          | What Actually Happens                                                                                                                           | Recovery                                                            |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Thread panic                     | `panic = "abort"` — process terminates immediately; no unwinding                                                                                | External process supervisor restarts the process                    |
-| Disk write error                 | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open                                                        | Client retries; underlying disk issue must be resolved externally   |
-| CRC mismatch on replay           | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records | Automatic; the offending tail bytes are dropped                     |
-| Bad record header                | `EngineError::BadRecord`; treated as the truncation point during replay                                                                         | Affected tail records are lost; older records survive               |
-| RESP parse error                 | Connection closed; no response sent                                                                                                             | Client reconnects                                                   |
-| HTTP malformed request           | JSON error body `{"error": "...", "message": "..."}` with 4xx status                                                                            | Client fixes request                                                |
-| Expired key read                 | Tombstone appended, evicted from L1; `None` returned to caller                                                                                  | Transparent; client sees cache miss                                 |
-| Crash during MSET (single shard) | Single fsynced write — either all records land or the partial tail is truncated by recovery's CRC check                                         | No partial state; client can safely retry                           |
-| Crash during cross-shard MSET    | Each shard's subset is independent; some shards may have committed before the crash                                                             | Client retries; idempotent overwrites converge to the desired state |
-| Crash mid-reclaim                | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim                                          | Automatic; no data loss (no rename happened)                        |
-| L1 cache over capacity           | Eviction runs inline during insert; oldest Small-queue entries dropped first                                                                    | Automatic; no data loss (L2 is authoritative)                       |
+| Failure                                                                     | What Actually Happens                                                                                                                                                                                                                                                                                                   | Recovery                                                                                                                                                                                                                           |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Thread panic                                                                | `panic = "abort"` — process terminates immediately; no unwinding                                                                                                                                                                                                                                                        | External process supervisor restarts the process                                                                                                                                                                                   |
+| Process crash between writes and fsync                                      | Writes in the last ≤1 second (since the previous timer-fsync) are lost — they went to the OS page cache but not stable storage                                                                                                                                                                                          | Up to ~1 second of writes lost; recovery truncates the active file at the last fsynced CRC boundary                                                                                                                                |
+| Disk write error                                                            | `EngineError::Io` propagated; RESP client receives `ERR` response; connection stays open                                                                                                                                                                                                                                | Client retries; underlying disk issue must be resolved externally                                                                                                                                                                  |
+| CRC mismatch on replay                                                      | `EngineError::CrcMismatch` during recovery — active file truncates at the last good boundary, sealed-file footer falls back to scanning records                                                                                                                                                                         | Automatic; the offending tail bytes are dropped                                                                                                                                                                                    |
+| Bad record header                                                           | `EngineError::BadRecord`; treated as the truncation point during replay                                                                                                                                                                                                                                                 | Affected tail records are lost; older records survive                                                                                                                                                                              |
+| Value-separated blob corrupted (bit-rot, mismatch)                          | Read re-hashes the blob; on content-hash mismatch returns `EngineError::BadRecord` instead of the wrong bytes (parity with inline CRC)                                                                                                                                                                                  | Detected, not silent; the key reads as an error until the blob is restored/overwritten                                                                                                                                             |
+| RESP parse error                                                            | Connection closed; no response sent                                                                                                                                                                                                                                                                                     | Client reconnects                                                                                                                                                                                                                  |
+| HTTP malformed request                                                      | JSON error body `{"error": "...", "message": "..."}` with 4xx status                                                                                                                                                                                                                                                    | Client fixes request                                                                                                                                                                                                               |
+| Expired key read                                                            | Tombstone appended, evicted from L1; `None` returned to caller                                                                                                                                                                                                                                                          | Transparent; client sees cache miss                                                                                                                                                                                                |
+| Crash during MSET (single shard)                                            | All records are built into one buffer and written with a single `write_all_at` — they're atomically visible or not from the OS perspective, but are only on stable storage after the next 1s fsync. A crash before that fsync loses the whole MSET. Recovery truncates the active file at the last fsynced CRC boundary | The MSET either fully lands or is fully absent after recovery — no partial MSET state                                                                                                                                              |
+| Crash during cross-shard MSET                                               | Each shard's subset is independent; some shards may have committed before the crash                                                                                                                                                                                                                                     | Client retries; idempotent overwrites converge to the desired state                                                                                                                                                                |
+| Crash mid-reclaim                                                           | Old sealed files are still authoritative; tmp file from the partial reclaim is removed on next reclaim                                                                                                                                                                                                                  | Automatic; no data loss (no rename happened)                                                                                                                                                                                       |
+| Crash between blob write and log append                                     | The blob is written but no record references it — an **orphan blob** (wasted disk only, never data loss). Recovery doesn't index it (no footer/record points at it)                                                                                                                                                     | `ValueStore::sweep_orphans` at the next open deletes every `values/blob-*` not referenced by a live key. Proven on the binary across a SIGKILL restart                                                                             |
+| Power loss after a value-sep overwrite/delete, before its record is durable | The key reverts to its previous value (everysec: the un-fsynced overwrite is lost). The old blob is **still present** — its deletion was deferred until the superseding record's fsync, which didn't happen                                                                                                             | Reads return the old value correctly (no dangling pointer). If the superseding record _was_ durable, the old blob is instead a true orphan → reclaimed by `sweep_orphans`. Exhaustively verified by the crash-consistency tests    |
+| Concurrent same-key write races a conditional write (CAS/NX/XX), then crash | **Closed.** Conditional writes hold the key's write stripe and check the condition _before_ appending, so a failed condition writes **no record at all** — there is no optimistic orphan to resurrect. (Previously: an aborted optimistic CAS left a valid orphan record a crash could resurrect.)                      | N/A — the orphan-producing code path was removed, not guarded. Verified by `concurrency_tests::concurrent_mixed_writes_recover_to_runtime_state` (recovery reproduces runtime exactly under heavy same-key CAS/SET/DEL contention) |
+| L1 cache over capacity                                                      | Eviction runs inline during insert; oldest Small-queue entries dropped first                                                                                                                                                                                                                                            | Automatic; no data loss (L2 is authoritative)                                                                                                                                                                                      |
 
 ## File Map
 
-| File                               | What It Does                                                                                                                                                |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/proto/src/command.rs`      | Parses RESP arrays into `Command` enum; validates arity and option syntax                                                                                   |
-| `crates/proto/src/response.rs`     | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply)                                                                                   |
-| `crates/proto/src/error.rs`        | Protocol-level error variants returned to clients                                                                                                           |
-| `crates/engine/src/store.rs`       | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET                                                                    |
-| `crates/engine/src/cache.rs`       | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting                                                                                 |
-| `crates/engine/src/types.rs`       | `Entry`, `SetOptions`, `TtlResult`, `ScanPage`                                                                                                              |
-| `crates/engine/src/error.rs`       | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON)                                                                      |
-| `crates/engine/src/log/mod.rs`     | `NamespaceLog`: index + active + sealed files; put_full / put_many / tombstone / ttl_update / bulk_read / flush / reclaim                                   |
-| `crates/engine/src/log/file.rs`    | `LogFile`: monoio io_uring file wrapper; append, read_at, write_footer, read_footer                                                                         |
-| `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                                                             |
-| `crates/engine/src/log/index.rs`   | `NsIndex`: hashmap + TTL sidecar + bucket-cursor SCAN                                                                                                       |
-| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers; clean-shutdown active file has a footer (fast path), crash falls back to CRC-truncating replay                          |
-| `crates/engine/src/log/reclaim.rs` | Threshold-triggered merge of sealed files into a new sealed file; also exposed as `BGREWRITEAOF`                                                            |
-| `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                                                      |
-| `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                                                     |
-| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS                                              |
-| `crates/server/src/cross_shard.rs` | `CrossShardRequest` enum (MGet, MSet, Del, Set, Incr, DelRev, SetNx, SetXx, SetRev, GetDel, …) + per-shard receiver loop; `futures_channel::mpsc` transport |
-| `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                                                      |
-| `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                                                            |
-| `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint; batch endpoint                                                |
-| `crates/server/src/routing.rs`     | `peek_resp_key` / `peek_http_key` — peek first bytes of a new connection to extract routing key; `shard_for_key` (FxHash); percent-decode for HTTP paths    |
-| `crates/server/src/metrics.rs`     | Prometheus metric definitions (`MetricsInner` / `Metrics`); `encode()` flushes atomic cache counters into registered `CounterVec` before gathering          |
+| File                               | What It Does                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/proto/src/command.rs`      | Parses RESP arrays into `Command` enum; validates arity and option syntax                                                                                                                                                                                                                                                                                                                                                                                         |
+| `crates/proto/src/response.rs`     | Builds RESP values (ok, nil, bulk, error, array, hello reply, scan reply)                                                                                                                                                                                                                                                                                                                                                                                         |
+| `crates/proto/src/error.rs`        | Protocol-level error variants returned to clients                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `crates/engine/src/store.rs`       | `ShardStore`: all storage operations; coordinates L1 + L2; expiry logic; SCAN; bulk MGET                                                                                                                                                                                                                                                                                                                                                                          |
+| `crates/engine/src/cache.rs`       | `MemCache`: S3-FIFO in-memory cache; eviction; ghost set; memory accounting                                                                                                                                                                                                                                                                                                                                                                                       |
+| `crates/engine/src/types.rs`       | `Entry`, `SetOptions`, `TtlResult`, `ScanPage`                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `crates/engine/src/error.rs`       | Storage-level errors (I/O, CRC mismatch, bad record, invalid namespace, metadata JSON)                                                                                                                                                                                                                                                                                                                                                                            |
+| `crates/engine/src/log/mod.rs`     | `NamespaceLog`: index + active + sealed files + blob store; put_full / put_many / tombstone / ttl_update / bulk_read / flush; `reclaim` → `reclaim_inner` (size-tiered); value separation on write (`maybe_separate`/`apply_valsep_insert`) and deref on read; `compaction_bytes`                                                                                                                                                                                 |
+| `crates/engine/src/value_store.rs` | `ValueStore`: content-addressed blob store (`values/blob-{hash}`), all I/O async via `monoio::fs` (io_uring); `put` (write-once + dedup, fsync data+dir before returning), `get`, `unref` (refcount-- + queue), `collect_garbage` (delete queued blobs after fsync), `incr_ref` (recovery), `sweep_orphans` (reclaim crash-orphaned blobs at open), `clear` (FLUSHDB); per-content `flock` stripes serialize create/delete; callers re-hash on read for integrity |
+| `crates/engine/src/log/config.rs`  | `LogConfig`: `rotate_threshold`, `fanout` (KV_COMPACTION_FANOUT), `value_sep_threshold`                                                                                                                                                                                                                                                                                                                                                                           |
+| `crates/engine/src/log/file.rs`    | `LogFile`: monoio io_uring file wrapper; append, read_at; `FooterEntry` (+ `value_hash`) encode/decode + footer magic v3                                                                                                                                                                                                                                                                                                                                          |
+| `crates/engine/src/log/record.rs`  | Record encoding/decoding; CRC-64/NVME via `crc-fast`; flag bits                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `crates/engine/src/log/index.rs`   | `NsIndex`: `BTreeMap` + TTL sidecar + value-sep hash sidecar + range-cursor SCAN                                                                                                                                                                                                                                                                                                                                                                                  |
+| `crates/engine/src/log/recover.rs` | Startup: parse sealed-file footers (incl. `value_hash`); clean-shutdown active file has a footer (fast path), crash falls back to CRC-truncating replay; repopulates the value-sep sidecar                                                                                                                                                                                                                                                                        |
+| `crates/engine/src/log/reclaim.rs` | `reclaim_namespace`: merge a set of sealed files into one new sealed file, unlink inputs (called once per level by size-tiered reclaim); also exposed as `BGREWRITEAOF`                                                                                                                                                                                                                                                                                           |
+| `crates/server/src/main.rs`        | Thread spawning; per-thread Monoio runtime + ShardStore initialization                                                                                                                                                                                                                                                                                                                                                                                            |
+| `crates/server/src/config.rs`      | CLI arg + env var parsing into `Config`                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `crates/server/src/dispatch.rs`    | Maps `Command` → `ShardStore` calls → RESP response; `ConnState`; cross-shard fan-out for MGET/MSET/DEL/EXISTS                                                                                                                                                                                                                                                                                                                                                    |
+| `crates/server/src/cross_shard.rs` | `CrossShardRequest` enum (MGet, MSet, Del, Set, Incr, DelRev, SetNx, SetXx, SetRev, GetDel, …) + per-shard receiver loop; `futures_channel::mpsc` transport                                                                                                                                                                                                                                                                                                       |
+| `crates/engine/src/watch.rs`       | `WatchEvent`, `KeyFilter`, `WatchRegistry` — per-shard subscription registry; dead-sender lazy pruning                                                                                                                                                                                                                                                                                                                                                            |
+| `crates/server/src/resp.rs`        | TCP accept loop; RESP framing; connection state machine; `WATCH`/`PWATCH` streaming (RESP3 only)                                                                                                                                                                                                                                                                                                                                                                  |
+| `crates/server/src/http.rs`        | HTTP route handlers; header/query param extraction; JSON error responses; SSE watch endpoint; batch endpoint                                                                                                                                                                                                                                                                                                                                                      |
+| `crates/server/src/routing.rs`     | `peek_resp_key` / `peek_http_key` — peek first bytes of a new connection to extract routing key; `shard_for_key` (FxHash); percent-decode for HTTP paths                                                                                                                                                                                                                                                                                                          |
+| `crates/server/src/metrics.rs`     | Prometheus metric definitions (`MetricsInner` / `Metrics`); `encode()` flushes atomic cache counters into registered `CounterVec` before gathering                                                                                                                                                                                                                                                                                                                |

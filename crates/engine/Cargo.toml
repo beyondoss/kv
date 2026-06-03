@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = "1"
 bytes.workspace = true
 crc-fast.workspace = true
 futures-channel.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 divan = "0.1"
+libc = "0.2"
 tempfile = "3"
 
 [[bench]]

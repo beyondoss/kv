@@ -39,6 +39,7 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
         // Fresh namespace — create active file id 0.
         let path = dir.join(crate::log::file::data_filename(0));
         let active = LogFile::open_rw(path, 0).await?;
+        crate::log::file::sync_dir(&dir).await; // make the new file's dir entry durable
         return Ok(OpenedFiles {
             sealed,
             active,
@@ -80,11 +81,11 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
                 offset: 0,
                 reason: "file_id overflow on clean-shutdown recovery",
             })?;
-            if next_id >= u16::MAX - 100 {
+            if next_id >= u32::MAX - 100 {
                 warn!(
                     file_id = next_id,
-                    remaining = u16::MAX - next_id,
-                    "file_id nearing u16::MAX; compact sealed files to reclaim IDs"
+                    remaining = u32::MAX - next_id,
+                    "file_id nearing u32::MAX; compact sealed files to reclaim IDs"
                 );
             }
             let new_path = active_path
@@ -94,7 +95,9 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
                     reason: "namespace data_dir has no parent; cannot compute next-file path",
                 })?
                 .join(crate::log::file::data_filename(next_id));
-            LogFile::open_rw(new_path, next_id).await?
+            let active = LogFile::open_rw(new_path, next_id).await?;
+            crate::log::file::sync_dir(&dir).await; // new active after clean-shutdown recovery
+            active
         }
         None => {
             drop(highest);
@@ -111,16 +114,19 @@ pub async fn open_namespace(dir: PathBuf) -> Result<OpenedFiles> {
     })
 }
 
-fn apply_footer_entries(index: &mut NsIndex, file_id: u16, entries: &[FooterEntry]) {
+fn apply_footer_entries(index: &mut NsIndex, file_id: u32, entries: &[FooterEntry]) {
     for e in entries {
         let entry = IndexEntry::new(file_id, e.record_offset, e.record_size, e.tstamp_ms);
         index.insert(e.key.clone(), entry, e.expires_at_ms);
+        // Value-separated keys carry their blob hash in the footer — repopulate
+        // the sidecar so overwrite/delete can unref and blob refcounts rebuild.
+        index.set_valsep(&e.key, e.value_hash);
     }
 }
 
 /// Scan a file's records from the start, populating the index. Used as a
 /// fallback when a sealed file's footer is missing/corrupt.
-async fn rebuild_from_records(file: &LogFile, file_id: u16, index: &mut NsIndex) -> Result<()> {
+async fn rebuild_from_records(file: &LogFile, file_id: u32, index: &mut NsIndex) -> Result<()> {
     let total = file.size().await?;
     let mut offset = 0u64;
     while offset < total {
@@ -156,7 +162,7 @@ async fn rebuild_from_records(file: &LogFile, file_id: u16, index: &mut NsIndex)
 
 /// Replay the active file from offset 0 to EOF. On bad CRC, truncate at the
 /// last good boundary.
-async fn replay_active(file: &LogFile, file_id: u16, index: &mut NsIndex) -> Result<()> {
+async fn replay_active(file: &LogFile, file_id: u32, index: &mut NsIndex) -> Result<()> {
     let total = file.size().await?;
     let mut offset = 0u64;
     let mut last_good = 0u64;
@@ -205,7 +211,7 @@ async fn replay_active(file: &LogFile, file_id: u16, index: &mut NsIndex) -> Res
 
 fn apply_record(
     index: &mut NsIndex,
-    file_id: u16,
+    file_id: u32,
     offset: u64,
     hdr: &crate::log::record::RecordHeader,
     body: &[u8],
@@ -251,5 +257,22 @@ fn apply_record(
     } else {
         Some(hdr.expires_at_ms)
     };
-    index.insert(Bytes::copy_from_slice(key), entry, ttl);
+    let key_bytes = Bytes::copy_from_slice(key);
+    index.insert(key_bytes.clone(), entry, ttl);
+    // Value-separated record: the value field is the 16-byte blob hash. Repopulate
+    // the sidecar so the blob can be unref'd on a later overwrite/delete.
+    if hdr.flags & rflags::VALUE_SEP != 0 {
+        let vstart = hdr.key_size as usize;
+        let vend = vstart + hdr.val_size as usize;
+        if hdr.val_size as usize == 16 && body.len() >= vend {
+            let mut h = [0u8; 16];
+            h.copy_from_slice(&body[vstart..vend]);
+            index.set_valsep(&key_bytes, Some(h));
+        } else {
+            warn!(
+                offset,
+                "value-separated record without a 16-byte hash; ignoring sidecar entry"
+            );
+        }
+    }
 }
