@@ -12,7 +12,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       - name: install:ts
         run: mise run install:ts
@@ -24,6 +24,9 @@ jobs:
         working-directory: sdk/ts/kv
       - name: build:ts
         run: mise run build:ts
+      - name: upgrade npm
+        # OIDC trusted publishing requires npm >= 11.5.1; node LTS ships npm 10.
+        run: npm install -g npm@latest
       - name: publish
         run: npm publish --access public
         working-directory: sdk/ts/kv
