@@ -68,6 +68,37 @@ describe("snapshot — real KV", () => {
     expect(snap.get("polled")).toEqual({ on: true });
   });
 
+  it("fires onChange once per real edit, never for unchanged re-reads (byte dedup)", async () => {
+    const name = `dedup-${crypto.randomUUID()}`;
+    await writeDef(kv, name, { on: true, rollout: { percent: 50 } });
+
+    const changes: string[][] = [];
+    const ours = () => changes.flat().filter((n) => n === name);
+    snap = new Snapshot(kv, {
+      refresh: 1, // poll every second
+      watch: false,
+      onChange: (names) => changes.push(names),
+    });
+    snap.start();
+    await snap.ready(); // initial load — onChange suppressed
+
+    // Several poll cycles re-read the identical def. Same bytes → no events.
+    await sleep(2_200);
+    expect(ours()).toEqual([]);
+
+    // A genuine edit is detected on the next poll — exactly once.
+    await writeDef(kv, name, { on: false });
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && ours().length === 0) {
+      await sleep(100);
+    }
+    expect(ours()).toEqual([name]);
+
+    // Re-reading the now-stable value must not keep firing.
+    await sleep(2_200);
+    expect(ours()).toEqual([name]);
+  });
+
   it("ignores keys outside flags:def: prefix", async () => {
     const { error } = await kv.set("not-a-flag", JSON.stringify({ on: true }));
     expect(error).toBeUndefined();

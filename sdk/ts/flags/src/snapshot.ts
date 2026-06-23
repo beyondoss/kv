@@ -19,7 +19,12 @@ const decoder = new TextDecoder();
  * Reads are O(1) Map lookups — zero KV round-trips per flag eval.
  */
 export class Snapshot {
-  private state = new Map<string, FlagDef>();
+  /**
+   * Parsed def plus the exact KV bytes it was decoded from. The raw bytes are
+   * the source of truth for change detection (see {@link applyValue}) — keeping
+   * them avoids re-serializing parsed objects to compare.
+   */
+  private state = new Map<string, { def: FlagDef; raw: Uint8Array }>();
   private readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private watchAbort: AbortController | undefined;
@@ -69,7 +74,7 @@ export class Snapshot {
 
   /** Lookup the current state for a flag. Returns `undefined` if absent. */
   get(name: string): FlagDef | undefined {
-    return this.state.get(name);
+    return this.state.get(name)?.def;
   }
 
   /** Start the snapshot: initial load + background sync (watch or poll). */
@@ -196,8 +201,17 @@ export class Snapshot {
 
   /**
    * Decode and store a flag def. Returns `true` if the stored value actually
-   * changed (added or differs from the prior def) so callers can fire change
-   * notifications without spurious events on no-op re-reads.
+   * changed (newly added, or its KV bytes differ from the prior value) so
+   * callers can fire change notifications without spurious events on no-op
+   * re-reads — every poll re-reads every def, so an unchanged re-read must stay
+   * silent.
+   *
+   * Change is decided by exact equality of the raw KV bytes, not by comparing
+   * parsed objects: bytes are the authoritative representation, the check
+   * short-circuits on length, and it needs no parse→serialize round-trip. A
+   * semantically-identical rewrite with reordered keys counts as a change here
+   * (different bytes) — that only triggers a harmless re-resolve downstream, so
+   * canonicalizing is deliberately not worth the cost.
    */
   private applyValue(flagName: string, raw: Uint8Array): boolean {
     let parsed: FlagDef | undefined;
@@ -209,8 +223,11 @@ export class Snapshot {
     }
     if (!parsed) return false;
     const prev = this.state.get(flagName);
-    this.state.set(flagName, parsed);
-    return prev === undefined || JSON.stringify(prev) !== JSON.stringify(parsed);
+    if (prev && bytesEqual(prev.raw, raw)) return false;
+    // Copy the bytes: the KV client's buffer is not guaranteed to outlive this
+    // call unmutated, and this map retains it as the change-detection baseline.
+    this.state.set(flagName, { def: parsed, raw: raw.slice() });
+    return true;
   }
 
   /**
@@ -287,6 +304,16 @@ export async function fetchUserPrefs(
     });
     return null;
   }
+}
+
+/** Exact byte equality. Short-circuits on length; no allocation. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 function decodeFlagDef(value: Uint8Array): FlagDef | undefined {
