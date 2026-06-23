@@ -245,7 +245,10 @@ class RequestDefSource implements DefSource {
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i] as string;
       const entry = data[i];
-      out.set(key, entry ? parseDef(entry.text(), key, this.onError) : undefined);
+      out.set(
+        key,
+        entry ? parseDef(entry.text(), key, this.onError) : undefined,
+      );
     }
     return out;
   }
@@ -269,10 +272,10 @@ function parseDef(
   try {
     const parsed = JSON.parse(text) as unknown;
     if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed) ||
-      typeof (parsed as Record<string, unknown>)["on"] !== "boolean"
+      parsed === null
+      || typeof parsed !== "object"
+      || Array.isArray(parsed)
+      || typeof (parsed as Record<string, unknown>)["on"] !== "boolean"
     ) {
       throw new Error("flag def must be a JSON object with a boolean `on`");
     }
@@ -300,10 +303,9 @@ export function beyondAdapter<
 >(kv: KvClient, opts: BeyondAdapterOptions = {}): BeyondAdapter<T, E> {
   const mode = opts.mode ?? "snapshot";
   const useUserPrefs = opts.userPrefs !== false;
-  const defSource: DefSource =
-    mode === "request"
-      ? new RequestDefSource(kv, opts)
-      : new SnapshotDefSource(kv, opts);
+  const defSource: DefSource = mode === "request"
+    ? new RequestDefSource(kv, opts)
+    : new SnapshotDefSource(kv, opts);
 
   // Stable per-instance id so the host groups this adapter's flags for bulk eval.
   const adapterId = Symbol("beyondAdapter");
@@ -353,7 +355,13 @@ export function beyondAdapter<
       await defSource.ready();
       const def = await defSource.get(key, headers);
       const prefs = useUserPrefs ? await loadPrefs(ctx.id, headers) : null;
-      return evaluate<T>(key, defaultValue as T, ctx, def as FlagDef<T> | undefined, prefs).value;
+      return evaluate<T>(
+        key,
+        defaultValue as T,
+        ctx,
+        def as FlagDef<T> | undefined,
+        prefs,
+      ).value;
     },
 
     async bulkDecide({ flags, entities, headers }) {
@@ -401,7 +409,8 @@ export function beyondAdapter<
           hints: [
             {
               key: "beyond-kv",
-              text: `Failed to load flag definitions from Beyond KV: ${error.message}`,
+              text:
+                `Failed to load flag definitions from Beyond KV: ${error.message}`,
             },
           ],
         };

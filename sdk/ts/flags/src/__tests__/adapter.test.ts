@@ -1,7 +1,7 @@
 import type { KvClient } from "@beyond.dev/kv";
 import type { ReadonlyHeaders, ReadonlyRequestCookies } from "flags";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { beyondAdapter, type BeyondAdapter } from "../adapter.js";
+import { type BeyondAdapter, beyondAdapter } from "../adapter.js";
 import type { FlagContext } from "../types.js";
 import { kvClient, writeDef } from "./harness.js";
 import "./test-context.js";
@@ -183,7 +183,12 @@ for (const mode of ["snapshot", "request"] as const) {
         headers: reqHeaders(),
         cookies,
       });
-      expect(out).toEqual({ [a]: true, [b]: false, [c]: true, [missing]: false });
+      expect(out).toEqual({
+        [a]: true,
+        [b]: false,
+        [c]: true,
+        [missing]: false,
+      });
     });
 
     it("missing id falls every flag back to its default", async () => {
@@ -230,11 +235,12 @@ describe("beyondAdapter — request mode caching", () => {
       }
       // Two distinct def keys → at most two def reads total (get or batchGet),
       // plus one prefs read for the id. Re-evaluations hit the per-request cache.
-      const defReads =
-        getSpy.mock.calls.filter((c) => String(c[0]).startsWith("flags:def:"))
-          .length + batchSpy.mock.calls.length;
+      const defReads = getSpy.mock.calls.filter((c) =>
+        String(c[0]).startsWith("flags:def:")
+      )
+        .length + batchSpy.mock.calls.length;
       const prefReads = getSpy.mock.calls.filter((c) =>
-        String(c[0]).startsWith("flags:user:"),
+        String(c[0]).startsWith("flags:user:")
       ).length;
       expect(defReads).toBe(2);
       expect(prefReads).toBe(1);
@@ -293,8 +299,9 @@ describe("beyondAdapter — adapter identity", () => {
     try {
       expect(typeof adapter.adapterId).toBe("symbol");
       const origin = adapter.origin;
-      const resolved =
-        typeof origin === "function" ? origin("my-flag") : origin;
+      const resolved = typeof origin === "function"
+        ? origin("my-flag")
+        : origin;
       expect(resolved).toBe("https://flags.example/my-flag");
     } finally {
       await adapter.close();

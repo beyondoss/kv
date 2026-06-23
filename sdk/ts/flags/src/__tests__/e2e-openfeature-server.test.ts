@@ -49,9 +49,12 @@ async function waitUntil(
 // biome-ignore lint/suspicious/noExplicitAny: server Client type is verbose here
 function collectChanges(client: any): () => string[] {
   const seen: string[] = [];
-  client.addHandler(ProviderEvents.ConfigurationChanged, (e: { flagsChanged?: string[] }) => {
-    seen.push(...(e?.flagsChanged ?? []));
-  });
+  client.addHandler(
+    ProviderEvents.ConfigurationChanged,
+    (e: { flagsChanged?: string[] }) => {
+      seen.push(...(e?.flagsChanged ?? []));
+    },
+  );
   return () => seen;
 }
 
@@ -69,9 +72,12 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
 
   it("host-returned value tracks live KV state (the irrefutable toggle)", async () => {
     const key = uid();
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
-    const eval_ = () => client.getBooleanValue(key, false, { targetingKey: "u1" });
+    const eval_ = () =>
+      client.getBooleanValue(key, false, { targetingKey: "u1" });
 
     // No def yet → declared default.
     expect(await eval_()).toBe(false);
@@ -95,14 +101,22 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
       on: true,
       rules: [{ when: { plan: "pro" }, value: true }],
     });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
 
     expect(
-      await client.getBooleanValue(key, false, { targetingKey: "u1", plan: "pro" }),
+      await client.getBooleanValue(key, false, {
+        targetingKey: "u1",
+        plan: "pro",
+      }),
     ).toBe(true);
     expect(
-      await client.getBooleanValue(key, false, { targetingKey: "u2", plan: "free" }),
+      await client.getBooleanValue(key, false, {
+        targetingKey: "u2",
+        plan: "free",
+      }),
     ).toBe(false);
   });
 
@@ -110,13 +124,21 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     const key = uid();
     const id = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
 
-    expect(await client.getBooleanValue(key, false, { targetingKey: id })).toBe(true);
-    expect(await client.getBooleanValue(key, false, { targetingKey: uid() })).toBe(false);
+    expect(await client.getBooleanValue(key, false, { targetingKey: id })).toBe(
+      true,
+    );
+    expect(await client.getBooleanValue(key, false, { targetingKey: uid() }))
+      .toBe(false);
   });
 
   it("getBooleanDetails surfaces reason and flagMetadata through the host", async () => {
@@ -125,7 +147,9 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
       on: true,
       rules: [{ when: { plan: "pro" }, value: true }],
     });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
 
     const details = await client.getBooleanDetails(key, false, {
@@ -144,10 +168,14 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
       on: true,
       rollout: { percent: 100, value: "not-a-bool" },
     });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
 
-    const details = await client.getBooleanDetails(key, false, { targetingKey: "u1" });
+    const details = await client.getBooleanDetails(key, false, {
+      targetingKey: "u1",
+    });
     expect(details.value).toBe(false);
     expect(details.reason).toBe("ERROR");
     expect(details.errorCode).toBe("TYPE_MISMATCH");
@@ -165,29 +193,46 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
 
     // The host now resolves the new value from the live snapshot.
     await waitUntil(
-      async () => (await client.getBooleanValue(key, false, { targetingKey: "u1" })) === true,
+      async () =>
+        (await client.getBooleanValue(key, false, { targetingKey: "u1" }))
+          === true,
       "value→true",
     );
-    await waitUntil(() => changes().includes(key), "config-changed event", 10_000);
+    await waitUntil(
+      () => changes().includes(key),
+      "config-changed event",
+      10_000,
+    );
   });
 
   it("resolves string, number, and object flags through the host", async () => {
     const sKey = uid();
     const nKey = uid();
     const oKey = uid();
-    await writeDef(kv, sKey, { on: true, rollout: { percent: 100, value: "dark" } });
-    await writeDef(kv, nKey, { on: true, rollout: { percent: 100, value: 42 } });
+    await writeDef(kv, sKey, {
+      on: true,
+      rollout: { percent: 100, value: "dark" },
+    });
+    await writeDef(kv, nKey, {
+      on: true,
+      rollout: { percent: 100, value: 42 },
+    });
     await writeDef(kv, oKey, {
       on: true,
       rollout: { percent: 100, value: { a: 1, b: ["x"] } },
     });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
     const id = { targetingKey: "u1" };
 
     expect(await client.getStringValue(sKey, "light", id)).toBe("dark");
     expect(await client.getNumberValue(nKey, 0, id)).toBe(42);
-    expect(await client.getObjectValue(oKey, {}, id)).toEqual({ a: 1, b: ["x"] });
+    expect(await client.getObjectValue(oKey, {}, id)).toEqual({
+      a: 1,
+      b: ["x"],
+    });
 
     // Details path is typed end-to-end too.
     const sd = await client.getStringDetails(sKey, "light", id);
@@ -202,8 +247,13 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     const oKey = uid();
     // String flag resolving to a number, object flag resolving to a string.
     await writeDef(kv, sKey, { on: true, rollout: { percent: 100, value: 7 } });
-    await writeDef(kv, oKey, { on: true, rollout: { percent: 100, value: "scalar" } });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await writeDef(kv, oKey, {
+      on: true,
+      rollout: { percent: 100, value: "scalar" },
+    });
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
     const id = { targetingKey: "u1" };
 
@@ -223,7 +273,8 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
       new BeyondProvider(kv, { mode: "snapshot", watch: false }),
     );
     const client = OpenFeature.getClient();
-    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(true);
+    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" }))
+      .toBe(true);
   });
 
   it("flag deletion propagates back to the default", async () => {
@@ -231,19 +282,25 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
     // fetch mode re-reads KV each eval, so deletion is observed immediately and
     // deterministically. Watch-driven deletion is covered in snapshot.test.ts.
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
-    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(true);
+    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" }))
+      .toBe(true);
 
     await deleteDef(kv, key);
     // With the def gone, the host falls back to the declared default.
-    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(false);
+    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" }))
+      .toBe(false);
   });
 
   it("partial rollout is deterministic and roughly split through the host", async () => {
     const key = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 50 } });
-    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondProvider(kv, { mode: "fetch" }),
+    );
     const client = OpenFeature.getClient();
 
     const ids = Array.from({ length: 200 }, (_, i) => `user-${i}`);
@@ -264,14 +321,19 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     const key = uid();
     const id = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
     await OpenFeature.setProviderAndWait(
       new BeyondProvider(kv, { mode: "fetch", userPrefs: false }),
     );
     const client = OpenFeature.getClient();
     // Pref says true, but userPrefs:false ignores it → 0% rollout = false.
-    expect(await client.getBooleanValue(key, false, { targetingKey: id })).toBe(false);
+    expect(await client.getBooleanValue(key, false, { targetingKey: id })).toBe(
+      false,
+    );
   });
 
   it("degrades to the default and reports onError on malformed KV data", async () => {
@@ -286,7 +348,8 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     const client = OpenFeature.getClient();
 
     // Malformed def is treated as absent → declared default is returned.
-    expect(await client.getBooleanValue(key, true, { targetingKey: "u1" })).toBe(true);
+    expect(await client.getBooleanValue(key, true, { targetingKey: "u1" }))
+      .toBe(true);
     expect(errors.length).toBeGreaterThan(0);
     expect(errors[0]?.source).toBe("snapshot");
   });
@@ -302,11 +365,15 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     });
     const errors: FlagsErrorEvent[] = [];
     await OpenFeature.setProviderAndWait(
-      new BeyondProvider(deadKv, { mode: "fetch", onError: (e) => errors.push(e) }),
+      new BeyondProvider(deadKv, {
+        mode: "fetch",
+        onError: (e) => errors.push(e),
+      }),
     );
     const client = OpenFeature.getClient();
 
-    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(false);
+    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" }))
+      .toBe(false);
     expect(errors.length).toBeGreaterThan(0);
   });
 });

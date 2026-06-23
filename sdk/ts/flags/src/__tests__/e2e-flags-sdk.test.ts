@@ -98,9 +98,10 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
       }),
     });
     try {
-      expect(await aiSearch(request({ "x-user-id": "u1", "x-plan": "pro" }))).toBe(
-        true,
-      );
+      expect(await aiSearch(request({ "x-user-id": "u1", "x-plan": "pro" })))
+        .toBe(
+          true,
+        );
       expect(
         await aiSearch(request({ "x-user-id": "u2", "x-plan": "free" })),
       ).toBe(false);
@@ -138,7 +139,10 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
     // Write before creating the adapter; the first decide awaits initial load.
     const key = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-    const adapter = beyondAdapter<boolean>(kv, { mode: "snapshot", watch: false });
+    const adapter = beyondAdapter<boolean>(kv, {
+      mode: "snapshot",
+      watch: false,
+    });
     const snap = flag<boolean>({
       key,
       defaultValue: false,
@@ -171,7 +175,12 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
     const id = uid();
     const identify = (): FlagContext => ({ id, plan: "pro" });
     const mk = (key: string) =>
-      flag<boolean, FlagContext>({ key, defaultValue: false, adapter, identify });
+      flag<boolean, FlagContext>({
+        key,
+        defaultValue: false,
+        adapter,
+        identify,
+      });
     const a = mk(ka);
     const b = mk(kb);
     const c = mk(kc);

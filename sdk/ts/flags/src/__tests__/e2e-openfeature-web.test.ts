@@ -39,7 +39,9 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
   it("host returns live value after a watched def change (the irrefutable toggle)", async () => {
     const key = uid();
     await OpenFeature.setContext({ targetingKey: "u1" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     // No def yet → declared default (sync call, implicit static context).
@@ -48,10 +50,17 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const changes = collectChanges(client);
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
     // Wait on the observable value, not a single event within a fixed window.
-    await waitUntil(() => client.getBooleanValue(key, false) === true, "value→true");
+    await waitUntil(
+      () => client.getBooleanValue(key, false) === true,
+      "value→true",
+    );
 
     expect(client.getBooleanValue(key, false)).toBe(true);
-    await waitUntil(() => changes().includes(key), "config-changed event", 10_000);
+    await waitUntil(
+      () => changes().includes(key),
+      "config-changed event",
+      10_000,
+    );
   });
 
   it("targeting rule resolves from the static context", async () => {
@@ -61,7 +70,9 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       rules: [{ when: { plan: "pro" }, value: true }],
     });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "pro" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(true);
@@ -74,7 +85,9 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       rules: [{ when: { plan: "pro" }, value: true }],
     });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "free" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(false); // free
@@ -88,10 +101,15 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const key = uid();
     const id = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
     await OpenFeature.setContext({ targetingKey: id });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(true);
@@ -107,9 +125,14 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       on: true,
       rules: [{ when: { plan: "pro" }, value: true }],
     });
-    await writeDef(kv, badKey, { on: true, rollout: { percent: 100, value: "x" } });
+    await writeDef(kv, badKey, {
+      on: true,
+      rollout: { percent: 100, value: "x" },
+    });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "pro" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     const ok = client.getBooleanDetails(okKey, false);
@@ -126,14 +149,22 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const sKey = uid();
     const nKey = uid();
     const oKey = uid();
-    await writeDef(kv, sKey, { on: true, rollout: { percent: 100, value: "dark" } });
-    await writeDef(kv, nKey, { on: true, rollout: { percent: 100, value: 42 } });
+    await writeDef(kv, sKey, {
+      on: true,
+      rollout: { percent: 100, value: "dark" },
+    });
+    await writeDef(kv, nKey, {
+      on: true,
+      rollout: { percent: 100, value: 42 },
+    });
     await writeDef(kv, oKey, {
       on: true,
       rollout: { percent: 100, value: { a: 1, b: ["x"] } },
     });
     await OpenFeature.setContext({ targetingKey: "u1" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: true, refresh: 2 }),
+    );
     const client = OpenFeature.getClient();
 
     expect(client.getStringValue(sKey, "light")).toBe("dark");
@@ -156,10 +187,17 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
 
     const changes = collectChanges(client);
     await deleteDef(kv, key);
-    await waitUntil(() => client.getBooleanValue(key, false) === false, "value→false");
+    await waitUntil(
+      () => client.getBooleanValue(key, false) === false,
+      "value→false",
+    );
 
     expect(client.getBooleanValue(key, false)).toBe(false);
-    await waitUntil(() => changes().includes(key), "del config-changed", 10_000);
+    await waitUntil(
+      () => changes().includes(key),
+      "del config-changed",
+      10_000,
+    );
   });
 
   it("polling fallback (watch:false) still picks up live changes", async () => {
@@ -174,7 +212,10 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
 
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
     // Arrives via the poll loop, not watch — wait on the value with headroom.
-    await waitUntil(() => client.getBooleanValue(key, false) === true, "poll→true");
+    await waitUntil(
+      () => client.getBooleanValue(key, false) === true,
+      "poll→true",
+    );
 
     expect(client.getBooleanValue(key, false)).toBe(true);
   });
@@ -183,7 +224,10 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const key = uid();
     const id = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
     await OpenFeature.setContext({ targetingKey: id });
     await OpenFeature.setProviderAndWait(
@@ -219,8 +263,11 @@ function collectChanges(
   client: any,
 ): () => string[] {
   const seen: string[] = [];
-  client.addHandler(ProviderEvents.ConfigurationChanged, (e: { flagsChanged?: string[] }) => {
-    seen.push(...(e?.flagsChanged ?? []));
-  });
+  client.addHandler(
+    ProviderEvents.ConfigurationChanged,
+    (e: { flagsChanged?: string[] }) => {
+      seen.push(...(e?.flagsChanged ?? []));
+    },
+  );
   return () => seen;
 }

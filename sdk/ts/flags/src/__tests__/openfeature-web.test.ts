@@ -48,7 +48,12 @@ describe("BeyondWebProvider — synchronous resolution", () => {
 
   it("returns the default with reason DEFAULT when no def exists", async () => {
     await start(ctx("u"));
-    const res = provider.resolveBooleanEvaluation(uid(), false, ctx("u"), logger);
+    const res = provider.resolveBooleanEvaluation(
+      uid(),
+      false,
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toBe(false);
     expect(res.reason).toBe("DEFAULT");
   });
@@ -83,7 +88,10 @@ describe("BeyondWebProvider — synchronous resolution", () => {
     const key = uid();
     const id = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
     await start(ctx(id)); // prefetches id's prefs
     const res = provider.resolveBooleanEvaluation(key, false, ctx(id), logger);
@@ -96,7 +104,10 @@ describe("BeyondWebProvider — synchronous resolution", () => {
     const id1 = uid();
     const id2 = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
-    const { error } = await kv.set(`flags:user:${id1}`, JSON.stringify({ [key]: true }));
+    const { error } = await kv.set(
+      `flags:user:${id1}`,
+      JSON.stringify({ [key]: true }),
+    );
     if (error) throw error;
     await start(ctx(id1)); // id1 → pref true
     expect(
@@ -112,7 +123,10 @@ describe("BeyondWebProvider — synchronous resolution", () => {
 
   it("returns TYPE_MISMATCH for a wrong-typed value", async () => {
     const key = uid();
-    await writeDef(kv, key, { on: true, rollout: { percent: 100, value: "nope" } });
+    await writeDef(kv, key, {
+      on: true,
+      rollout: { percent: 100, value: "nope" },
+    });
     await start(ctx("u"));
     const res = provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
     expect(res.value).toBe(false);
@@ -131,7 +145,7 @@ describe("BeyondWebProvider — synchronous resolution", () => {
     const flagsChanged = await Promise.race([
       changed,
       new Promise<string[]>((_, reject) =>
-        setTimeout(() => reject(new Error("timed out")), 10_000),
+        setTimeout(() => reject(new Error("timed out")), 10_000)
       ),
     ]);
     expect(flagsChanged).toContain(key);

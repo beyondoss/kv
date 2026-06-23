@@ -12,7 +12,6 @@
  * per-test UUIDs because the test KV server shares one keyspace (see
  * http.ts `nsToIndex`).
  */
-import { randomBytes } from "node:crypto";
 import type { KvClient } from "@beyond.dev/kv";
 import { createAccessProof, encryptOverrides, mergeProviderData } from "flags";
 import {
@@ -23,6 +22,7 @@ import {
   getProviderData,
   serialize,
 } from "flags/next";
+import { randomBytes } from "node:crypto";
 import {
   afterAll,
   beforeAll,
@@ -89,9 +89,10 @@ describe("e2e surface: real flags/next host → beyond adapter → real KV", () 
     });
     try {
       // pro → rule "v2"; free → rollout "v1".
-      expect(await variant(request({ "x-user-id": "u", "x-plan": "pro" }))).toBe(
-        "v2",
-      );
+      expect(await variant(request({ "x-user-id": "u", "x-plan": "pro" })))
+        .toBe(
+          "v2",
+        );
       expect(
         await variant(request({ "x-user-id": "u", "x-plan": "free" })),
       ).toBe("v1");
@@ -104,7 +105,10 @@ describe("e2e surface: real flags/next host → beyond adapter → real KV", () 
     type Config = { theme: string; max: number };
     const key = uid();
     const def = { theme: "dark", max: 5 };
-    await writeDef(kv, key, { on: true, rollout: { percent: 100, value: def } });
+    await writeDef(kv, key, {
+      on: true,
+      rollout: { percent: 100, value: def },
+    });
     const adapter = beyondAdapter<Config>(kv, { mode: "request" });
     const config = flag<Config>({
       key,

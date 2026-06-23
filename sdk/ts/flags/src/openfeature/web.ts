@@ -33,18 +33,14 @@ import {
   type Logger,
   OpenFeatureEventEmitter,
   type Provider,
-  type ProviderMetadata,
   ProviderEvents,
+  type ProviderMetadata,
   type ResolutionDetails,
 } from "@openfeature/web-sdk";
 import { evaluate } from "../eval.js";
 import { fetchUserPrefs, Snapshot } from "../snapshot.js";
 import type { FlagsErrorEvent, JsonValue, UserPrefs } from "../types.js";
-import {
-  type ExpectedType,
-  toFlagContext,
-  toResolution,
-} from "./shared.js";
+import { type ExpectedType, toFlagContext, toResolution } from "./shared.js";
 
 /** Options for {@link BeyondWebProvider}. The KV client is passed positionally. */
 export interface BeyondWebProviderOptions {

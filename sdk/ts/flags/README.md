@@ -102,9 +102,9 @@ npm install @beyond.dev/flags @beyond.dev/kv flags
 ```
 
 ```ts
-import { flag } from "flags/next";
-import { createKvClient } from "@beyond.dev/kv";
 import { beyondAdapter } from "@beyond.dev/flags/adapter";
+import { createKvClient } from "@beyond.dev/kv";
+import { flag } from "flags/next";
 
 const kv = createKvClient({ url: process.env.BEYOND_KV_URL });
 const adapter = beyondAdapter(kv);

@@ -129,7 +129,9 @@ export class Snapshot {
           if (!entry) continue;
           const flagName = fullKey.slice(DEF_PREFIX.length);
           seen.add(flagName);
-          if (entry.revision > this.lastRevision) this.lastRevision = entry.revision;
+          if (entry.revision > this.lastRevision) {
+            this.lastRevision = entry.revision;
+          }
           if (this.applyValue(flagName, entry.value)) changed.push(flagName);
         }
       }
@@ -153,7 +155,10 @@ export class Snapshot {
       this.watchAbort = new AbortController();
       // Resume from the last revision we saw so deltas that arrived while the
       // stream was down are replayed (the server treats `since` as exclusive).
-      const opts: WatchOptions = { prefix: true, signal: this.watchAbort.signal };
+      const opts: WatchOptions = {
+        prefix: true,
+        signal: this.watchAbort.signal,
+      };
       if (this.lastRevision > 0) opts.since = this.lastRevision;
       const sessionStart = Date.now();
       try {
@@ -162,7 +167,9 @@ export class Snapshot {
           if (event.type === "ready") continue;
           // Advance the resume point on every delta, even ones the byte-compare
           // dedups, so a reconnect never re-requests already-applied revisions.
-          if (event.revision > this.lastRevision) this.lastRevision = event.revision;
+          if (event.revision > this.lastRevision) {
+            this.lastRevision = event.revision;
+          }
           if (event.type === "set") {
             const flagName = event.key.slice(DEF_PREFIX.length);
             if (this.applyValue(flagName, event.value)) {

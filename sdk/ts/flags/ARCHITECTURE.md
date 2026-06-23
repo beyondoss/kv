@@ -208,16 +208,16 @@ evaluate(key, defaultValue, ctx, def, prefs)  ← same pure engine as native eva
 
 **Read modes** (`mode` option):
 
-| Mode                  | Source                                                            | Best for                                   |
-| --------------------- | ---------------------------------------------------------------- | ------------------------------------------ |
-| `snapshot` (default)  | reuses the `Snapshot` class — in-memory, watch/poll, zero per-eval I/O | long-lived Node servers                    |
-| `request`             | per-request fetch cached in `WeakMap<ReadonlyHeaders, …>` (one `list`+`batchGet`/request) | short-lived edge/serverless (no persistent watch) |
+| Mode                 | Source                                                                                    | Best for                                          |
+| -------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `snapshot` (default) | reuses the `Snapshot` class — in-memory, watch/poll, zero per-eval I/O                    | long-lived Node servers                           |
+| `request`            | per-request fetch cached in `WeakMap<ReadonlyHeaders, …>` (one `list`+`batchGet`/request) | short-lived edge/serverless (no persistent watch) |
 
 **Batching**: a stable per-instance `adapterId` (Symbol) + `bulkDecide` let the host's `evaluate()` resolve all flags sharing one adapter **and** one `identify` reference in a single call. Distinct `identify` closures form distinct groups (one `bulkDecide` each).
 
 **Discovery**: `adapter.getProviderData()` enumerates `flags:def:*` for the toolbar/`createFlagsDiscoveryEndpoint`. Definitions are thin (KV stores only `on`/`rules`/`rollout`, marked `declaredInCode: false`); merge with the host's `getProviderData(flags)` via `mergeProviderData` for code-side `options`/`description`/`defaultValue`.
 
-**Not bridged**: native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no Vercel equivalent — the adapter still *reads* prefs (end-user opt-in honored), but writes stay on the native API; toolbar overrides replace `.when()`.
+**Not bridged**: native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no Vercel equivalent — the adapter still _reads_ prefs (end-user opt-in honored), but writes stay on the native API; toolbar overrides replace `.when()`.
 
 ## OpenFeature Providers (`src/openfeature/`)
 
@@ -247,15 +247,15 @@ ResolutionDetails<T> { value, reason, errorCode?, flagMetadata? }
 
 **Read model**:
 
-| Provider | Mode | Source |
-| -------- | ---- | ------ |
-| server   | `snapshot` (default) | in-memory `Snapshot`, watch/poll, zero def I/O per eval |
-| server   | `fetch`              | one `kv.get` per flag per eval (no persistent watch)    |
+| Provider | Mode                 | Source                                                                                                             |
+| -------- | -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| server   | `snapshot` (default) | in-memory `Snapshot`, watch/poll, zero def I/O per eval                                                            |
+| server   | `fetch`              | one `kv.get` per flag per eval (no persistent watch)                                                               |
 | web      | snapshot only        | sync resolve needs in-memory state; prefs for the active context are pre-fetched on `initialize`/`onContextChange` |
 
 **Events**: in snapshot mode both providers wire the new `Snapshot` `onChange` hook → `events.emit(PROVIDER_CONFIGURATION_CHANGED, { flagsChanged })`. `PROVIDER_READY`/`PROVIDER_ERROR` are emitted by the SDK from `initialize()` resolving/rejecting (no manual emit).
 
-**Not bridged**: like the Vercel adapter, native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no OpenFeature equivalent — the providers *read* prefs but writes stay on the native API.
+**Not bridged**: like the Vercel adapter, native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no OpenFeature equivalent — the providers _read_ prefs but writes stay on the native API.
 
 ## KV Schema
 
@@ -276,12 +276,12 @@ ResolutionDetails<T> { value, reason, errorCode?, flagMetadata? }
 | `src/flag.ts`                       | `Flag<T>` public interface and `FlagRuntime` internal interface; `makeFlag()` factory                                         |
 | `src/flags.ts`                      | `FlagsClient`, `createFlags()`, lazy `flags` singleton; `mutateUserPrefs()` CAS loop; `Runtime` impl                          |
 | `src/eval.ts`                       | Pure synchronous `evaluate()` — the 7-step precedence chain                                                                   |
-| `src/adapter.ts`                    | Vercel Flags SDK adapter (`beyondAdapter()`): `decide`/`bulkDecide`/`getProviderData` over the same eval engine + KV         |
+| `src/adapter.ts`                    | Vercel Flags SDK adapter (`beyondAdapter()`): `decide`/`bulkDecide`/`getProviderData` over the same eval engine + KV          |
 | `src/hash.ts`                       | `fnv1a32()` and `bucket(id, flagName)` for deterministic rollouts                                                             |
-| `src/snapshot.ts`                   | `Snapshot` class: in-memory `Map<name, FlagDef>`, watch+polling sync, `onChange` change hook, `fetchUserPrefs()`             |
-| `src/openfeature/shared.ts`         | SDK-agnostic OpenFeature glue: `toFlagContext`, `mapReason`, `toResolution` (+ type-mismatch handling)                       |
-| `src/openfeature/server.ts`         | OpenFeature **server** provider (`BeyondProvider`): async resolvers, snapshot/fetch modes, `PROVIDER_CONFIGURATION_CHANGED`  |
-| `src/openfeature/web.ts`            | OpenFeature **web** provider (`BeyondWebProvider`): sync resolvers, per-context pref prefetch on init/context-change         |
+| `src/snapshot.ts`                   | `Snapshot` class: in-memory `Map<name, FlagDef>`, watch+polling sync, `onChange` change hook, `fetchUserPrefs()`              |
+| `src/openfeature/shared.ts`         | SDK-agnostic OpenFeature glue: `toFlagContext`, `mapReason`, `toResolution` (+ type-mismatch handling)                        |
+| `src/openfeature/server.ts`         | OpenFeature **server** provider (`BeyondProvider`): async resolvers, snapshot/fetch modes, `PROVIDER_CONFIGURATION_CHANGED`   |
+| `src/openfeature/web.ts`            | OpenFeature **web** provider (`BeyondWebProvider`): sync resolvers, per-context pref prefetch on init/context-change          |
 | `src/middleware/hono.ts`            | Hono `MiddlewareHandler` — wraps chain with `runWithScope`                                                                    |
 | `src/middleware/express.ts`         | Express `RequestHandler` — wraps chain with `runWithScope`, errors via `next(err)`                                            |
 | `src/middleware/fastify.ts`         | Fastify plugin — `onRequest` hook uses `enterScope` (can't wrap chain)                                                        |
@@ -322,16 +322,16 @@ CLOSED
 
 ## Failure Modes
 
-| Failure                                    | What Actually Happens                                                    | Recovery                                              |
-| ------------------------------------------ | ------------------------------------------------------------------------ | ----------------------------------------------------- |
-| Zero-arg flag call with no active scope    | Throws `FlagError("no_context")`                                         | Ensure middleware is registered before route handlers |
-| `ctx.id === ""`                            | Throws `FlagError("missing_id")`                                         | Middleware must supply a non-empty id                 |
-| Snapshot not yet loaded                    | Returns flag's `default` with reason `"no-snapshot"`                     | Await `client.ready()` at startup                     |
+| Failure                                    | What Actually Happens                                                                    | Recovery                                                    |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Zero-arg flag call with no active scope    | Throws `FlagError("no_context")`                                                         | Ensure middleware is registered before route handlers       |
+| `ctx.id === ""`                            | Throws `FlagError("missing_id")`                                                         | Middleware must supply a non-empty id                       |
+| Snapshot not yet loaded                    | Returns flag's `default` with reason `"no-snapshot"`                                     | Await `client.ready()` at startup                           |
 | Watch stream error                         | `onError` called; backoff + falls back to polling; reconnect resumes from `lastRevision` | Auto-recovers; deltas during the gap are replayed, not lost |
-| User prefs KV fetch fails                  | `onError` called; prefs treated as `null`                                | Evals continue, user-pref branch skipped              |
-| `flag.set/reset` CAS conflict (≤4 retries) | Retries; emits `onError` + throws `FlagError("kv_error")` on max retries | Caller must handle                                    |
-| `BEYOND_KV_URL` not set                    | Default `flags` singleton throws at first call                           | Set env var or use `createFlags(kv)`                  |
-| KV entry has invalid JSON                  | `onError` called; flag treated as absent (`"no-snapshot"`)               | Fix via CLI                                           |
+| User prefs KV fetch fails                  | `onError` called; prefs treated as `null`                                                | Evals continue, user-pref branch skipped                    |
+| `flag.set/reset` CAS conflict (≤4 retries) | Retries; emits `onError` + throws `FlagError("kv_error")` on max retries                 | Caller must handle                                          |
+| `BEYOND_KV_URL` not set                    | Default `flags` singleton throws at first call                                           | Set env var or use `createFlags(kv)`                        |
+| KV entry has invalid JSON                  | `onError` called; flag treated as absent (`"no-snapshot"`)                               | Fix via CLI                                                 |
 
 ## Why It Behaves This Way
 
@@ -359,4 +359,4 @@ Most users never opt in or out of any flag. Storing only deviations means the `f
 
 A reconnect that re-subscribes from the current moment silently drops any write or delete that landed while the stream was down — leaving a flag permanently stale until the next change or restart. Resuming from the last revision applied makes the snapshot self-healing across disconnects: the server replays the gap (since is exclusive), and byte-compare dedup makes any over-replay a no-op. This is the snapshot equivalent of the idempotent/recoverable property required of state-mutating operations elsewhere — eventual consistency that actually converges, rather than a poll-timing race.
 
-A periodic full reconcile on a *healthy* stream is deliberately **not** done: its cost is `O(flags)` reads per interval × every replica, independent of change rate, and it would mask (rather than surface) a server-side watch-delivery bug. If silent same-stream drops are ever observed, that belongs fixed at the watch source, not papered over with fleet-wide polling.
+A periodic full reconcile on a _healthy_ stream is deliberately **not** done: its cost is `O(flags)` reads per interval × every replica, independent of change rate, and it would mask (rather than surface) a server-side watch-delivery bug. If silent same-stream drops are ever observed, that belongs fixed at the watch source, not papered over with fleet-wide polling.

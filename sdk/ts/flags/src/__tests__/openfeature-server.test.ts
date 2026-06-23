@@ -46,7 +46,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
   });
 
   it("returns the default with reason DEFAULT when no def exists", async () => {
-    const res = await provider.resolveBooleanEvaluation(uid(), false, ctx("u"), logger);
+    const res = await provider.resolveBooleanEvaluation(
+      uid(),
+      false,
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toBe(false);
     expect(res.reason).toBe("DEFAULT");
     expect(res.errorCode).toBeUndefined();
@@ -55,7 +60,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
   it("resolves a 100% rollout to true with reason SPLIT", async () => {
     const key = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-    const res = await provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
+    const res = await provider.resolveBooleanEvaluation(
+      key,
+      false,
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toBe(true);
     expect(res.reason).toBe("SPLIT");
   });
@@ -63,7 +73,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
   it("honors the kill switch with reason DISABLED", async () => {
     const key = uid();
     await writeDef(kv, key, { on: false, rollout: { percent: 100 } });
-    const res = await provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
+    const res = await provider.resolveBooleanEvaluation(
+      key,
+      false,
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toBe(false);
     expect(res.reason).toBe("DISABLED");
   });
@@ -98,7 +113,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
       JSON.stringify({ [key]: true }),
     );
     if (error) throw error;
-    const res = await provider.resolveBooleanEvaluation(key, false, ctx(id), logger);
+    const res = await provider.resolveBooleanEvaluation(
+      key,
+      false,
+      ctx(id),
+      logger,
+    );
     expect(res.value).toBe(true);
     expect(res.reason).toBe("TARGETING_MATCH");
     expect(res.flagMetadata?.beyondReason).toBe("user-pref");
@@ -107,9 +127,20 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
   it("resolves string and number flags", async () => {
     const sKey = uid();
     const nKey = uid();
-    await writeDef(kv, sKey, { on: true, rollout: { percent: 100, value: "dark" } });
-    await writeDef(kv, nKey, { on: true, rollout: { percent: 100, value: 42 } });
-    const s = await provider.resolveStringEvaluation(sKey, "light", ctx("u"), logger);
+    await writeDef(kv, sKey, {
+      on: true,
+      rollout: { percent: 100, value: "dark" },
+    });
+    await writeDef(kv, nKey, {
+      on: true,
+      rollout: { percent: 100, value: 42 },
+    });
+    const s = await provider.resolveStringEvaluation(
+      sKey,
+      "light",
+      ctx("u"),
+      logger,
+    );
     const n = await provider.resolveNumberEvaluation(nKey, 0, ctx("u"), logger);
     expect(s.value).toBe("dark");
     expect(n.value).toBe(42);
@@ -121,7 +152,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
       on: true,
       rollout: { percent: 100, value: { mode: "x", n: 3 } },
     });
-    const res = await provider.resolveObjectEvaluation(key, {}, ctx("u"), logger);
+    const res = await provider.resolveObjectEvaluation(
+      key,
+      {},
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toEqual({ mode: "x", n: 3 });
   });
 
@@ -132,7 +168,12 @@ describe("BeyondProvider (server) — fetch mode resolution", () => {
       on: true,
       rollout: { percent: 100, value: "not-a-bool" },
     });
-    const res = await provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
+    const res = await provider.resolveBooleanEvaluation(
+      key,
+      false,
+      ctx("u"),
+      logger,
+    );
     expect(res.value).toBe(false); // declared default, not coerced
     expect(res.reason).toBe("ERROR");
     expect(res.errorCode).toBe("TYPE_MISMATCH");
@@ -168,7 +209,12 @@ describe("BeyondProvider (server) — snapshot mode", () => {
     const provider = new BeyondProvider(kv, { mode: "snapshot", watch: false });
     await provider.initialize();
     try {
-      const res = await provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
+      const res = await provider.resolveBooleanEvaluation(
+        key,
+        false,
+        ctx("u"),
+        logger,
+      );
       expect(res.value).toBe(true);
     } finally {
       await provider.onClose();
@@ -180,7 +226,12 @@ describe("BeyondProvider (server) — snapshot mode", () => {
     // def deterministically yields STALE (vs DEFAULT once ready).
     const provider = new BeyondProvider(kv, { mode: "snapshot", watch: false });
     try {
-      const res = await provider.resolveBooleanEvaluation(uid(), false, ctx("u"), logger);
+      const res = await provider.resolveBooleanEvaluation(
+        uid(),
+        false,
+        ctx("u"),
+        logger,
+      );
       expect(res.value).toBe(false); // declared default
       expect(res.reason).toBe("STALE");
     } finally {
@@ -190,7 +241,11 @@ describe("BeyondProvider (server) — snapshot mode", () => {
 
   it("emits PROVIDER_CONFIGURATION_CHANGED when a watched def changes", async () => {
     const key = uid();
-    const provider = new BeyondProvider(kv, { mode: "snapshot", watch: true, refresh: 2 });
+    const provider = new BeyondProvider(kv, {
+      mode: "snapshot",
+      watch: true,
+      refresh: 2,
+    });
     await provider.initialize();
     try {
       const changed = new Promise<string[]>((resolve) => {
@@ -199,11 +254,20 @@ describe("BeyondProvider (server) — snapshot mode", () => {
         });
       });
       await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-      const flagsChanged = await withTimeout(changed, 10_000, "ConfigurationChanged");
+      const flagsChanged = await withTimeout(
+        changed,
+        10_000,
+        "ConfigurationChanged",
+      );
       expect(flagsChanged).toContain(key);
 
       // And the new value is now resolvable from the snapshot.
-      const res = await provider.resolveBooleanEvaluation(key, false, ctx("u"), logger);
+      const res = await provider.resolveBooleanEvaluation(
+        key,
+        false,
+        ctx("u"),
+        logger,
+      );
       expect(res.value).toBe(true);
     } finally {
       await provider.onClose();
@@ -215,7 +279,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     p,
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms),
+      setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms)
     ),
   ]);
 }

@@ -39,7 +39,8 @@ export function toFlagContext(context: EvaluationContext): FlagContext {
 
 /** Whether the context can drive rollout bucketing / pref lookup. */
 export function hasTargetingKey(context: EvaluationContext): boolean {
-  return typeof context.targetingKey === "string" && context.targetingKey !== "";
+  return typeof context.targetingKey === "string"
+    && context.targetingKey !== "";
 }
 
 /**
@@ -47,7 +48,10 @@ export function hasTargetingKey(context: EvaluationContext): boolean {
  * `no-snapshot` reports `STALE` before the provider has loaded (the def may yet
  * arrive) and `DEFAULT` afterward (the flag genuinely has no def in KV).
  */
-export function mapReason(reason: EvalReason, ready: boolean): ResolutionReason {
+export function mapReason(
+  reason: EvalReason,
+  ready: boolean,
+): ResolutionReason {
   switch (reason) {
     case "off":
       return StandardResolutionReasons.DISABLED;
@@ -102,15 +106,18 @@ export function toResolution<T extends JsonValue>(
       value: defaultValue,
       reason: StandardResolutionReasons.ERROR,
       errorCode: ErrorCode.TYPE_MISMATCH,
-      errorMessage:
-        `flag resolved to ${describe(result.value)}, expected ${expected}`,
+      errorMessage: `flag resolved to ${
+        describe(result.value)
+      }, expected ${expected}`,
       flagMetadata: { beyondReason: result.reason },
     };
   }
   const flagMetadata: Record<string, string | number | boolean> = {
     beyondReason: result.reason,
   };
-  if (result.ruleIndex !== undefined) flagMetadata["ruleIndex"] = result.ruleIndex;
+  if (result.ruleIndex !== undefined) {
+    flagMetadata["ruleIndex"] = result.ruleIndex;
+  }
   return {
     value: result.value as T,
     reason: mapReason(result.reason, ready),

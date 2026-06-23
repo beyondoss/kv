@@ -32,8 +32,8 @@ import {
   type Logger,
   OpenFeatureEventEmitter,
   type Provider,
-  type ProviderMetadata,
   ProviderEvents,
+  type ProviderMetadata,
   type ResolutionDetails,
 } from "@openfeature/server-sdk";
 import { evaluate } from "../eval.js";
@@ -164,14 +164,13 @@ export class BeyondProvider implements Provider {
     this.kv = kv;
     this.useUserPrefs = opts.userPrefs !== false;
     this.onError = opts.onError;
-    this.reader =
-      (opts.mode ?? "snapshot") === "fetch"
-        ? new FetchReader(kv, opts)
-        : new SnapshotReader(kv, opts, (flagsChanged) => {
-            this.events.emit(ProviderEvents.ConfigurationChanged, {
-              flagsChanged,
-            });
-          });
+    this.reader = (opts.mode ?? "snapshot") === "fetch"
+      ? new FetchReader(kv, opts)
+      : new SnapshotReader(kv, opts, (flagsChanged) => {
+        this.events.emit(ProviderEvents.ConfigurationChanged, {
+          flagsChanged,
+        });
+      });
   }
 
   /** Await the initial snapshot load. The SDK emits `PROVIDER_READY` on resolve. */
@@ -218,8 +217,12 @@ export class BeyondProvider implements Provider {
     context: EvaluationContext,
     _logger: Logger,
   ): Promise<ResolutionDetails<T>> {
-    return this.resolve(flagKey, defaultValue as JsonValue, context, "object") as
-      Promise<ResolutionDetails<T>>;
+    return this.resolve(
+      flagKey,
+      defaultValue as JsonValue,
+      context,
+      "object",
+    ) as Promise<ResolutionDetails<T>>;
   }
 
   private async resolve<T extends JsonValue>(
@@ -253,10 +256,10 @@ function parseDef(
   try {
     const parsed = JSON.parse(text) as unknown;
     if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed) ||
-      typeof (parsed as Record<string, unknown>)["on"] !== "boolean"
+      parsed === null
+      || typeof parsed !== "object"
+      || Array.isArray(parsed)
+      || typeof (parsed as Record<string, unknown>)["on"] !== "boolean"
     ) {
       throw new Error("flag def must be a JSON object with a boolean `on`");
     }

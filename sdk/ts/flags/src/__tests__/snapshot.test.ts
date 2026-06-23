@@ -272,18 +272,33 @@ describe("snapshot — watch resume after hard reconnect", () => {
       async batchGet() {
         return { data: [] as never[], error: undefined };
       },
-      async *watch(_key: string, opts?: WatchOptions): AsyncGenerator<WatchEvent> {
+      async *watch(
+        _key: string,
+        opts?: WatchOptions,
+      ): AsyncGenerator<WatchEvent> {
         watchCalls++;
         sinceSeen.push(opts?.since);
         if (watchCalls === 1) {
           yield { type: "ready" };
-          yield { type: "set", key: "flags:def:a", value: encode({ on: true }), revision: 5 };
+          yield {
+            type: "set",
+            key: "flags:def:a",
+            value: encode({ on: true }),
+            revision: 5,
+          };
           throw new KvError("sse_error", "stream dropped", 500); // hard disconnect
         }
         // Reconnect: replay the delta that landed while we were down.
-        yield { type: "set", key: "flags:def:b", value: encode({ on: false }), revision: 7 };
+        yield {
+          type: "set",
+          key: "flags:def:b",
+          value: encode({ on: false }),
+          revision: 7,
+        };
         await new Promise<void>((resolve) => {
-          opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          opts?.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
         });
       },
     } as unknown as KvClient;
@@ -295,7 +310,9 @@ describe("snapshot — watch resume after hard reconnect", () => {
     // First session applied A.
     {
       const deadline = Date.now() + 2_000;
-      while (Date.now() < deadline && snap.get("a") === undefined) await sleep(25);
+      while (Date.now() < deadline && snap.get("a") === undefined) {
+        await sleep(25);
+      }
     }
     expect(snap.get("a")).toEqual({ on: true });
 
@@ -303,7 +320,9 @@ describe("snapshot — watch resume after hard reconnect", () => {
     // replayed delta for B must land — proving no gap loss.
     {
       const deadline = Date.now() + 5_000;
-      while (Date.now() < deadline && snap.get("b") === undefined) await sleep(25);
+      while (Date.now() < deadline && snap.get("b") === undefined) {
+        await sleep(25);
+      }
     }
     expect(snap.get("b")).toEqual({ on: false });
 
