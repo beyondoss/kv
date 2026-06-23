@@ -93,6 +93,47 @@ export default async function Page() {
 }
 ```
 
+## Vercel Flags SDK Adapter
+
+Already using the [Vercel Flags SDK](https://flags-sdk.dev) (`flags/next`)? Back its `flag()` declarations with Beyond KV via the adapter — you keep the SDK's `flag()`, toolbar overrides, precompute, and discovery endpoint, and Beyond KV supplies the values (same defs, rules, rollout, and user prefs as the native API).
+
+```sh
+npm install @beyond.dev/flags @beyond.dev/kv flags
+```
+
+```ts
+import { flag } from "flags/next";
+import { createKvClient } from "@beyond.dev/kv";
+import { beyondAdapter } from "@beyond.dev/flags/adapter";
+
+const kv = createKvClient({ url: process.env.BEYOND_KV_URL });
+const adapter = beyondAdapter(kv);
+
+export const newCheckout = flag<boolean>({
+  key: "new-checkout",
+  defaultValue: false,
+  adapter,
+  // identify supplies the entities passed to evaluation; `id` is the bucket key.
+  identify: ({ headers }) => ({
+    id: headers.get("x-user-id") ?? "anon",
+    plan: "free",
+  }),
+});
+
+const enabled = await newCheckout(); // resolved by Beyond KV through the host
+```
+
+**Read modes** — `beyondAdapter(kv, { mode })`:
+
+- `"snapshot"` (default) keeps an in-memory snapshot synced via KV watch/poll — zero round-trips per evaluation. Best for long-lived Node servers.
+- `"request"` fetches defs per request (cached by request headers). Best for short-lived edge/serverless functions that can't hold a persistent watch.
+
+**Batching** — share one `adapter` instance and one `identify` reference across flags, and the host's `evaluate([...])` resolves them in a single `bulkDecide` call.
+
+**Toolbar discovery** — wire `adapter.getProviderData()` into the SDK's `createFlagsDiscoveryEndpoint`, merging with the host's `getProviderData(flags)` via `mergeProviderData` for code-side metadata.
+
+> Note: per-user writes (`.set()`/`.reset()`) and `.when()` overrides are native-only — the adapter still _reads_ user prefs, but the Vercel toolbar replaces code overrides. Use the native `createFlags` API (above) if you want those.
+
 ## Flag Definitions
 
 Store flag definitions in KV under `flags:def:<name>`. Definitions control behavior without deploys.
@@ -180,7 +221,7 @@ const flags = createFlags(kv, {
 
 | Option       | Type                               | Default | Description                                                   |
 | ------------ | ---------------------------------- | ------- | ------------------------------------------------------------- |
-| `watch`      | `boolean`                          | `false` | Stream flag definition updates via KV watch                   |
-| `refresh`    | `number`                           | —       | Poll interval in seconds (fallback when watch is unavailable) |
+| `watch`      | `boolean`                          | `true`  | Stream flag definition updates via KV watch                   |
+| `refresh`    | `number`                           | `30`    | Poll interval in seconds (fallback when watch is unavailable) |
 | `onEvaluate` | `(event: FlagEvent) => void`       | —       | Called after each evaluation                                  |
 | `onError`    | `(event: FlagsErrorEvent) => void` | —       | Called on KV or snapshot errors                               |

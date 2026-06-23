@@ -178,6 +178,39 @@ Different frameworks expose different hooks, requiring two propagation strategie
 
 **Important for Next.js edge middleware**: the scope established in `middleware.ts` does **not** propagate into App Router route handlers — Next dispatches them in a separate async context. Route handlers should use explicit `await flag(ctx)` instead.
 
+## Vercel Flags SDK Adapter (`src/adapter.ts`)
+
+`@beyond.dev/flags/adapter` lets the Vercel [Flags SDK](https://flags-sdk.dev) (`flags/next`) resolve flags against Beyond KV. The host owns request plumbing, toolbar overrides, precompute, and `reportValue`; this module implements the one seam the host calls — the `Adapter` interface — by reusing the same `evaluate()` engine and KV reads as the native API. It is purely additive and shares no state with the ALS/scope machinery above (the host manages the request lifecycle).
+
+```
+flag({ key, adapter, identify })          ← user declares with the Vercel SDK
+        │  flag(request) / evaluate([...]) ← host (flags/next) drives evaluation
+        ▼
+host: identify({headers,cookies}) → entities ; reads override cookie
+        │
+        ▼  adapter.decide({ key, entities, headers, cookies, defaultValue })
+beyondAdapter:  entities → FlagContext (entities.id = bucket key)
+        │       def  = DefSource.get(key)         (snapshot or per-request)
+        │       prefs = fetchUserPrefs(id)         (per-request cached)
+        ▼
+evaluate(key, defaultValue, ctx, def, prefs)  ← same pure engine as native eval
+```
+
+**Mapping**: `EntitiesType = FlagContext`; the host's `entities.id` is the rollout bucket key. The declared `defaultValue` is threaded into `evaluate()` rather than baked into KV, so precedence is identical to native usage. Missing `entities`/`id` → the declared default (can't bucket).
+
+**Read modes** (`mode` option):
+
+| Mode                  | Source                                                            | Best for                                   |
+| --------------------- | ---------------------------------------------------------------- | ------------------------------------------ |
+| `snapshot` (default)  | reuses the `Snapshot` class — in-memory, watch/poll, zero per-eval I/O | long-lived Node servers                    |
+| `request`             | per-request fetch cached in `WeakMap<ReadonlyHeaders, …>` (one `list`+`batchGet`/request) | short-lived edge/serverless (no persistent watch) |
+
+**Batching**: a stable per-instance `adapterId` (Symbol) + `bulkDecide` let the host's `evaluate()` resolve all flags sharing one adapter **and** one `identify` reference in a single call. Distinct `identify` closures form distinct groups (one `bulkDecide` each).
+
+**Discovery**: `adapter.getProviderData()` enumerates `flags:def:*` for the toolbar/`createFlagsDiscoveryEndpoint`. Definitions are thin (KV stores only `on`/`rules`/`rollout`, marked `declaredInCode: false`); merge with the host's `getProviderData(flags)` via `mergeProviderData` for code-side `options`/`description`/`defaultValue`.
+
+**Not bridged**: native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no Vercel equivalent — the adapter still *reads* prefs (end-user opt-in honored), but writes stay on the native API; toolbar overrides replace `.when()`.
+
 ## KV Schema
 
 | Key                | Value                     | Written by                    |
@@ -197,6 +230,7 @@ Different frameworks expose different hooks, requiring two propagation strategie
 | `src/flag.ts`                       | `Flag<T>` public interface and `FlagRuntime` internal interface; `makeFlag()` factory                                         |
 | `src/flags.ts`                      | `FlagsClient`, `createFlags()`, lazy `flags` singleton; `mutateUserPrefs()` CAS loop; `Runtime` impl                          |
 | `src/eval.ts`                       | Pure synchronous `evaluate()` — the 7-step precedence chain                                                                   |
+| `src/adapter.ts`                    | Vercel Flags SDK adapter (`beyondAdapter()`): `decide`/`bulkDecide`/`getProviderData` over the same eval engine + KV         |
 | `src/hash.ts`                       | `fnv1a32()` and `bucket(id, flagName)` for deterministic rollouts                                                             |
 | `src/snapshot.ts`                   | `Snapshot` class: in-memory `Map<name, FlagDef>`, watch+polling sync, `fetchUserPrefs()`                                      |
 | `src/middleware/hono.ts`            | Hono `MiddlewareHandler` — wraps chain with `runWithScope`                                                                    |
