@@ -1,6 +1,6 @@
 {
   "name": "@beyond.dev/flags",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "repository": {
     "type": "git",
@@ -57,7 +57,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@beyond.dev/kv": "*",
+    "@beyond.dev/kv": "^0.2.0",
     "std-env": "^3.9.0",
     "tslib": "^2.8.1"
   },
