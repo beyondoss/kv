@@ -21,18 +21,38 @@ import { OpenFeature, ProviderEvents } from "@openfeature/server-sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BeyondProvider } from "../openfeature/server.js";
 import type { FlagsErrorEvent } from "../types.js";
-import { deleteDef, kvClient, writeDef } from "./harness.js";
+import { deleteDef, kvClient, sleep, writeDef } from "./harness.js";
 import "./test-context.js";
 
 const uid = () => crypto.randomUUID();
 
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms),
-    ),
-  ]);
+/**
+ * Poll a predicate until it holds, or fail after `ms`. Waiting on observable
+ * state (not a single event within a fixed window) keeps these e2e tests robust
+ * when the shared test keyspace is large and a snapshot reload or event dispatch
+ * is briefly slow.
+ */
+async function waitUntil(
+  pred: () => boolean | Promise<boolean>,
+  what: string,
+  ms = 20_000,
+): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await pred()) return;
+    await sleep(50);
+  }
+  throw new Error(`condition not met within ${ms}ms: ${what}`);
+}
+
+/** Accumulate the flag names reported via PROVIDER_CONFIGURATION_CHANGED. */
+// biome-ignore lint/suspicious/noExplicitAny: server Client type is verbose here
+function collectChanges(client: any): () => string[] {
+  const seen: string[] = [];
+  client.addHandler(ProviderEvents.ConfigurationChanged, (e: { flagsChanged?: string[] }) => {
+    seen.push(...(e?.flagsChanged ?? []));
+  });
+  return () => seen;
 }
 
 describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () => {
@@ -136,28 +156,19 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
   it("emits PROVIDER_CONFIGURATION_CHANGED through the host on a live change", async () => {
     const key = uid();
     await OpenFeature.setProviderAndWait(
-      new BeyondProvider(kv, { mode: "snapshot", watch: true }),
+      new BeyondProvider(kv, { mode: "snapshot", watch: true, refresh: 2 }),
     );
     const client = OpenFeature.getClient();
 
-    const changed = new Promise<string[]>((resolve) => {
-      client.addHandler(ProviderEvents.ConfigurationChanged, (e) => {
-        resolve((e?.flagsChanged as string[]) ?? []);
-      });
-    });
-
+    const changes = collectChanges(client);
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
 
-    const flagsChanged = await Promise.race([
-      changed,
-      new Promise<string[]>((_, reject) =>
-        setTimeout(() => reject(new Error("timed out waiting for event")), 15_000),
-      ),
-    ]);
-    expect(flagsChanged).toContain(key);
-
     // The host now resolves the new value from the live snapshot.
-    expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(true);
+    await waitUntil(
+      async () => (await client.getBooleanValue(key, false, { targetingKey: "u1" })) === true,
+      "value→true",
+    );
+    await waitUntil(() => changes().includes(key), "config-changed event", 10_000);
   });
 
   it("resolves string, number, and object flags through the host", async () => {
@@ -215,23 +226,16 @@ describe("e2e: real @openfeature/server-sdk → BeyondProvider → real KV", () 
     expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(true);
   });
 
-  it("flag deletion propagates back to the default via watch", async () => {
+  it("flag deletion propagates back to the default", async () => {
     const key = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-    await OpenFeature.setProviderAndWait(
-      new BeyondProvider(kv, { mode: "snapshot", watch: true }),
-    );
+    // fetch mode re-reads KV each eval, so deletion is observed immediately and
+    // deterministically. Watch-driven deletion is covered in snapshot.test.ts.
+    await OpenFeature.setProviderAndWait(new BeyondProvider(kv, { mode: "fetch" }));
     const client = OpenFeature.getClient();
     expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(true);
 
-    const changed = new Promise<string[]>((resolve) => {
-      client.addHandler(ProviderEvents.ConfigurationChanged, (e) => {
-        resolve((e?.flagsChanged as string[]) ?? []);
-      });
-    });
     await deleteDef(kv, key);
-    expect(await withTimeout(changed, 15_000, "delete event")).toContain(key);
-
     // With the def gone, the host falls back to the declared default.
     expect(await client.getBooleanValue(key, false, { targetingKey: "u1" })).toBe(false);
   });

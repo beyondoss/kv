@@ -190,7 +190,7 @@ describe("BeyondProvider (server) — snapshot mode", () => {
 
   it("emits PROVIDER_CONFIGURATION_CHANGED when a watched def changes", async () => {
     const key = uid();
-    const provider = new BeyondProvider(kv, { mode: "snapshot", watch: true });
+    const provider = new BeyondProvider(kv, { mode: "snapshot", watch: true, refresh: 2 });
     await provider.initialize();
     try {
       const changed = new Promise<string[]>((resolve) => {

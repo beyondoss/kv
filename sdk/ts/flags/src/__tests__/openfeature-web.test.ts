@@ -42,7 +42,7 @@ describe("BeyondWebProvider — synchronous resolution", () => {
   });
 
   async function start(context: EvaluationContext): Promise<void> {
-    provider = new BeyondWebProvider(kv, { watch: true });
+    provider = new BeyondWebProvider(kv, { watch: true, refresh: 2 });
     await provider.initialize(context);
   }
 

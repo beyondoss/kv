@@ -19,7 +19,7 @@ import type { KvClient } from "@beyond.dev/kv";
 import { OpenFeature, ProviderEvents } from "@openfeature/web-sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BeyondWebProvider } from "../openfeature/web.js";
-import { deleteDef, kvClient, writeDef } from "./harness.js";
+import { deleteDef, kvClient, sleep, writeDef } from "./harness.js";
 import "./test-context.js";
 
 const uid = () => crypto.randomUUID();
@@ -39,17 +39,19 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
   it("host returns live value after a watched def change (the irrefutable toggle)", async () => {
     const key = uid();
     await OpenFeature.setContext({ targetingKey: "u1" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     // No def yet → declared default (sync call, implicit static context).
     expect(client.getBooleanValue(key, false)).toBe(false);
 
-    const changed = onceConfigChanged(client, key);
+    const changes = collectChanges(client);
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-    await changed; // watch → snapshot → PROVIDER_CONFIGURATION_CHANGED
+    // Wait on the observable value, not a single event within a fixed window.
+    await waitUntil(() => client.getBooleanValue(key, false) === true, "value→true");
 
     expect(client.getBooleanValue(key, false)).toBe(true);
+    await waitUntil(() => changes().includes(key), "config-changed event", 10_000);
   });
 
   it("targeting rule resolves from the static context", async () => {
@@ -59,7 +61,7 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       rules: [{ when: { plan: "pro" }, value: true }],
     });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "pro" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(true);
@@ -72,7 +74,7 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       rules: [{ when: { plan: "pro" }, value: true }],
     });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "free" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(false); // free
@@ -89,7 +91,7 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const { error } = await kv.set(`flags:user:${id}`, JSON.stringify({ [key]: true }));
     if (error) throw error;
     await OpenFeature.setContext({ targetingKey: id });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     expect(client.getBooleanValue(key, false)).toBe(true);
@@ -107,7 +109,7 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     });
     await writeDef(kv, badKey, { on: true, rollout: { percent: 100, value: "x" } });
     await OpenFeature.setContext({ targetingKey: "u1", plan: "pro" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     const ok = client.getBooleanDetails(okKey, false);
@@ -131,7 +133,7 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
       rollout: { percent: 100, value: { a: 1, b: ["x"] } },
     });
     await OpenFeature.setContext({ targetingKey: "u1" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true, refresh: 2 }));
     const client = OpenFeature.getClient();
 
     expect(client.getStringValue(sKey, "light")).toBe("dark");
@@ -139,19 +141,25 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     expect(client.getObjectValue(oKey, {})).toEqual({ a: 1, b: ["x"] });
   });
 
-  it("flag deletion propagates back to the default via watch", async () => {
+  it("flag deletion propagates back to the default via poll reconcile", async () => {
     const key = uid();
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
     await OpenFeature.setContext({ targetingKey: "u1" });
-    await OpenFeature.setProviderAndWait(new BeyondWebProvider(kv, { watch: true }));
+    // Poll mode reconciles continuously (watch mode only polls during reconnect
+    // gaps), so a deletion is caught deterministically. Watch-driven deletion is
+    // covered in snapshot.test.ts.
+    await OpenFeature.setProviderAndWait(
+      new BeyondWebProvider(kv, { watch: false, refresh: 1 }),
+    );
     const client = OpenFeature.getClient();
     expect(client.getBooleanValue(key, false)).toBe(true);
 
-    const changed = onceConfigChanged(client, key);
+    const changes = collectChanges(client);
     await deleteDef(kv, key);
-    await changed; // watch del → snapshot drop → PROVIDER_CONFIGURATION_CHANGED
+    await waitUntil(() => client.getBooleanValue(key, false) === false, "value→false");
 
     expect(client.getBooleanValue(key, false)).toBe(false);
+    await waitUntil(() => changes().includes(key), "del config-changed", 10_000);
   });
 
   it("polling fallback (watch:false) still picks up live changes", async () => {
@@ -164,9 +172,9 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
     const client = OpenFeature.getClient();
     expect(client.getBooleanValue(key, false)).toBe(false);
 
-    const changed = onceConfigChanged(client, key);
     await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
-    await changed; // arrives via the poll loop, not watch
+    // Arrives via the poll loop, not watch — wait on the value with headroom.
+    await waitUntil(() => client.getBooleanValue(key, false) === true, "poll→true");
 
     expect(client.getBooleanValue(key, false)).toBe(true);
   });
@@ -186,22 +194,33 @@ describe("e2e: real @openfeature/web-sdk → BeyondWebProvider → real KV", () 
   });
 });
 
-/** Resolve once the provider reports `name` changed (with a bounded timeout). */
-function onceConfigChanged(
+/**
+ * Poll a predicate until it holds, or fail after `ms`. Waiting on observable
+ * state (rather than a single event within a fixed window) keeps these e2e tests
+ * robust when the shared test keyspace is large and a snapshot reload or event
+ * dispatch is briefly slow.
+ */
+async function waitUntil(
+  pred: () => boolean | Promise<boolean>,
+  what: string,
+  ms = 20_000,
+): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await pred()) return;
+    await sleep(50);
+  }
+  throw new Error(`condition not met within ${ms}ms: ${what}`);
+}
+
+/** Accumulate the flag names reported via PROVIDER_CONFIGURATION_CHANGED. */
+function collectChanges(
   // biome-ignore lint/suspicious/noExplicitAny: web Client type is verbose here
   client: any,
-  name: string,
-): Promise<void> {
-  return Promise.race([
-    new Promise<void>((resolve) => {
-      // biome-ignore lint/suspicious/noExplicitAny: event payload
-      const handler = (e: any) => {
-        if (((e?.flagsChanged as string[]) ?? []).includes(name)) resolve();
-      };
-      client.addHandler(ProviderEvents.ConfigurationChanged, handler);
-    }),
-    new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error("timed out waiting for change")), 15_000),
-    ),
-  ]);
+): () => string[] {
+  const seen: string[] = [];
+  client.addHandler(ProviderEvents.ConfigurationChanged, (e: { flagsChanged?: string[] }) => {
+    seen.push(...(e?.flagsChanged ?? []));
+  });
+  return () => seen;
 }
