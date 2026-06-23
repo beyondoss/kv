@@ -61,16 +61,24 @@ createFlags(kv, opts)
       │
       ▼
 snapshot.start()
-  ├─ loadAll(): list(flags:def:*) + batchGet() → in-memory Map
+  ├─ loadAll(): list(flags:def:*) + batchGet() → in-memory Map; track maxRevision
   └─ opts.watch !== false:
-       kv.watch("flags:def:*") → stream deltas → apply to Map
-       on error: exponential backoff (1s→60s) + poll fallback
+       kv.watch("flags:def:*", { since: lastRevision }) → stream deltas → apply to Map
+       on hard error: exponential backoff (1s→60s) + poll fallback,
+                      then re-watch from { since: lastRevision }  (no gap loss)
      opts.watch === false (or fallback):
        setInterval(loadAll, refresh * 1000)   [timer unref'd]
       │
       ▼
 flag eval: snapshot.get(name) → O(1) → FlagDef | undefined
 ```
+
+`lastRevision` is the highest revision seen from any read or watch delta. The
+first watch starts from the revision the initial `loadAll` saw, and every
+reconnect resumes from the last delta applied — so writes/deletes that land while
+the stream is down are replayed (the server treats `since` as exclusive) rather
+than lost. Re-applying an already-seen revision is a no-op (byte-compare dedup),
+so over-replay is harmless.
 
 ### User pref mutation (CAS loop)
 
@@ -319,7 +327,7 @@ CLOSED
 | Zero-arg flag call with no active scope    | Throws `FlagError("no_context")`                                         | Ensure middleware is registered before route handlers |
 | `ctx.id === ""`                            | Throws `FlagError("missing_id")`                                         | Middleware must supply a non-empty id                 |
 | Snapshot not yet loaded                    | Returns flag's `default` with reason `"no-snapshot"`                     | Await `client.ready()` at startup                     |
-| Watch stream error                         | `onError` called; backoff + falls back to polling                        | Auto-recovers; no eval interruption                   |
+| Watch stream error                         | `onError` called; backoff + falls back to polling; reconnect resumes from `lastRevision` | Auto-recovers; deltas during the gap are replayed, not lost |
 | User prefs KV fetch fails                  | `onError` called; prefs treated as `null`                                | Evals continue, user-pref branch skipped              |
 | `flag.set/reset` CAS conflict (≤4 retries) | Retries; emits `onError` + throws `FlagError("kv_error")` on max retries | Caller must handle                                    |
 | `BEYOND_KV_URL` not set                    | Default `flags` singleton throws at first call                           | Set env var or use `createFlags(kv)`                  |
@@ -346,3 +354,9 @@ Using only `id` would mean a user in the 20% cohort for flag A would also be in 
 ### Why prefs are sparse (only non-defaults stored)
 
 Most users never opt in or out of any flag. Storing only deviations means the `flags:user:{id}` key doesn't exist for most ids, keeping KV storage proportional to actual customization rather than user count × flag count.
+
+### Why the watch resumes from `lastRevision` (not from "now")
+
+A reconnect that re-subscribes from the current moment silently drops any write or delete that landed while the stream was down — leaving a flag permanently stale until the next change or restart. Resuming from the last revision applied makes the snapshot self-healing across disconnects: the server replays the gap (since is exclusive), and byte-compare dedup makes any over-replay a no-op. This is the snapshot equivalent of the idempotent/recoverable property required of state-mutating operations elsewhere — eventual consistency that actually converges, rather than a poll-timing race.
+
+A periodic full reconcile on a *healthy* stream is deliberately **not** done: its cost is `O(flags)` reads per interval × every replica, independent of change rate, and it would mask (rather than surface) a server-side watch-delivery bug. If silent same-stream drops are ever observed, that belongs fixed at the watch source, not papered over with fleet-wide polling.

@@ -1,8 +1,10 @@
 import { KvError } from "@beyond.dev/kv";
-import type { KvClient } from "@beyond.dev/kv";
+import type { KvClient, WatchEvent, WatchOptions } from "@beyond.dev/kv";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { fetchUserPrefs, Snapshot } from "../snapshot.js";
 import { deleteDef, kvClient, sleep, writeDef } from "./harness.js";
+
+const encode = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
 
 describe("snapshot — real KV", () => {
   let kv: KvClient;
@@ -252,6 +254,63 @@ describe("snapshot — real KV", () => {
     }
     expect(snap.get("post-fail")).toBeDefined();
     expect(errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe("snapshot — watch resume after hard reconnect", () => {
+  it("resumes from the last revision and replays the delta missed while down", async () => {
+    const sinceSeen: (number | undefined)[] = [];
+    let watchCalls = 0;
+
+    // Fake client: empty initial load; a watch that delivers one set then
+    // hard-errors (a dropped stream), and on reconnect replays a *different*
+    // delta — exactly what the server does for everything after `since`.
+    const fakeKv = {
+      async list() {
+        return { data: { keys: [] as { name: string }[] }, error: undefined };
+      },
+      async batchGet() {
+        return { data: [] as never[], error: undefined };
+      },
+      async *watch(_key: string, opts?: WatchOptions): AsyncGenerator<WatchEvent> {
+        watchCalls++;
+        sinceSeen.push(opts?.since);
+        if (watchCalls === 1) {
+          yield { type: "ready" };
+          yield { type: "set", key: "flags:def:a", value: encode({ on: true }), revision: 5 };
+          throw new KvError("sse_error", "stream dropped", 500); // hard disconnect
+        }
+        // Reconnect: replay the delta that landed while we were down.
+        yield { type: "set", key: "flags:def:b", value: encode({ on: false }), revision: 7 };
+        await new Promise<void>((resolve) => {
+          opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    } as unknown as KvClient;
+
+    const snap = new Snapshot(fakeKv, { refresh: 30, watch: true });
+    snap.start();
+    await snap.ready();
+
+    // First session applied A.
+    {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline && snap.get("a") === undefined) await sleep(25);
+    }
+    expect(snap.get("a")).toEqual({ on: true });
+
+    // After the hard error + backoff, the reconnect must carry since=5 and the
+    // replayed delta for B must land — proving no gap loss.
+    {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && snap.get("b") === undefined) await sleep(25);
+    }
+    expect(snap.get("b")).toEqual({ on: false });
+
+    expect(sinceSeen[0]).toBeUndefined(); // first connect starts from current state
+    expect(sinceSeen[1]).toBe(5); // reconnect resumes exactly where it left off
+
+    snap.close();
   });
 });
 

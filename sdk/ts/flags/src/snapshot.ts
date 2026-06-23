@@ -1,4 +1,4 @@
-import type { KvClient } from "@beyond.dev/kv";
+import type { KvClient, WatchOptions } from "@beyond.dev/kv";
 import { FlagError } from "./errors.js";
 import type {
   FlagDef,
@@ -31,6 +31,13 @@ export class Snapshot {
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   isReady = false;
+  /**
+   * Highest revision observed from any read or watch event. Used to resume the
+   * watch from where it left off after a hard reconnect (and to start the first
+   * watch from the point the initial load saw), so deltas that land while the
+   * stream is down are replayed rather than lost.
+   */
+  private lastRevision = 0;
 
   readonly kv: KvClient;
   readonly opts: {
@@ -122,6 +129,7 @@ export class Snapshot {
           if (!entry) continue;
           const flagName = fullKey.slice(DEF_PREFIX.length);
           seen.add(flagName);
+          if (entry.revision > this.lastRevision) this.lastRevision = entry.revision;
           if (this.applyValue(flagName, entry.value)) changed.push(flagName);
         }
       }
@@ -143,12 +151,18 @@ export class Snapshot {
     let attempt = 0;
     while (!this.closed) {
       this.watchAbort = new AbortController();
-      const opts = { prefix: true, signal: this.watchAbort.signal };
+      // Resume from the last revision we saw so deltas that arrived while the
+      // stream was down are replayed (the server treats `since` as exclusive).
+      const opts: WatchOptions = { prefix: true, signal: this.watchAbort.signal };
+      if (this.lastRevision > 0) opts.since = this.lastRevision;
       const sessionStart = Date.now();
       try {
         for await (const event of this.kv.watch(DEF_PREFIX, opts)) {
           if (this.closed) return;
           if (event.type === "ready") continue;
+          // Advance the resume point on every delta, even ones the byte-compare
+          // dedups, so a reconnect never re-requests already-applied revisions.
+          if (event.revision > this.lastRevision) this.lastRevision = event.revision;
           if (event.type === "set") {
             const flagName = event.key.slice(DEF_PREFIX.length);
             if (this.applyValue(flagName, event.value)) {
