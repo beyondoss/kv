@@ -16,17 +16,26 @@ jobs:
       - uses: jdx/mise-action@v4
       - name: install:ts
         run: mise run install:ts
-      - name: set version
+      - name: set versions
+        # The tag drives the version for every published package (lockstep).
+        # @beyond.dev/flags depends on @beyond.dev/kv, so pin that dependency to
+        # the same release rather than letting consumers float to any version.
         run: |
           VERSION=${GITHUB_REF_NAME#sdk/v}
-          npm version "$VERSION" --no-git-tag-version
-        # @beyond.dev/kv lives in the workspace package, not the (private) sdk/ts root
-        working-directory: sdk/ts/kv
+          npm version "$VERSION" --no-git-tag-version --allow-same-version -w @beyond.dev/kv
+          npm version "$VERSION" --no-git-tag-version --allow-same-version -w @beyond.dev/flags
+          VERSION="$VERSION" node -e "const fs=require('fs');const f='flags/package.json';const p=JSON.parse(fs.readFileSync(f));p.dependencies['@beyond.dev/kv']='^'+process.env.VERSION;fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+        working-directory: sdk/ts
       - name: build:ts
         run: mise run build:ts
       - name: upgrade npm
         # OIDC trusted publishing requires npm >= 11.5.1; node LTS ships npm 10.
         run: npm install -g npm@latest
-      - name: publish
+      # @beyond.dev/kv is published first so @beyond.dev/flags' pinned dependency
+      # on it is resolvable the moment flags lands on the registry.
+      - name: publish @beyond.dev/kv
         run: npm publish --access public
         working-directory: sdk/ts/kv
+      - name: publish @beyond.dev/flags
+        run: npm publish --access public
+        working-directory: sdk/ts/flags
