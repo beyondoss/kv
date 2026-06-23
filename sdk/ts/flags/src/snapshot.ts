@@ -1,4 +1,4 @@
-import type { KvClient } from "@beyond.dev/kv";
+import type { KvClient, WatchOptions } from "@beyond.dev/kv";
 import { FlagError } from "./errors.js";
 import type {
   FlagDef,
@@ -19,19 +19,32 @@ const decoder = new TextDecoder();
  * Reads are O(1) Map lookups — zero KV round-trips per flag eval.
  */
 export class Snapshot {
-  private state = new Map<string, FlagDef>();
+  /**
+   * Parsed def plus the exact KV bytes it was decoded from. The raw bytes are
+   * the source of truth for change detection (see {@link applyValue}) — keeping
+   * them avoids re-serializing parsed objects to compare.
+   */
+  private state = new Map<string, { def: FlagDef; raw: Uint8Array }>();
   private readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private watchAbort: AbortController | undefined;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   isReady = false;
+  /**
+   * Highest revision observed from any read or watch event. Used to resume the
+   * watch from where it left off after a hard reconnect (and to start the first
+   * watch from the point the initial load saw), so deltas that land while the
+   * stream is down are replayed rather than lost.
+   */
+  private lastRevision = 0;
 
   readonly kv: KvClient;
   readonly opts: {
     refresh: number;
     watch: boolean;
     onError?: (e: FlagsErrorEvent) => void;
+    onChange?: (names: string[]) => void;
   };
 
   constructor(
@@ -40,6 +53,13 @@ export class Snapshot {
       refresh: number;
       watch: boolean;
       onError?: (e: FlagsErrorEvent) => void;
+      /**
+       * Called after the *initial* load with the names of flags whose def
+       * changed (added, updated, or removed) via a watch delta or a poll
+       * reload. Never fired during the initial load. Used to surface live
+       * config changes (e.g. OpenFeature `PROVIDER_CONFIGURATION_CHANGED`).
+       */
+      onChange?: (names: string[]) => void;
     },
   ) {
     this.kv = kv;
@@ -61,7 +81,7 @@ export class Snapshot {
 
   /** Lookup the current state for a flag. Returns `undefined` if absent. */
   get(name: string): FlagDef | undefined {
-    return this.state.get(name);
+    return this.state.get(name)?.def;
   }
 
   /** Start the snapshot: initial load + background sync (watch or poll). */
@@ -91,6 +111,7 @@ export class Snapshot {
   private async loadAll(): Promise<void> {
     let cursor: string | undefined;
     const seen = new Set<string>();
+    const changed: string[] = [];
     do {
       const { data, error } = await this.kv.list(
         cursor === undefined
@@ -108,7 +129,10 @@ export class Snapshot {
           if (!entry) continue;
           const flagName = fullKey.slice(DEF_PREFIX.length);
           seen.add(flagName);
-          this.applyValue(flagName, entry.value);
+          if (entry.revision > this.lastRevision) {
+            this.lastRevision = entry.revision;
+          }
+          if (this.applyValue(flagName, entry.value)) changed.push(flagName);
         }
       }
       cursor = data.nextCursor;
@@ -116,26 +140,44 @@ export class Snapshot {
 
     // Drop any flag that's no longer in KV.
     for (const name of this.state.keys()) {
-      if (!seen.has(name)) this.state.delete(name);
+      if (!seen.has(name)) {
+        this.state.delete(name);
+        changed.push(name);
+      }
     }
+
+    this.notifyChange(changed);
   }
 
   private async runWatch(): Promise<void> {
     let attempt = 0;
     while (!this.closed) {
       this.watchAbort = new AbortController();
-      const opts = { prefix: true, signal: this.watchAbort.signal };
+      // Resume from the last revision we saw so deltas that arrived while the
+      // stream was down are replayed (the server treats `since` as exclusive).
+      const opts: WatchOptions = {
+        prefix: true,
+        signal: this.watchAbort.signal,
+      };
+      if (this.lastRevision > 0) opts.since = this.lastRevision;
       const sessionStart = Date.now();
       try {
         for await (const event of this.kv.watch(DEF_PREFIX, opts)) {
           if (this.closed) return;
           if (event.type === "ready") continue;
+          // Advance the resume point on every delta, even ones the byte-compare
+          // dedups, so a reconnect never re-requests already-applied revisions.
+          if (event.revision > this.lastRevision) {
+            this.lastRevision = event.revision;
+          }
           if (event.type === "set") {
             const flagName = event.key.slice(DEF_PREFIX.length);
-            this.applyValue(flagName, event.value);
+            if (this.applyValue(flagName, event.value)) {
+              this.notifyChange([flagName]);
+            }
           } else if (event.type === "del") {
             const flagName = event.key.slice(DEF_PREFIX.length);
-            this.state.delete(flagName);
+            if (this.state.delete(flagName)) this.notifyChange([flagName]);
           }
         }
         // Stream ended cleanly (server close, LB timeout, graceful restart).
@@ -178,15 +220,44 @@ export class Snapshot {
     }
   }
 
-  private applyValue(flagName: string, raw: Uint8Array): void {
+  /**
+   * Decode and store a flag def. Returns `true` if the stored value actually
+   * changed (newly added, or its KV bytes differ from the prior value) so
+   * callers can fire change notifications without spurious events on no-op
+   * re-reads — every poll re-reads every def, so an unchanged re-read must stay
+   * silent.
+   *
+   * Change is decided by exact equality of the raw KV bytes, not by comparing
+   * parsed objects: bytes are the authoritative representation, the check
+   * short-circuits on length, and it needs no parse→serialize round-trip. A
+   * semantically-identical rewrite with reordered keys counts as a change here
+   * (different bytes) — that only triggers a harmless re-resolve downstream, so
+   * canonicalizing is deliberately not worth the cost.
+   */
+  private applyValue(flagName: string, raw: Uint8Array): boolean {
     let parsed: FlagDef | undefined;
     try {
       parsed = decodeFlagDef(raw);
     } catch (err) {
       this.reportError("snapshot", err, flagName);
-      return;
+      return false;
     }
-    if (parsed) this.state.set(flagName, parsed);
+    if (!parsed) return false;
+    const prev = this.state.get(flagName);
+    if (prev && bytesEqual(prev.raw, raw)) return false;
+    // Copy the bytes: the KV client's buffer is not guaranteed to outlive this
+    // call unmutated, and this map retains it as the change-detection baseline.
+    this.state.set(flagName, { def: parsed, raw: raw.slice() });
+    return true;
+  }
+
+  /**
+   * Fire the `onChange` callback for actually-changed flags. Suppressed during
+   * the initial load (only live deltas/reloads notify) and for empty sets.
+   */
+  private notifyChange(names: string[]): void {
+    if (!this.isReady || names.length === 0 || !this.opts.onChange) return;
+    this.opts.onChange(names);
   }
 
   private reportError(
@@ -254,6 +325,16 @@ export async function fetchUserPrefs(
     });
     return null;
   }
+}
+
+/** Exact byte equality. Short-circuits on length; no allocation. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 function decodeFlagDef(value: Uint8Array): FlagDef | undefined {

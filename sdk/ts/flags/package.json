@@ -17,6 +17,10 @@
       "import": "./dist/index.mjs",
       "types": "./dist/index.d.mts"
     },
+    "./adapter": {
+      "import": "./dist/adapter.mjs",
+      "types": "./dist/adapter.d.mts"
+    },
     "./hono": {
       "import": "./dist/middleware/hono.mjs",
       "types": "./dist/middleware/hono.d.mts"
@@ -36,6 +40,14 @@
     "./next/middleware": {
       "import": "./dist/middleware/next-middleware.mjs",
       "types": "./dist/middleware/next-middleware.d.mts"
+    },
+    "./openfeature/server": {
+      "import": "./dist/openfeature/server.mjs",
+      "types": "./dist/openfeature/server.d.mts"
+    },
+    "./openfeature/web": {
+      "import": "./dist/openfeature/web.mjs",
+      "types": "./dist/openfeature/web.d.mts"
     }
   },
   "scripts": {
@@ -50,13 +62,29 @@
     "tslib": "^2.8.1"
   },
   "peerDependencies": {
+    "@openfeature/core": ">=1.11",
+    "@openfeature/server-sdk": ">=1.22",
+    "@openfeature/web-sdk": ">=1.9",
     "express": ">=4",
     "fastify": ">=4",
     "fastify-plugin": ">=4",
+    "flags": ">=4",
     "hono": ">=4",
     "next": ">=14"
   },
   "peerDependenciesMeta": {
+    "@openfeature/core": {
+      "optional": true
+    },
+    "@openfeature/server-sdk": {
+      "optional": true
+    },
+    "@openfeature/web-sdk": {
+      "optional": true
+    },
+    "flags": {
+      "optional": true
+    },
     "express": {
       "optional": true
     },
@@ -74,11 +102,15 @@
     }
   },
   "devDependencies": {
+    "@openfeature/core": "^1.11.0",
+    "@openfeature/server-sdk": "^1.22.0",
+    "@openfeature/web-sdk": "^1.9.0",
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
     "express": "^5.0.0",
     "fastify": "^5.0.0",
     "fastify-plugin": "^5.0.0",
+    "flags": "^4.2.0",
     "hono": "^4.0.0",
     "next": "^15.0.0",
     "tsdown": "^0.21.10",
