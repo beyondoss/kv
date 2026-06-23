@@ -24,6 +24,10 @@ import type { FlagContext } from "../types.js";
 import { kvClient, writeDef } from "./harness.js";
 import "./test-context.js";
 
+// The test KV server shares one keyspace (see http.ts `nsToIndex`), so use
+// per-test UUIDs for flag keys and ids to avoid cross-test/cross-file collisions.
+const uid = () => crypto.randomUUID();
+
 /**
  * Minimal Pages-Router request the host accepts (`"headers" in request`). The
  * host only reads `.headers`, so a bare object suffices; typed `any` because it
@@ -47,27 +51,28 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
   });
 
   it("host-returned value tracks live KV state (the irrefutable toggle)", async () => {
+    const key = uid();
     const adapter = beyondAdapter<boolean>(kv, { mode: "request" });
     const newCheckout = flag<boolean>({
-      key: "new-checkout",
+      key,
       defaultValue: false,
       adapter,
-      identify: () => ({ id: "u1" }),
+      identify: () => ({ id: uid() }),
     });
     try {
       // No def yet → host applies the declared defaultValue.
       expect(await newCheckout(request())).toBe(false);
 
       // Turn it on at 100% → host now returns true (value came from KV via decide).
-      await writeDef(kv, "new-checkout", { on: true, rollout: { percent: 100 } });
+      await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
       expect(await newCheckout(request())).toBe(true);
 
       // Kill switch → back to default.
-      await writeDef(kv, "new-checkout", { on: false });
+      await writeDef(kv, key, { on: false });
       expect(await newCheckout(request())).toBe(false);
 
       // Re-enable → true again. The flips prove decide reads live KV each call.
-      await writeDef(kv, "new-checkout", { on: true, rollout: { percent: 100 } });
+      await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
       expect(await newCheckout(request())).toBe(true);
     } finally {
       await adapter.close();
@@ -75,7 +80,8 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
   });
 
   it("identify → entities → KV targeting rule, end to end", async () => {
-    await writeDef(kv, "ai-search", {
+    const key = uid();
+    await writeDef(kv, key, {
       on: true,
       rules: [{ when: { plan: "pro" }, value: true }],
     });
@@ -83,7 +89,7 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
 
     // identify pulls the plan from the request headers the host sealed for us.
     const aiSearch = flag<boolean, FlagContext>({
-      key: "ai-search",
+      key,
       defaultValue: false,
       adapter,
       identify: ({ headers }) => ({
@@ -104,23 +110,25 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
   });
 
   it("per-user pref resolves end to end", async () => {
-    await writeDef(kv, "beta", { on: true, rollout: { percent: 0 } });
+    const key = uid();
+    const id = uid();
+    await writeDef(kv, key, { on: true, rollout: { percent: 0 } });
     const { error } = await kv.set(
-      "flags:user:u1",
-      JSON.stringify({ beta: true }),
+      `flags:user:${id}`,
+      JSON.stringify({ [key]: true }),
     );
     if (error) throw error;
 
     const adapter = beyondAdapter<boolean>(kv, { mode: "request" });
     const beta = flag<boolean>({
-      key: "beta",
+      key,
       defaultValue: false,
       adapter,
       identify: ({ headers }) => ({ id: headers.get("x-user-id") ?? "anon" }),
     });
     try {
-      expect(await beta(request({ "x-user-id": "u1" }))).toBe(true); // pref
-      expect(await beta(request({ "x-user-id": "u2" }))).toBe(false); // 0% rollout
+      expect(await beta(request({ "x-user-id": id }))).toBe(true); // pref
+      expect(await beta(request({ "x-user-id": uid() }))).toBe(false); // 0% rollout
     } finally {
       await adapter.close();
     }
@@ -128,13 +136,14 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
 
   it("snapshot mode resolves through the host too", async () => {
     // Write before creating the adapter; the first decide awaits initial load.
-    await writeDef(kv, "snap", { on: true, rollout: { percent: 100 } });
+    const key = uid();
+    await writeDef(kv, key, { on: true, rollout: { percent: 100 } });
     const adapter = beyondAdapter<boolean>(kv, { mode: "snapshot", watch: false });
     const snap = flag<boolean>({
-      key: "snap",
+      key,
       defaultValue: false,
       adapter,
-      identify: () => ({ id: "u1" }),
+      identify: () => ({ id: uid() }),
     });
     try {
       expect(await snap(request())).toBe(true);
@@ -144,9 +153,12 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
   });
 
   it("host evaluate() batches through our bulkDecide", async () => {
-    await writeDef(kv, "a", { on: true, rollout: { percent: 100 } });
-    await writeDef(kv, "b", { on: false });
-    await writeDef(kv, "c", {
+    const ka = uid();
+    const kb = uid();
+    const kc = uid();
+    await writeDef(kv, ka, { on: true, rollout: { percent: 100 } });
+    await writeDef(kv, kb, { on: false });
+    await writeDef(kv, kc, {
       on: true,
       rules: [{ when: { plan: "pro" }, value: true }],
     });
@@ -156,21 +168,22 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
     // The host groups flags by (adapterId, identify reference). Sharing ONE
     // adapter instance AND one identify function collapses all three into a
     // single bulk group → a single bulkDecide call.
-    const identify = (): FlagContext => ({ id: "u1", plan: "pro" });
+    const id = uid();
+    const identify = (): FlagContext => ({ id, plan: "pro" });
     const mk = (key: string) =>
       flag<boolean, FlagContext>({ key, defaultValue: false, adapter, identify });
-    const a = mk("a");
-    const b = mk("b");
-    const c = mk("c");
+    const a = mk(ka);
+    const b = mk(kb);
+    const c = mk(kc);
     try {
       const result = await evaluate([a, b, c], request());
       expect(result).toEqual([true, false, true]);
       // Proves the host routed through bulkDecide, not per-flag decide.
       expect(bulkSpy).toHaveBeenCalledTimes(1);
       expect(bulkSpy.mock.calls[0]?.[0].flags.map((f) => f.key)).toEqual([
-        "a",
-        "b",
-        "c",
+        ka,
+        kb,
+        kc,
       ]);
     } finally {
       await adapter.close();
@@ -178,17 +191,18 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
   });
 
   it("getProviderData merges adapter (KV) + host (code) definitions", async () => {
-    await writeDef(kv, "shipped", { on: true });
+    const key = uid();
+    await writeDef(kv, key, { on: true });
     const adapter = beyondAdapter<boolean>(kv, {
       mode: "request",
-      origin: (key) => `https://flags.example/${key}`,
+      origin: (k) => `https://flags.example/${k}`,
     });
     const shipped = flag<boolean>({
-      key: "shipped",
+      key,
       defaultValue: false,
       description: "A shipped feature",
       adapter,
-      identify: () => ({ id: "u1" }),
+      identify: () => ({ id: uid() }),
     });
     try {
       // Host builds code-side definitions (description/defaultValue/options).
@@ -197,10 +211,10 @@ describe("e2e: real flags/next host → beyond adapter → real KV", () => {
       // Adapter builds provider-side definitions (what exists in KV + origin).
       const kvData = await adapter.getProviderData();
 
-      expect(codeData.definitions.shipped?.description).toBe("A shipped feature");
-      expect(kvData.definitions.shipped?.declaredInCode).toBe(false);
-      expect(kvData.definitions.shipped?.origin).toBe(
-        "https://flags.example/shipped",
+      expect(codeData.definitions[key]?.description).toBe("A shipped feature");
+      expect(kvData.definitions[key]?.declaredInCode).toBe(false);
+      expect(kvData.definitions[key]?.origin).toBe(
+        `https://flags.example/${key}`,
       );
       expect(kvData.hints).toEqual([]);
     } finally {
