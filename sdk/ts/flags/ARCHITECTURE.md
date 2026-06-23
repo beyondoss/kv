@@ -211,6 +211,44 @@ evaluate(key, defaultValue, ctx, def, prefs)  ← same pure engine as native eva
 
 **Not bridged**: native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no Vercel equivalent — the adapter still *reads* prefs (end-user opt-in honored), but writes stay on the native API; toolbar overrides replace `.when()`.
 
+## OpenFeature Providers (`src/openfeature/`)
+
+`@beyond.dev/flags/openfeature/server` and `.../web` expose the same eval engine to [OpenFeature](https://openfeature.dev/), the CNCF vendor-neutral flag standard. OpenFeature's `Provider` is the same one-method seam as the Vercel `Adapter`; both providers are thin shells over the same `evaluate()` + `Snapshot` + `fetchUserPrefs` and share no state with the ALS machinery.
+
+Two entry points because OpenFeature ships server and web as **distinct packages with different `Provider` interfaces** — server `resolve*` is `async`, web `resolve*` is **synchronous** against a static context. A small SDK-agnostic `shared.ts` (imports only `@openfeature/core`) holds the mapping both reuse, so neither entry pulls the other SDK.
+
+```
+EvaluationContext (targetingKey + attrs)
+        │  toFlagContext()                 ← shared.ts
+        ▼
+FlagContext { id, ...attrs }
+        │  def = Snapshot.get(key)         ← reuse snapshot.ts
+        │  prefs = fetchUserPrefs(id)      ← reuse snapshot.ts
+        ▼
+evaluate(key, default, ctx, def, prefs)    ← same pure engine as native/adapter
+        │  toResolution() + type-check
+        ▼
+ResolutionDetails<T> { value, reason, errorCode?, flagMetadata? }
+```
+
+**Context mapping**: `EvaluationContext.targetingKey` → `FlagContext.id` (the rollout/pref bucket key); other attributes carry through for rule matching. A missing `targetingKey` maps to `id: ""` — rules on attributes still match, rollout/prefs are skipped (no throw, unlike native `flag.ts`).
+
+**Reason mapping** (`EvalReason` → OpenFeature `ResolutionReason`): `off`→`DISABLED`; `user-pref`/`override`/`rule`→`TARGETING_MATCH`; `rollout`→`SPLIT`; `no-snapshot`→`STALE` before init else `DEFAULT`; `default`→`DEFAULT`. `flagMetadata` carries `beyondReason` (+ `ruleIndex` on a rule match).
+
+**Type contract**: each typed resolver (`resolveBoolean/String/Number/ObjectEvaluation`) checks the resolved value's type; on mismatch it returns the declared `defaultValue` with `errorCode: TYPE_MISMATCH` (never coerces). All four delegate to one private generic `resolve`.
+
+**Read model**:
+
+| Provider | Mode | Source |
+| -------- | ---- | ------ |
+| server   | `snapshot` (default) | in-memory `Snapshot`, watch/poll, zero def I/O per eval |
+| server   | `fetch`              | one `kv.get` per flag per eval (no persistent watch)    |
+| web      | snapshot only        | sync resolve needs in-memory state; prefs for the active context are pre-fetched on `initialize`/`onContextChange` |
+
+**Events**: in snapshot mode both providers wire the new `Snapshot` `onChange` hook → `events.emit(PROVIDER_CONFIGURATION_CHANGED, { flagsChanged })`. `PROVIDER_READY`/`PROVIDER_ERROR` are emitted by the SDK from `initialize()` resolving/rejecting (no manual emit).
+
+**Not bridged**: like the Vercel adapter, native `.set()`/`.reset()` (pref writes) and `.when()` overrides have no OpenFeature equivalent — the providers *read* prefs but writes stay on the native API.
+
 ## KV Schema
 
 | Key                | Value                     | Written by                    |
@@ -232,7 +270,10 @@ evaluate(key, defaultValue, ctx, def, prefs)  ← same pure engine as native eva
 | `src/eval.ts`                       | Pure synchronous `evaluate()` — the 7-step precedence chain                                                                   |
 | `src/adapter.ts`                    | Vercel Flags SDK adapter (`beyondAdapter()`): `decide`/`bulkDecide`/`getProviderData` over the same eval engine + KV         |
 | `src/hash.ts`                       | `fnv1a32()` and `bucket(id, flagName)` for deterministic rollouts                                                             |
-| `src/snapshot.ts`                   | `Snapshot` class: in-memory `Map<name, FlagDef>`, watch+polling sync, `fetchUserPrefs()`                                      |
+| `src/snapshot.ts`                   | `Snapshot` class: in-memory `Map<name, FlagDef>`, watch+polling sync, `onChange` change hook, `fetchUserPrefs()`             |
+| `src/openfeature/shared.ts`         | SDK-agnostic OpenFeature glue: `toFlagContext`, `mapReason`, `toResolution` (+ type-mismatch handling)                       |
+| `src/openfeature/server.ts`         | OpenFeature **server** provider (`BeyondProvider`): async resolvers, snapshot/fetch modes, `PROVIDER_CONFIGURATION_CHANGED`  |
+| `src/openfeature/web.ts`            | OpenFeature **web** provider (`BeyondWebProvider`): sync resolvers, per-context pref prefetch on init/context-change         |
 | `src/middleware/hono.ts`            | Hono `MiddlewareHandler` — wraps chain with `runWithScope`                                                                    |
 | `src/middleware/express.ts`         | Express `RequestHandler` — wraps chain with `runWithScope`, errors via `next(err)`                                            |
 | `src/middleware/fastify.ts`         | Fastify plugin — `onRequest` hook uses `enterScope` (can't wrap chain)                                                        |

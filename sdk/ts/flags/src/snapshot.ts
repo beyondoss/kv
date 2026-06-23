@@ -32,6 +32,7 @@ export class Snapshot {
     refresh: number;
     watch: boolean;
     onError?: (e: FlagsErrorEvent) => void;
+    onChange?: (names: string[]) => void;
   };
 
   constructor(
@@ -40,6 +41,13 @@ export class Snapshot {
       refresh: number;
       watch: boolean;
       onError?: (e: FlagsErrorEvent) => void;
+      /**
+       * Called after the *initial* load with the names of flags whose def
+       * changed (added, updated, or removed) via a watch delta or a poll
+       * reload. Never fired during the initial load. Used to surface live
+       * config changes (e.g. OpenFeature `PROVIDER_CONFIGURATION_CHANGED`).
+       */
+      onChange?: (names: string[]) => void;
     },
   ) {
     this.kv = kv;
@@ -91,6 +99,7 @@ export class Snapshot {
   private async loadAll(): Promise<void> {
     let cursor: string | undefined;
     const seen = new Set<string>();
+    const changed: string[] = [];
     do {
       const { data, error } = await this.kv.list(
         cursor === undefined
@@ -108,7 +117,7 @@ export class Snapshot {
           if (!entry) continue;
           const flagName = fullKey.slice(DEF_PREFIX.length);
           seen.add(flagName);
-          this.applyValue(flagName, entry.value);
+          if (this.applyValue(flagName, entry.value)) changed.push(flagName);
         }
       }
       cursor = data.nextCursor;
@@ -116,8 +125,13 @@ export class Snapshot {
 
     // Drop any flag that's no longer in KV.
     for (const name of this.state.keys()) {
-      if (!seen.has(name)) this.state.delete(name);
+      if (!seen.has(name)) {
+        this.state.delete(name);
+        changed.push(name);
+      }
     }
+
+    this.notifyChange(changed);
   }
 
   private async runWatch(): Promise<void> {
@@ -132,10 +146,12 @@ export class Snapshot {
           if (event.type === "ready") continue;
           if (event.type === "set") {
             const flagName = event.key.slice(DEF_PREFIX.length);
-            this.applyValue(flagName, event.value);
+            if (this.applyValue(flagName, event.value)) {
+              this.notifyChange([flagName]);
+            }
           } else if (event.type === "del") {
             const flagName = event.key.slice(DEF_PREFIX.length);
-            this.state.delete(flagName);
+            if (this.state.delete(flagName)) this.notifyChange([flagName]);
           }
         }
         // Stream ended cleanly (server close, LB timeout, graceful restart).
@@ -178,15 +194,32 @@ export class Snapshot {
     }
   }
 
-  private applyValue(flagName: string, raw: Uint8Array): void {
+  /**
+   * Decode and store a flag def. Returns `true` if the stored value actually
+   * changed (added or differs from the prior def) so callers can fire change
+   * notifications without spurious events on no-op re-reads.
+   */
+  private applyValue(flagName: string, raw: Uint8Array): boolean {
     let parsed: FlagDef | undefined;
     try {
       parsed = decodeFlagDef(raw);
     } catch (err) {
       this.reportError("snapshot", err, flagName);
-      return;
+      return false;
     }
-    if (parsed) this.state.set(flagName, parsed);
+    if (!parsed) return false;
+    const prev = this.state.get(flagName);
+    this.state.set(flagName, parsed);
+    return prev === undefined || JSON.stringify(prev) !== JSON.stringify(parsed);
+  }
+
+  /**
+   * Fire the `onChange` callback for actually-changed flags. Suppressed during
+   * the initial load (only live deltas/reloads notify) and for empty sets.
+   */
+  private notifyChange(names: string[]): void {
+    if (!this.isReady || names.length === 0 || !this.opts.onChange) return;
+    this.opts.onChange(names);
   }
 
   private reportError(
