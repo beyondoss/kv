@@ -5,6 +5,8 @@ rust = { version = "1.92", components = "rustfmt,clippy", targets = "aarch64-unk
 yamlfmt = "latest"
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
+zig = "latest"
+"cargo:cargo-zigbuild" = "latest"
 
 [tasks."build:rs"]
 run = "cargo build"

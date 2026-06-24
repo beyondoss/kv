@@ -1,0 +1,37 @@
+name: Release API
+on:
+  push:
+    tags:
+      - api-v*
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            zigtarget: x86_64-unknown-linux-gnu.2.39
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - runs-on: ubuntu-24.04-arm
+            zigtarget: aarch64-unknown-linux-gnu.2.39
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo zigbuild --release --target ${{ matrix.zigtarget }} -p beyond-kv
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#api-v}
+          ARCHIVE="beyond-kv-v${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$ARCHIVE" -C target/${{ matrix.target }}/release beyond-kv
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ARCHIVE }}
